@@ -1,0 +1,24 @@
+# Build output
+bin/
+obj/
+release/
+*.zip
+*.map
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# IDE
+.vs/
+*.user
+*.suo
+*.VC.db
+
+# Local analysis artifacts
+dumps/
+tools/
+*.log
+
+# 截图/临时文件
+*.png

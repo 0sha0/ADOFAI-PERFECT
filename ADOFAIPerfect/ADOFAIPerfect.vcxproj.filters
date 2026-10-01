@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="src">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="imgui">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="imgui\backends">
+      <UniqueIdentifier>{D9A9C4A1-1B2C-4E5F-8A6B-7C8D9E0F1A2B}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\dllmain.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\Log.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\MonoApi.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\GameBridge.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\GameDetour.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\RenderHook.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\Menu.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="$(RepoRoot)imgui\imgui.cpp"><Filter>imgui</Filter></ClCompile>
+    <ClCompile Include="$(RepoRoot)imgui\imgui_draw.cpp"><Filter>imgui</Filter></ClCompile>
+    <ClCompile Include="$(RepoRoot)imgui\imgui_tables.cpp"><Filter>imgui</Filter></ClCompile>
+    <ClCompile Include="$(RepoRoot)imgui\imgui_widgets.cpp"><Filter>imgui</Filter></ClCompile>
+    <ClCompile Include="$(RepoRoot)imgui\backends\imgui_impl_win32.cpp"><Filter>imgui\backends</Filter></ClCompile>
+    <ClCompile Include="$(RepoRoot)imgui\backends\imgui_impl_dx11.cpp"><Filter>imgui\backends</Filter></ClCompile>
+    <ClCompile Include="$(RepoRoot)imgui\backends\imgui_impl_dx12.cpp"><Filter>imgui\backends</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\CheatState.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\Log.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\MonoApi.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\GameBridge.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\GameDetour.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\RenderHook.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\Menu.h"><Filter>src</Filter></ClInclude>
+  </ItemGroup>
+</Project>
