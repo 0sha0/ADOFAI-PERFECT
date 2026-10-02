@@ -117,9 +117,10 @@ static DWORD WINAPI WorkerMain(LPVOID)
         return 0;
     }
 
-    // 解析游戏类（非阻塞：静态字段偏移要等游戏完成类初始化，
-    // BridgeLoop 会持续重试直到就绪；期间覆盖层照常工作）
-    GameBridge::Init();
+    // 解析游戏类（非阻塞）：实际解析投递到游戏主线程执行
+    // （mono API 只有主线程可安全调用），BridgeLoop 会持续重投
+    // 直到就绪；期间覆盖层照常工作。
+    GameBridge::QueueMainThreadInit();
 
     // 注：不再对 scrPlayer.DieByHitbox 做 JIT detour ——
     // 本 Unity 6 协作式 Mono 上，mono_compile_method 在非托管线程会

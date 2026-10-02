@@ -1,6 +1,7 @@
 #include "Menu.h"
 #include "CheatState.h"
 #include "GameBridge.h"
+#include "Chart4K.h"
 #include "Log.h"
 
 #include <windows.h>
@@ -18,6 +19,7 @@ namespace Menu
 {
     // ---- 本地状态 ----
     static bool  s_collapsed = false;      // 是否缩成小圆点
+    static ImVec2 s_mainSize(448, 430);    // 主窗口尺寸（可拖右下角调整，控件随宽度自适应）
     static ImVec2 s_mainPos(60, 60);       // 主窗口位置（折叠/展开间保持）
     static ImVec2 s_dotPos(60, 60);        // 小圆点位置
     static float s_anim[2] = { 0.f, 0.f }; // 开关动画 0..1
@@ -103,10 +105,17 @@ namespace Menu
             return s;
         }();
 
+        // 页内容超出窗口高度时可上下滚动（鼠标滚轮 / 右侧滚动条）。
+        // 4K 页三张卡片总高 > 窗口可视区，指定内容高度让 ImGui 产生滚动范围。
+        const float k4kPageH = 92.f + 8.f + 244.f + 8.f + 152.f + 44.f;   // 4K 页三张卡片
+        const float k6kPageH = 92.f + 8.f + 118.f + 8.f + 132.f + 44.f;   // 6K 页三张卡片
+        const float pageScrollH = (s_page == 2) ? (88.f + k4kPageH)
+                                : (s_page == 3) ? (88.f + k6kPageH) : 400.f;
+        // 宽度 0 = 由内容自适应（不会出现横向滚动条）；高度显式给值以产生纵向滚动范围
+        ImGui::SetNextWindowContentSize(ImVec2(0.f, pageScrollH));
         ImGui::SetNextWindowPos(s_mainPos, ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(400, 430), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(s_mainSize, ImGuiCond_Always);
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
-                                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                                  ImGuiWindowFlags_NoBringToFrontOnFocus;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
         ImGui::Begin("##adofai_main", nullptr, flags);
@@ -117,32 +126,36 @@ namespace Menu
 
         // ============ 标题栏（自绘，可拖动窗口） ============
         {
-            float hdrH = 34.f;
+            const float hdrH = 38.f;
+            dl->AddRectFilled(ImVec2(wpos.x + 1, wpos.y + 1),
+                              ImVec2(wpos.x + wsize.x - 1, wpos.y + hdrH),
+                              IM_COL32(21, 22, 26, 255), 11.f, ImDrawFlags_RoundCornersTop);
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 8.f, wpos.y + 8.f));
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-            ImGui::InvisibleButton("##hdrdrag", ImVec2(wsize.x - 76.f, hdrH));
+            ImGui::InvisibleButton("##hdrdrag", ImVec2(wsize.x - 76.f, hdrH - 12.f));
             ImGui::PopStyleVar();
             if (ImGui::IsItemActive())
                 s_mainPos = ImVec2(s_mainPos.x + ImGui::GetIO().MouseDelta.x,
                                    s_mainPos.y + ImGui::GetIO().MouseDelta.y);
 
-            // 标题：ADOFAI PERFECT | POWERED BY SHASHEN4404
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 12, wpos.y + 9));
+            // 标题：ADOFAI-PERFECT
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 14, wpos.y + 11));
             ImGui::PushStyleColor(ImGuiCol_Text, Col(kAccent));
             ImGui::TextUnformatted("\xe2\x97\x88"); // ◈
             ImGui::PopStyleColor();
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 28, wpos.y + 10));
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 30, wpos.y + 12));
             ImGui::PushFont(nullptr, 14.f);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.96f, 1.f, 1.f));
-            ImGui::TextUnformatted("ADOFAI PERFECT");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.95f, 0.98f, 1.f));
+            ImGui::TextUnformatted("ADOFAI-PERFECT");
             ImGui::PopStyleColor();
             ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim, 0.95f));
-            ImGui::TextUnformatted(" | POWERED BY SHASHEN4404");
+            ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim, 0.9f));
+            ImGui::TextUnformatted("  \xc2\xb7  4K / 6K ASSIST");
             ImGui::PopStyleColor();
             ImGui::PopFont();
 
             // 折叠按钮（–）
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + wsize.x - 34, wpos.y + 6));
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + wsize.x - 34, wpos.y + 8));
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.08f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1, 1, 1, 0.14f));
@@ -152,57 +165,65 @@ namespace Menu
             {
                 ImVec2 bp = ImGui::GetItemRectMin();
                 dl->AddLine(ImVec2(bp.x + 6, bp.y + 11), ImVec2(bp.x + 20, bp.y + 11),
-                            IM_COL32(220, 224, 232, 220), 2.f);
+                            IM_COL32(200, 205, 215, 220), 2.f);
             }
 
-            dl->AddLine(ImVec2(wpos.x + 1, wpos.y + hdrH), ImVec2(wpos.x + wsize.x - 1, wpos.y + hdrH),
-                        Col(kCardLine));
-
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 12, wpos.y + hdrH + 10));
+            dl->AddLine(ImVec2(wpos.x + 1, wpos.y + hdrH),
+                        ImVec2(wpos.x + wsize.x - 1, wpos.y + hdrH),
+                        IM_COL32(255, 255, 255, 22));
         }
 
-        // ============ 分页选择（分段控件） ============
+        // ============ 模式 TAB（深色标签栏） ============
         {
-            float segW = wsize.x - 24.f, segH = 32.f;
-            ImVec2 sp = ImGui::GetCursorScreenPos();
-            dl->AddRectFilled(sp, ImVec2(sp.x + segW, sp.y + segH), IM_COL32(0, 0, 0, 90), 9.f);
-
-            const char* names[2] = { "\xe5\x8a\x9f\xe8\x83\xbd", "\xe5\xae\x9e\xe6\x97\xb6\xe7\x8a\xb6\xe6\x80\x81" }; // 功能 / 实时状态
-            float half = segW * 0.5f;
-            for (int i = 0; i < 2; i++)
+            const char* names[4] = {
+                "\xe5\x8a\x9f\xe8\x83\xbd",                        // 功能
+                "\xe5\xae\x9e\xe6\x97\xb6\xe7\x8a\xb6\xe6\x80\x81", // 实时状态
+                "4K\xe8\xbe\x85\xe5\x8a\xa9",                      // 4K辅助
+                "6K\xe6\xa8\xa1\xe5\xbc\x8f"                       // 6K模式
+            };
+            // 页签条底：整幅深色（随窗口宽度自适应），让 TAB 看起来像设计好的分段控件
+            dl->AddRectFilled(ImVec2(wpos.x + 1.f, wpos.y + 38.f),
+                              ImVec2(wpos.x + wsize.x - 1.f, wpos.y + 86.f),
+                              IM_COL32(16, 17, 20, 255));
+            dl->AddLine(ImVec2(wpos.x + 1.f, wpos.y + 86.f),
+                        ImVec2(wpos.x + wsize.x - 1.f, wpos.y + 86.f),
+                        IM_COL32(255, 255, 255, 18));
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 10.f, wpos.y + 46.f));
+            ImGui::PushStyleColor(ImGuiCol_Tab,                 ImVec4(0.11f, 0.11f, 0.13f, 1.f));
+            ImGui::PushStyleColor(ImGuiCol_TabHovered,          ImVec4(0.26f, 0.59f, 0.98f, 0.45f));
+            ImGui::PushStyleColor(ImGuiCol_TabSelected,         ImVec4(0.16f, 0.29f, 0.48f, 1.f));
+            ImGui::PushStyleColor(ImGuiCol_TabSelectedOverline, ImVec4(0.26f, 0.59f, 0.98f, 1.f));
+            ImGui::PushStyleColor(ImGuiCol_TabDimmed,           ImVec4(0.11f, 0.11f, 0.13f, 0.75f));
+            ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected,   ImVec4(0.14f, 0.22f, 0.36f, 1.f));
+            ImGui::PushStyleVar(ImGuiStyleVar_TabRounding, 6.f);
+            if (ImGui::BeginTabBar("##modetabs", ImGuiTabBarFlags_None))
             {
-                ImVec2 bsp(sp.x + i * half + 3, sp.y + 3);
-                ImGui::SetCursorScreenPos(bsp);
-                char bid[16];
-                snprintf(bid, sizeof(bid), "##seg%d", i);
-                ImGui::PushID(bid);
-                ImGui::InvisibleButton("##segbtn", ImVec2(half - 6, segH - 6));
-                ImGui::PopID();
-                bool sel = (s_page == i);
-                if (ImGui::IsItemClicked())
-                    s_page = i;
-                if (sel)
+                for (int i = 0; i < 4; i++)
                 {
-                    dl->AddRectFilled(bsp, ImVec2(bsp.x + half - 6, bsp.y + segH - 6),
-                                      Col(kAccent, 0.22f), 7.f);
-                    dl->AddRect(bsp, ImVec2(bsp.x + half - 6, bsp.y + segH - 6),
-                                Col(kAccent, 0.75f), 7.f);
+                    if (ImGui::BeginTabItem(names[i]))
+                    {
+                        s_page = i;
+                        ImGui::EndTabItem();
+                    }
                 }
-                ImVec2 tp(bsp.x + (half - 6) * 0.5f - ImGui::CalcTextSize(names[i]).x * 0.5f,
-                          bsp.y + (segH - 6 - ImGui::GetTextLineHeight()) * 0.5f);
-                ImGui::SetCursorScreenPos(tp);
-                ImGui::PushStyleColor(ImGuiCol_Text, sel ? Col(kAccent) : Col(kTextDim));
-                ImGui::TextUnformatted(names[i]);
-                ImGui::PopStyleColor();
+                ImGui::EndTabBar();
             }
-            ImGui::SetCursorScreenPos(ImVec2(sp.x + 12, sp.y + segH + 12));
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(6);
         }
 
         // 页面几何（全部绝对坐标，杜绝光标残留导致的错位）
+        // 滚动：页内容整体上移 -scrollY；标题栏 / 页签 / 底部按钮固定不动
+        const float scrollY = ImGui::GetScrollY();
         const float pageX = wpos.x + 12.f;
-        const float pageY = wpos.y + 88.f;                       // 标题栏34 + 边距 + 页签32 + 间隙
+        const float pageY = wpos.y + 88.f - scrollY;             // 标题栏34 + 边距 + 页签32 + 间隙
         const float pageW = wsize.x - 24.f;
         const float contentH = wsize.y - 88.f - 52.f;            // 底部留按钮/提示区
+
+        // 可滚动内容区裁剪（内容滚出可视区时不覆盖标题栏 / 页签 / 底部按钮）
+        ImGui::PushClipRect(ImVec2(wpos.x + 1.f, wpos.y + 88.f),
+                            ImVec2(wpos.x + wsize.x - 1.f,
+                                   wpos.y + wsize.y - ((s_page == 2 || s_page == 3) ? 8.f : 46.f)), true);
 
         // ============ 页：功能 ============
         if (s_page == 0)
@@ -256,6 +277,7 @@ namespace Menu
             FeatureCard(1, "##card2", "\xe8\x87\xaa\xe5\x8a\xa8\xe8\xbf\x9e\xe5\x87\xbb",
                         &CheatState::AutoCombo, &s_anim[1], kAccent2, "##sw2");
 
+            ImGui::PopClipRect();
             ImGui::SetCursorScreenPos(ImVec2(pageX, wpos.y + wsize.y - 46.f));
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.20f, 0.55f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.20f, 0.25f, 0.75f));
@@ -263,6 +285,20 @@ namespace Menu
             if (ImGui::Button("\xe5\x8d\xb8\xe8\xbd\xbd\xe6\xa8\xa1\xe5\x9d\x97\xe5\xb9\xb6\xe8\xbf\x98\xe5\x8e\x9f", ImVec2(pageW, 30)))
                 CheatState::ExitRequested.store(true, std::memory_order_relaxed);
             ImGui::PopStyleColor(3);
+        }
+        // ============ 页：4K 辅助 ============
+        else if (s_page == 2)
+        {
+            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
+            Chart4K::DrawSettingsPage();
+            ImGui::PopClipRect();
+        }
+        // ============ 页：6K 模式 ============
+        else if (s_page == 3)
+        {
+            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
+            Chart4K::DrawSettings6KPage();
+            ImGui::PopClipRect();
         }
         // ============ 页：实时状态 ============
         else
@@ -324,13 +360,41 @@ namespace Menu
             }
             EndCard();
 
-            ImGui::SetCursorPosY(wpos.y + wsize.y - 34.f);
+            ImGui::PopClipRect();
+            ImGui::SetCursorPos(ImVec2(12.f, wsize.y - 34.f));
             ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim, 0.8f));
             ImGui::TextDisabled("Insert \xe6\x98\xbe\xe9\x9a\x90  \xc2\xb7  End \xe5\x8d\xb8\xe8\xbd\xbd  \xc2\xb7  \xe5\x8f\xaf\xe6\x8b\x96\xe5\x8a\xa8\xe6\xa0\x87\xe9\xa2\x98\xe6\xa0\x8f");
             ImGui::PopStyleColor();
         }
 
+        // ============ 右下角缩放柄（拖动 = 改窗口尺寸，控件随宽度自适应） ============
+        {
+            const float gs = 16.f;
+            ImVec2 gp(wpos.x + wsize.x - gs - 3.f, wpos.y + wsize.y - gs - 3.f);
+            ImGui::SetCursorScreenPos(gp);
+            ImGui::InvisibleButton("##wndresize", ImVec2(gs, gs));
+            bool hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
+            if (hov)
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
+            if (ImGui::IsItemActive())
+            {
+                s_mainSize.x += ImGui::GetIO().MouseDelta.x;
+                s_mainSize.y += ImGui::GetIO().MouseDelta.y;
+                if (s_mainSize.x < 380.f)  s_mainSize.x = 380.f;
+                if (s_mainSize.x > 1000.f) s_mainSize.x = 1000.f;
+                if (s_mainSize.y < 340.f)  s_mainSize.y = 340.f;
+                if (s_mainSize.y > 900.f)  s_mainSize.y = 900.f;
+            }
+            for (int i = 0; i < 3; i++)
+            {
+                float o = 3.f + i * 4.5f;
+                dl->AddLine(ImVec2(gp.x + gs - o, gp.y + gs - 2.f),
+                            ImVec2(gp.x + gs - 2.f, gp.y + gs - o),
+                            IM_COL32(230, 235, 245, hov ? 170 : 80), 1.4f);
+            }
+        }
         ImGui::End();
+
         ImGui::PopStyleVar(); // WindowBorderSize
     }
     static void DrawDot()
@@ -386,6 +450,7 @@ namespace Menu
 
     void Draw()
     {
+        Chart4K::DrawPlayfield(); // 4K 谱面独立窗口（不受菜单显隐影响）
         if (!CheatState::MenuVisible.load(std::memory_order_relaxed))
             return;
         if (s_collapsed)

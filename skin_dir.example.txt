@@ -1,0 +1,6 @@
+# 自定义皮肤说明（通常不需要本文件）：
+# 发布包已自带 skin\ 文件夹，放在 Injector.exe 同级目录即自动加载，无需配置。
+# 若要使用其他 Malody 皮肤：把本文件改名为 skin_dir.txt（放在 Injector.exe 同级），
+# 第一行填写皮肤目录（包含 rurudokey.png 的那个文件夹）。
+# 也可以用环境变量 ADOFAI_PERFECT_SKIN 指定。
+D:\Program Files (x86)\Steam\steamapps\common\MalodyV\skin\3752111034

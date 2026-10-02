@@ -12,4 +12,11 @@ namespace RenderHook
 {
     bool Install();   // worker 线程调用（需 dxgi.dll 已加载）
     void Shutdown();  // 卸载前调用：恢复 WndProc、摘钩、释放资源
+    void GetGameWindowSize(float* w, float* h); // 游戏客户区尺寸（渲染线程调用）
 }
+
+// ---- 游戏画面捕获（左下角缩略图用；DX11/DX12 通用）----
+// SetCaptureWanted：渲染线程每帧设置是否拷贝后缓冲（关闭时不产生 GPU 开销）
+// GetCaptureTex    ：取"不含覆盖层"的游戏画面贴图句柄（ImGui 用），未就绪返回 nullptr
+void  RenderHook_SetCaptureWanted(bool on);
+void* RenderHook_GetCaptureTex(int* w, int* h);

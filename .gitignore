@@ -1,4 +1,4 @@
-# Build output
+# ---- 构建产物 ----
 bin/
 obj/
 release/
@@ -7,18 +7,23 @@ release/
 *.pdb
 *.ilk
 *.exp
-*.lib
+*.lib.bak
 
-# IDE
+# ---- IDE ----
 .vs/
 *.user
 *.suo
 *.VC.db
+*.opendb
 
-# Local analysis artifacts
+# ---- 本地开发沙箱（反编译参考、测试脚本、截图）——不可发布 ----
+.reverse/
 dumps/
-tools/
 *.log
 
-# 截图/临时文件
-*.png
+# ---- 临时文件 ----
+*.tmp
+*.bak
+
+# ---- imgui 示例自带的预编译库（构建不需要）----
+deps/imgui/examples/libs/

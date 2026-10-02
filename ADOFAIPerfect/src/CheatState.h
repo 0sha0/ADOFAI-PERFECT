@@ -19,6 +19,7 @@ namespace CheatState
         bool  bridgeReady = false;        // mono 桥接是否就绪
         bool  controllerAlive = false;    // scrController.instance 存在
         bool  gameworld = false;          // 正在游戏关卡内
+        bool  paused = false;             // 游戏内暂停（scrController._paused）
         bool  noFailApplied = false;      // 不死模式已生效
         bool  autoApplied = false;        // 自动连击已生效
         int   state = -1;                 // scrController.States 枚举值
@@ -30,5 +31,14 @@ namespace CheatState
         int   checkpoints = 0;            // 使用的检查点次数
         char  levelName[160] = { 0 };     // 关卡名
         char  stateName[32] = { 0 };      // 状态名
+
+        // ---- 命中统计（scrMarginTracker，HitMargin 枚举 12 项）----
+        //   0 TooEarly 1 VeryEarly 2 EarlyPerfect 3 Perfect 4 LatePerfect
+        //   5 VeryLate 6 TooLate 7 Multipress 8 FailMiss 9 FailOverload
+        //  10 Auto 11 OverPress
+        int   hitCounts[12] = { 0 };      // 各类判定次数
+        int   hitTotal = 0;               // 已判定总数（hitMargins.Count）
+        int   combo = 0;                  // 当前连击（尾部连续有效判定）
+        int   maxCombo = 0;               // 历史最大连击
     };
 }

@@ -37,8 +37,10 @@ namespace GameBridge
     // 安全地为尚未使用的类创建 vtable（并完成静态字段布局），
     // 让桥接在标题画面就立即就绪，无需等玩家进入关卡。
     void QueueMainThreadInit();
+    void QueueCheatApply();      // 请求主线程把 noFail / RDC.auto 应用到当前值
     void MainThreadInitTask();   // 仅在游戏主线程调用！
     void SetMainThreadPoster(void (*fn)()); // RenderHook 注入投递函数
+    void* GetControllerInstance(); // 已发现的 scrController 实例（未发现返回 nullptr）
 
     bool Ready();
 }

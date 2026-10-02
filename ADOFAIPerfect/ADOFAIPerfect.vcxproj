@@ -40,7 +40,6 @@
   <PropertyGroup>
     <!-- 仓库根目录（独立编译 vcxproj 时也正确） -->
     <RepoRoot>$(MSBuildThisFileDirectory)..\</RepoRoot>
-    <VcpkgRoot Condition="'$(VcpkgRoot)'==''">D:\vcpkg\</VcpkgRoot>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>false</LinkIncremental>
@@ -62,7 +61,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(RepoRoot)deps\imgui;$(RepoRoot)deps\imgui\backends;$(VcpkgRoot)installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(RepoRoot)deps\imgui;$(RepoRoot)deps\imgui\backends;$(RepoRoot)deps\detours\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ExceptionHandling>Sync</ExceptionHandling>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -70,7 +69,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(VcpkgRoot)installed\x64-windows\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(RepoRoot)deps\detours\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>d3d12.lib;d3d11.lib;dxgi.lib;dxguid.lib;detours.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>
       </ModuleDefinitionFile>
@@ -86,7 +85,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(RepoRoot)deps\imgui;$(RepoRoot)deps\imgui\backends;$(VcpkgRoot)installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(RepoRoot)deps\imgui;$(RepoRoot)deps\imgui\backends;$(RepoRoot)deps\detours\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ExceptionHandling>Sync</ExceptionHandling>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -98,7 +97,7 @@
       <GenerateDebugInformation>false</GenerateDebugInformation>
       <MapFileName>$(OutDir)ADOFAIPerfect.map</MapFileName>
       <MapExports>true</MapExports>
-      <AdditionalLibraryDirectories>$(VcpkgRoot)installed\x64-windows\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(RepoRoot)deps\detours\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>d3d12.lib;d3d11.lib;dxgi.lib;dxguid.lib;detours.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>
       </ModuleDefinitionFile>
@@ -112,6 +111,8 @@
     <ClCompile Include="src\GameDetour.cpp" />
     <ClCompile Include="src\RenderHook.cpp" />
     <ClCompile Include="src\Menu.cpp" />
+    <ClCompile Include="src\Chart4K.cpp" />
+    <ResourceCompile Include="ADOFAIPerfect.rc" />
     <ClCompile Include="$(RepoRoot)deps\imgui\imgui.cpp" />
     <ClCompile Include="$(RepoRoot)deps\imgui\imgui_draw.cpp" />
     <ClCompile Include="$(RepoRoot)deps\imgui\imgui_tables.cpp" />
@@ -128,6 +129,7 @@
     <ClInclude Include="src\GameDetour.h" />
     <ClInclude Include="src\RenderHook.h" />
     <ClInclude Include="src\Menu.h" />
+    <ClInclude Include="src\Chart4K.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

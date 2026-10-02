@@ -5,12 +5,16 @@
 #include "Menu.h"
 
 #include <windows.h>
+#include <wincodec.h>
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <detours/detours.h>
 #include <atomic>
 #include <cstring>
+#include <map>
+#include <string>
+#include <vector>
 
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
@@ -82,6 +86,18 @@ namespace RenderHook
 
     // ECL 捕获时防自触发
     static thread_local bool t_inOurRender = false;
+
+    // ============ 游戏画面捕获（左下角缩略图"小窗"用） ============
+    // 在 Present 钩子内、绘制覆盖层"之前"把后缓冲拷进独立纹理 —— 得到的是
+    // 游戏自己的干净画面（Unity 渲染结果，不含本工具任何 UI）。
+    static std::atomic<bool> g_capWanted{ false };
+    static ID3D11Texture2D*          g_capTex11 = nullptr;
+    static ID3D11ShaderResourceView* g_capSrv11 = nullptr;
+    static UINT g_capW11 = 0, g_capH11 = 0;
+    static ID3D12Resource* g_capTex12 = nullptr;
+    static void*           g_capId12 = nullptr;   // GPU descriptor handle
+    static UINT g_capW12 = 0, g_capH12 = 0;
+    static int  g_capSrvIdx12 = -1;               // DX12 保留的描述符槽
 
     // ============ SRV 描述符分配器（ImGui 1.92 要求回调） ============
     struct HeapAllocState
@@ -230,6 +246,92 @@ namespace RenderHook
         return true;
     }
 
+    // ---- 捕获纹理（缩略图） ----
+    static void ReleaseCapture()
+    {
+        if (g_capSrv11) { g_capSrv11->Release(); g_capSrv11 = nullptr; }
+        if (g_capTex11) { g_capTex11->Release(); g_capTex11 = nullptr; }
+        g_capW11 = g_capH11 = 0;
+        if (g_capTex12) { g_capTex12->Release(); g_capTex12 = nullptr; }
+        g_capId12 = nullptr;
+        g_capW12 = g_capH12 = 0;
+    }
+
+    static bool EnsureCapture11(IDXGISwapChain* sc)
+    {
+        if (g_capSrv11)
+            return true;
+        if (!g_dev11 || !sc)
+            return false;
+        ID3D11Texture2D* back = nullptr;
+        if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&back))) || !back)
+            return false;
+        D3D11_TEXTURE2D_DESC d{};
+        back->GetDesc(&d);
+        back->Release();
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        d.CPUAccessFlags = 0;
+        d.MiscFlags = 0;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.SampleDesc.Count = 1;
+        d.SampleDesc.Quality = 0;
+        ID3D11Texture2D* tex = nullptr;
+        if (FAILED(g_dev11->CreateTexture2D(&d, nullptr, &tex)) || !tex)
+            return false;
+        ID3D11ShaderResourceView* srv = nullptr;
+        if (FAILED(g_dev11->CreateShaderResourceView(tex, nullptr, &srv)) || !srv)
+        {
+            tex->Release();
+            return false;
+        }
+        g_capTex11 = tex;
+        g_capSrv11 = srv;
+        g_capW11 = d.Width;
+        g_capH11 = d.Height;
+        Log::Printf("[Render] capture tex ready %ux%u", d.Width, d.Height);
+        return true;
+    }
+
+    static bool EnsureCapture12(IDXGISwapChain3* sc3)
+    {
+        if (g_capTex12)
+            return true;
+        if (!g_dev12 || !sc3 || !g_srvHeap12 || g_capSrvIdx12 < 0)
+            return false;
+        ID3D12Resource* back = nullptr;
+        if (FAILED(sc3->GetBuffer(0, IID_PPV_ARGS(&back))) || !back)
+            return false;
+        D3D12_RESOURCE_DESC bd = back->GetDesc();
+        back->Release();
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = bd;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        ID3D12Resource* tex = nullptr;
+        if (FAILED(g_dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                    nullptr, IID_PPV_ARGS(&tex))) || !tex)
+            return false;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_srvAlloc.cpuStart;
+        cpu.ptr += (SIZE_T)g_capSrvIdx12 * g_srvAlloc.inc;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = bd.Format;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        g_dev12->CreateShaderResourceView(tex, &sd, cpu);
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_srvAlloc.gpuStart;
+        gpu.ptr += (UINT64)g_capSrvIdx12 * g_srvAlloc.inc;
+        g_capTex12 = tex;
+        g_capId12 = (void*)(uintptr_t)gpu.ptr;
+        g_capW12 = (UINT)bd.Width;
+        g_capH12 = bd.Height;
+        Log::Printf("[Render] capture tex ready (DX12) %ux%u", g_capW12, g_capH12);
+        return true;
+    }
+
     // ============ ImGui 初始化 ============
     static bool InitImGui(IDXGISwapChain* sc, Api api)
     {
@@ -302,6 +404,9 @@ namespace RenderHook
             g_srvAlloc.freeCount = (int)kSrvHeapSize;
             for (int i = 0; i < (int)kSrvHeapSize; i++)
                 g_srvAlloc.freeList[i] = (int)kSrvHeapSize - 1 - i;
+            // 预留 0 号槽给"游戏画面捕获"缩略图（永久占用，不参与 ImGui 分配）
+            if (g_srvAlloc.freeCount > 0)
+                g_capSrvIdx12 = g_srvAlloc.freeList[--g_srvAlloc.freeCount];
 
             D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = {};
             rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -449,6 +554,7 @@ namespace RenderHook
             {
                 ReleaseRT12();
                 ReleaseRT11();
+                ReleaseCapture();
                 if (g_sc3) { g_sc3->Release(); g_sc3 = nullptr; }
                 sc->QueryInterface(IID_PPV_ARGS(&g_sc3));
                 g_sc = sc;
@@ -496,6 +602,26 @@ namespace RenderHook
         barrier.Transition.pResource = res;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g_cmdList12->ResourceBarrier(1, &barrier);
+
+        // 缩略图：趁后缓冲还是"游戏本帧画面"（未叠加 UI）先拷走
+        if (g_capWanted.load(std::memory_order_relaxed) && EnsureCapture12(sc3) && g_capTex12)
+        {
+            D3D12_RESOURCE_BARRIER cb = {};
+            cb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            cb.Transition.pResource = g_capTex12;
+            cb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cb.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            cb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            g_cmdList12->ResourceBarrier(1, &cb);
+            g_cmdList12->CopyResource(g_capTex12, res);
+            cb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            cb.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            g_cmdList12->ResourceBarrier(1, &cb);
+        }
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         g_cmdList12->ResourceBarrier(1, &barrier);
 
@@ -540,6 +666,17 @@ namespace RenderHook
         if (!g_rtv11[bb])
             return;
 
+        // 缩略图：先拷走"游戏本帧干净画面"，再往上叠本工具 UI
+        if (g_capWanted.load(std::memory_order_relaxed) && EnsureCapture11(sc) && g_capTex11)
+        {
+            ID3D11Texture2D* back = nullptr;
+            if (SUCCEEDED(sc->GetBuffer(bb, IID_PPV_ARGS(&back))) && back)
+            {
+                g_ctx11->CopyResource(g_capTex11, back);
+                back->Release();
+            }
+        }
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -571,6 +708,8 @@ namespace RenderHook
     {
         ReleaseRT12();
         ReleaseRT11();
+        ReleaseCapture();
+        ReleaseCapture();
         return g_oResizeBuffers(sc, bufCount, w, h, fmt, flags);
     }
 
@@ -841,6 +980,7 @@ namespace RenderHook
         // 4) 释放 D3D 资源
         ReleaseRT12();
         ReleaseRT11();
+        ReleaseCapture();
         if (g_cmdList12) { g_cmdList12->Release(); g_cmdList12 = nullptr; }
         for (auto& fc : g_frames12)
             if (fc.allocator) { fc.allocator->Release(); fc.allocator = nullptr; }
@@ -867,4 +1007,322 @@ namespace RenderHook
         g_hooksInstalled = false;
         Log::Printf("[Render] shutdown complete");
     }
+
+    void GetGameWindowSize(float* w, float* h)
+    {
+        *w = 1280.f; *h = 720.f;
+        if (g_hwnd)
+        {
+            RECT rc;
+            if (GetClientRect(g_hwnd, &rc))
+            {
+                *w = (float)(rc.right - rc.left);
+                *h = (float)(rc.bottom - rc.top);
+            }
+        }
+    }
+
+    // ============ 皮肤贴图加载（WIC 解码，DX11 / DX12 各一条上传路径） ============
+    // WIC → RGBA8 像素（两条 API 共用）
+    static bool DecodeImageRGBA(const char* path, std::vector<BYTE>* px, UINT* outW, UINT* outH)
+    {
+        IWICImagingFactory* wic = nullptr;
+        IWICBitmapDecoder* dec = nullptr;
+        IWICBitmapFrameDecode* frame = nullptr;
+        IWICFormatConverter* conv = nullptr;
+        bool ok = false;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARGS(&wic))) &&
+            SUCCEEDED(wic->CreateDecoderFromFilename(std::wstring(path, path + strlen(path)).c_str(),
+                                                     nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
+                                                     &dec)) &&
+            SUCCEEDED(dec->GetFrame(0, &frame)) &&
+            SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
+            SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+                                       WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
+        {
+            UINT w = 0, h = 0;
+            conv->GetSize(&w, &h);
+            px->resize((size_t)w * h * 4);
+            WICRect rc = { 0, 0, (INT)w, (INT)h };
+            if (SUCCEEDED(conv->CopyPixels(&rc, w * 4, (UINT)px->size(), px->data())) && w && h)
+            {
+                *outW = w; *outH = h;
+                ok = true;
+            }
+        }
+        if (conv) conv->Release();
+        if (frame) frame->Release();
+        if (dec) dec->Release();
+        if (wic) wic->Release();
+        return ok;
+    }
+
+    static std::map<std::string, void*>& TextureCache()
+    {
+        static std::map<std::string, void*> s_cache;
+        return s_cache;
+    }
+
+    void* RenderHook_LoadTextureDX11(const char* path)
+    {
+        if (g_api.load(std::memory_order_relaxed) != Api::D3D11 || !g_dev11)
+            return nullptr;
+
+        auto& cache = TextureCache();
+        auto it = cache.find(path);
+        if (it != cache.end())
+            return it->second;
+
+        void* srv = nullptr;
+        std::vector<BYTE> px;
+        UINT w = 0, h = 0;
+        ID3D11Texture2D* tex = nullptr;
+        if (DecodeImageRGBA(path, &px, &w, &h))
+        {
+                D3D11_TEXTURE2D_DESC td = {};
+                td.Width = w; td.Height = h;
+                td.MipLevels = 1; td.ArraySize = 1;
+                td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                td.SampleDesc.Count = 1;
+                td.Usage = D3D11_USAGE_IMMUTABLE;
+                td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                D3D11_SUBRESOURCE_DATA sd = { px.data(), w * 4, 0 };
+                if (SUCCEEDED(g_dev11->CreateTexture2D(&td, &sd, &tex)))
+                {
+                    D3D11_SHADER_RESOURCE_VIEW_DESC sd2 = {};
+                    sd2.Format = td.Format;
+                    sd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                    sd2.Texture2D.MipLevels = 1;
+                    g_dev11->CreateShaderResourceView(tex, &sd2, (ID3D11ShaderResourceView**)&srv);
+                    tex->Release();
+                }
+        }
+        if (srv)
+            cache[path] = srv;
+        return srv;
+    }
+
+    // ============ D3D12 贴图上传（WIC → 默认堆资源 + SRV） ============
+    // 从 ImGui 的 SRV 描述符堆的同一空闲表里永久占用一格
+    static bool AllocHeapSlot(D3D12_CPU_DESCRIPTOR_HANDLE* cpu, D3D12_GPU_DESCRIPTOR_HANDLE* gpu)
+    {
+        if (g_srvAlloc.freeCount <= 0 || !g_srvAlloc.heap || !g_srvAlloc.inc)
+            return false;
+        int idx = g_srvAlloc.freeList[--g_srvAlloc.freeCount];
+        cpu->ptr = g_srvAlloc.cpuStart.ptr + (SIZE_T)idx * g_srvAlloc.inc;
+        gpu->ptr = g_srvAlloc.gpuStart.ptr + (UINT64)idx * g_srvAlloc.inc;
+        return true;
+    }
+
+    void* RenderHook_LoadTextureDX12(const char* path)
+    {
+        if (g_api.load(std::memory_order_relaxed) != Api::D3D12)
+            return nullptr;
+        // 依赖尚未就绪时返回 nullptr，调用方下一帧重试
+        if (!g_dev12 || !g_srvHeap12 || !g_queue12 || !g_fence12 || !g_fenceEvent12)
+            return nullptr;
+
+        auto& cache = TextureCache();
+        auto it = cache.find(path);
+        if (it != cache.end())
+            return it->second;
+
+        std::vector<BYTE> px;
+        UINT w = 0, h = 0;
+        if (!DecodeImageRGBA(path, &px, &w, &h))
+        {
+            Log::Printf("[Render] DX12 tex decode failed: %s", path);
+            return nullptr;
+        }
+
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w;
+        rd.Height = h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        ID3D12Resource* tex = nullptr;
+        HRESULT hr = g_dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST,
+                                                      nullptr, IID_PPV_ARGS(&tex));
+        if (FAILED(hr) || !tex)
+            return nullptr;
+
+        UINT64 totalBytes = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        UINT numRows = 0;
+        UINT64 rowPitchBytes = 0;
+        g_dev12->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &numRows, &rowPitchBytes, &totalBytes);
+
+        D3D12_HEAP_PROPERTIES up = {};
+        up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC ud = {};
+        ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        ud.Width = totalBytes;
+        ud.Height = 1;
+        ud.DepthOrArraySize = 1;
+        ud.MipLevels = 1;
+        ud.Format = DXGI_FORMAT_UNKNOWN;
+        ud.SampleDesc.Count = 1;
+        ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        ID3D12Resource* upload = nullptr;
+        hr = g_dev12->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &ud,
+                                              D3D12_RESOURCE_STATE_GENERIC_READ,
+                                              nullptr, IID_PPV_ARGS(&upload));
+        if (FAILED(hr) || !upload)
+        {
+            tex->Release();
+            return nullptr;
+        }
+
+        void* mapped = nullptr;
+        D3D12_RANGE readRange = { 0, 0 };
+        if (FAILED(upload->Map(0, &readRange, &mapped)) || !mapped)
+        {
+            upload->Release();
+            tex->Release();
+            return nullptr;
+        }
+        for (UINT y = 0; y < numRows; y++)
+        {
+            memcpy((BYTE*)mapped + fp.Offset + (UINT64)y * fp.Footprint.RowPitch,
+                   px.data() + (size_t)y * (size_t)w * 4, (size_t)w * 4);
+        }
+        upload->Unmap(0, nullptr);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = {};
+        D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = {};
+        if (!AllocHeapSlot(&srvCpu, &srvGpu))
+        {
+            Log::Printf("[Render] DX12 tex: SRV heap exhausted");
+            upload->Release();
+            tex->Release();
+            return nullptr;
+        }
+
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList* list = nullptr;
+        if (FAILED(g_dev12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+            FAILED(g_dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr,
+                                              IID_PPV_ARGS(&list))))
+        {
+            if (alloc) alloc->Release();
+            upload->Release();
+            tex->Release();
+            return nullptr;
+        }
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = tex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = upload;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = fp;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = tex;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        list->ResourceBarrier(1, &barrier);
+        list->Close();
+
+        g_queue12->ExecuteCommandLists(1, (ID3D12CommandList* const*)&list);
+        const UINT64 waitValue = ++g_fenceLast;
+        g_queue12->Signal(g_fence12, waitValue);
+        if (g_fence12->GetCompletedValue() < waitValue)
+        {
+            g_fence12->SetEventOnCompletion(waitValue, g_fenceEvent12);
+            WaitForSingleObject(g_fenceEvent12, 3000);
+        }
+        list->Release();
+        alloc->Release();
+        upload->Release();
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        g_dev12->CreateShaderResourceView(tex, &sd, srvCpu);
+
+        void* id = (void*)(uintptr_t)srvGpu.ptr;
+        cache[path] = id;
+        return id;
+    }
+
+    // 统一入口：按当前图形 API 分派
+    void* RenderHook_LoadTexture(const char* path)
+    {
+        Api api = g_api.load(std::memory_order_relaxed);
+        if (api == Api::D3D12)
+            return RenderHook_LoadTextureDX12(path);
+        if (api == Api::D3D11)
+            return RenderHook_LoadTextureDX11(path);
+        return nullptr;
+    }
+
+    // ---- 游戏画面缩略图：开关（渲染线程每帧设置）+ 取贴图 ----
+    void SetCaptureWanted(bool on)
+    {
+        g_capWanted.store(on, std::memory_order_relaxed);
+    }
+
+    void* GetCaptureTex(int* w, int* h)
+    {
+        if (w) *w = 0;
+        if (h) *h = 0;
+        Api api = g_api.load(std::memory_order_relaxed);
+        if (api == Api::D3D11)
+        {
+            if (!g_capSrv11)
+                return nullptr;
+            if (w) *w = (int)g_capW11;
+            if (h) *h = (int)g_capH11;
+            return g_capSrv11;
+        }
+        if (api == Api::D3D12)
+        {
+            if (!g_capId12)
+                return nullptr;
+            if (w) *w = (int)g_capW12;
+            if (h) *h = (int)g_capH12;
+            return g_capId12;
+        }
+        return nullptr;
+    }
+}
+
+// 全局包装（供 Chart4K 调用）
+void* RenderHook_LoadTextureDX11(const char* path)
+{
+    return RenderHook::RenderHook_LoadTextureDX11(path);
+}
+
+void* RenderHook_LoadTexture(const char* path)
+{
+    return RenderHook::RenderHook_LoadTexture(path);
+}
+
+void RenderHook_SetCaptureWanted(bool on)
+{
+    RenderHook::SetCaptureWanted(on);
+}
+
+void* RenderHook_GetCaptureTex(int* w, int* h)
+{
+    return RenderHook::GetCaptureTex(w, h);
 }
