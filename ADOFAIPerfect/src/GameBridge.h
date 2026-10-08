@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================
 // GameBridge.h — 通过 Mono API 直接读写游戏内部状态
 //
@@ -40,7 +40,48 @@ namespace GameBridge
     void QueueCheatApply();      // 请求主线程把 noFail / RDC.auto 应用到当前值
     void MainThreadInitTask();   // 仅在游戏主线程调用！
     void SetMainThreadPoster(void (*fn)()); // RenderHook 注入投递函数
+    // 通用主线程任务（在主线程、mono 托管线程上执行；ctx 由调用方负责生命周期）
+    void QueueMainThreadWork(void (*fn)(void*), void* ctx);
     void* GetControllerInstance(); // 已发现的 scrController 实例（未发现返回 nullptr）
+
+    // 实时判定角度（7ms 快循环采样，渲染线程无锁读取）：
+    //   逆向依据 scrPlanet.SwitchChosen → scrMisc.GetHitMargin(cachedAngle, targetExitAngle,
+    //   isCW, bpm*speed, pitch, marginScale)：判定值 = (angle - targetExitAngle) * (isCW?1:-1)，
+    //   单位为弧度；换算成度后负=早（星球还没转到目标角），正=晚（已经越过）。
+    struct PlanetLive
+    {
+        bool   ok = false;      // 读到有效星球对象
+        double errDeg = 0.0;    // 判定角误差（度，负早正晚）
+        double speed = 1.0;     // PlanetarySystem.speed（关卡速度倍率）
+    };
+    void GetPlanetLive(PlanetLive* out);
+
+    // ---- 冰与火宏模式：每帧判定现场（游戏主线程输入钩子调用） ----
+    //   全部为"缓存偏移 + 纯指针读取"，任意线程可调用（内部 SEH 兜底）。
+    //   字段来源（Assembly-CSharp 反编译确认）：
+    //     scrController.state/currentState → States.PlayerControl(4)
+    //     scrPlanet.currfloor → scrFloor.seqID / holdLength / holdCompletion
+    //     scrPlanet.<targetExitAngle> / angle → err = (angle-target)*(isCW?1:-1)
+    struct FireCtx
+    {
+        bool   ok = false;
+        bool   inControl = false;      // 正在 PlayerControl（可打歌）
+        bool   gameworld = false;
+        bool   paused = false;
+          bool   hasNext = false;        // currfloor.nextfloor != null（最后一砖不再代打）
+          void*  player = nullptr;       // scrPlayer 实例（= playerManager.players[0]）
+          int    state = -1;             // scrController.currentState（1=Start 2=Countdown 4=PlayerControl）
+          int    floorIndex = -1;        // scrFloor.seqID（-1 = 读不到）
+        int    holdLength = -1;        // scrFloor.holdLength（> -1 = 长条块）
+        double holdCompletion = 0.0;   // scrFloor.holdCompletion 0..1
+        double errDeg = 0.0;           // 判定角误差（度，随时间增大）
+        double marginScale = 1.0;      // nextfloor.marginScale（判定窗倍率）
+        double speed = 1.0;            // PlanetarySystem.speed
+        double crotchet = 0.0;         // scrConductor.crotchetAtStart（秒/拍；BPM 折算）
+    };
+    bool ReadFireCtx(FireCtx* out);
+    // 跳过"按任意键开始"等待（写 scrController.levelWasSkipped；仅托管主线程调用）
+    bool SetLevelWasSkipped(bool on);
 
     bool Ready();
 }

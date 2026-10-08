@@ -10,7 +10,8 @@ namespace MonoApi
     MonoThread*   (*mono_thread_attach)(MonoDomain*) = nullptr;
     MonoThread*   (*mono_thread_detach)(MonoThread*) = nullptr;
     MonoImage*    (*mono_image_loaded)(const char*) = nullptr;
-    MonoAssembly* (*mono_assembly_get_image)(MonoAssembly*) = nullptr;
+    MonoImage*    (*mono_assembly_get_image)(MonoAssembly*) = nullptr;
+MonoAssembly* (*mono_domain_assembly_open)(MonoDomain*, const char*) = nullptr;
     const char*   (*mono_image_get_name)(MonoImage*) = nullptr;
     MonoClass*    (*mono_class_from_name)(MonoImage*, const char*, const char*) = nullptr;
     const char*   (*mono_class_get_name)(MonoClass*) = nullptr;
@@ -27,11 +28,13 @@ namespace MonoApi
     const char*   (*mono_field_get_name)(MonoClassField*) = nullptr;
     void*         (*mono_compile_method)(MonoMethod*) = nullptr;
     MonoObject*   (*mono_runtime_invoke)(MonoMethod*, void*, void**, MonoObject**) = nullptr;
+    void*         (*mono_object_unbox)(MonoObject*) = nullptr;
     MonoString*   (*mono_string_new)(MonoDomain*, const char*) = nullptr;
     char*         (*mono_string_to_utf8)(MonoString*) = nullptr;
     void          (*mono_free)(void*) = nullptr;
     MonoClass*    (*mono_object_get_class)(MonoObject*) = nullptr;
     void*         (*mono_array_addr_with_size)(MonoObject*, int, int) = nullptr;
+    MonoArray*    (*mono_array_new)(MonoDomain*, MonoClass*, uintptr_t) = nullptr;
     gunichar2*    (*mono_string_chars)(MonoString*) = nullptr;
     int           (*mono_string_length)(MonoString*) = nullptr;
     void*         (*mono_vtable_get_static_field_data)(MonoVTable*) = nullptr;
@@ -56,7 +59,8 @@ namespace MonoApi
             { "mono_thread_attach",              (void**)&mono_thread_attach },
             { "mono_thread_detach",              (void**)&mono_thread_detach },
             { "mono_image_loaded",               (void**)&mono_image_loaded },
-            { "mono_assembly_get_image",         (void**)&mono_assembly_get_image },
+            { "mono_domain_assembly_open",   (void**)&mono_domain_assembly_open },
+    { "mono_assembly_get_image",         (void**)&mono_assembly_get_image },
             { "mono_image_get_name",             (void**)&mono_image_get_name },
             { "mono_class_from_name",            (void**)&mono_class_from_name },
             { "mono_class_get_name",             (void**)&mono_class_get_name },
@@ -73,11 +77,13 @@ namespace MonoApi
             { "mono_field_get_name",             (void**)&mono_field_get_name },
             { "mono_compile_method",             (void**)&mono_compile_method },
             { "mono_runtime_invoke",             (void**)&mono_runtime_invoke },
+            { "mono_object_unbox",               (void**)&mono_object_unbox },
             { "mono_string_new",                 (void**)&mono_string_new },
             { "mono_string_to_utf8",             (void**)&mono_string_to_utf8 },
             { "mono_free",                       (void**)&mono_free },
             { "mono_object_get_class",           (void**)&mono_object_get_class },
             { "mono_array_addr_with_size",       (void**)&mono_array_addr_with_size },
+            { "mono_array_new",                  (void**)&mono_array_new },
             { "mono_string_chars",               (void**)&mono_string_chars },
             { "mono_string_length",              (void**)&mono_string_length },
             { "mono_vtable_get_static_field_data", (void**)&mono_vtable_get_static_field_data },

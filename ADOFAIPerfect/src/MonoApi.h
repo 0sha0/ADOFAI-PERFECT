@@ -16,6 +16,7 @@ typedef struct MonoObject     MonoObject;
 typedef struct MonoVTable     MonoVTable;
 typedef struct MonoString     MonoString;
 typedef struct MonoThread     MonoThread;
+typedef struct MonoArray      MonoArray;
 typedef unsigned short        gunichar2;
 
 namespace MonoApi
@@ -29,7 +30,8 @@ namespace MonoApi
     extern MonoThread*   (*mono_thread_attach)(MonoDomain* domain);
     extern MonoThread*   (*mono_thread_detach)(MonoThread* thread);
     extern MonoImage*    (*mono_image_loaded)(const char* name);
-    extern MonoAssembly* (*mono_assembly_get_image)(MonoAssembly* assembly);
+    extern MonoImage*    (*mono_assembly_get_image)(MonoAssembly* assembly);
+    extern MonoAssembly* (*mono_domain_assembly_open)(MonoDomain* domain, const char* name);
     extern const char*   (*mono_image_get_name)(MonoImage* image);
     extern MonoClass*    (*mono_class_from_name)(MonoImage* image, const char* name_space, const char* name);
     extern const char*   (*mono_class_get_name)(MonoClass* klass);
@@ -46,11 +48,13 @@ namespace MonoApi
     extern const char*   (*mono_field_get_name)(MonoClassField* field);
     extern void*         (*mono_compile_method)(MonoMethod* method);
     extern MonoObject*   (*mono_runtime_invoke)(MonoMethod* method, void* obj, void** params, MonoObject** exc);
+    extern void*         (*mono_object_unbox)(MonoObject* obj);
     extern MonoString*   (*mono_string_new)(MonoDomain* domain, const char* text);
     extern char*         (*mono_string_to_utf8)(MonoString* string_obj);
     extern void          (*mono_free)(void* ptr);
     extern MonoClass*    (*mono_object_get_class)(MonoObject* obj);
     extern void*         (*mono_array_addr_with_size)(MonoObject* array, int size, int index);
+    extern MonoArray*    (*mono_array_new)(MonoDomain* domain, MonoClass* eclass, uintptr_t n);
     extern gunichar2*    (*mono_string_chars)(MonoString* string_obj);
     extern int           (*mono_string_length)(MonoString* string_obj);
     extern void*         (*mono_vtable_get_static_field_data)(MonoVTable* vtable);

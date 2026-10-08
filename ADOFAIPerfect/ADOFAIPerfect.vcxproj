@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -61,7 +61,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(RepoRoot)deps\imgui;$(RepoRoot)deps\imgui\backends;$(RepoRoot)deps\detours\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(RepoRoot)deps\imgui;$(RepoRoot)deps\imgui\backends;$(RepoRoot)deps\detours\include;$(RepoRoot)deps\lua;$(RepoRoot)deps\sol2;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ExceptionHandling>Sync</ExceptionHandling>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -70,7 +70,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(RepoRoot)deps\detours\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>d3d12.lib;d3d11.lib;dxgi.lib;dxguid.lib;detours.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;d3d11.lib;dxgi.lib;dxguid.lib;detours.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>
       </ModuleDefinitionFile>
     </Link>
@@ -85,7 +85,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(RepoRoot)deps\imgui;$(RepoRoot)deps\imgui\backends;$(RepoRoot)deps\detours\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(RepoRoot)deps\imgui;$(RepoRoot)deps\imgui\backends;$(RepoRoot)deps\detours\include;$(RepoRoot)deps\lua;$(RepoRoot)deps\sol2;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ExceptionHandling>Sync</ExceptionHandling>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -98,7 +98,7 @@
       <MapFileName>$(OutDir)ADOFAIPerfect.map</MapFileName>
       <MapExports>true</MapExports>
       <AdditionalLibraryDirectories>$(RepoRoot)deps\detours\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>d3d12.lib;d3d11.lib;dxgi.lib;dxguid.lib;detours.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;d3d11.lib;dxgi.lib;dxguid.lib;detours.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>
       </ModuleDefinitionFile>
     </Link>
@@ -110,8 +110,52 @@
     <ClCompile Include="src\GameBridge.cpp" />
     <ClCompile Include="src\GameDetour.cpp" />
     <ClCompile Include="src\RenderHook.cpp" />
+    <ClCompile Include="src\GameRecorder.cpp" />
     <ClCompile Include="src\Menu.cpp" />
+    <ClCompile Include="src\ChartCore.cpp" />
+    <ClCompile Include="src\SkinMsp.cpp" />
+    <ClCompile Include="src\SkinLua.cpp" />
     <ClCompile Include="src\Chart4K.cpp" />
+    <ClCompile Include="src\Chart5K.cpp" />
+    <ClCompile Include="src\Chart6K.cpp" />
+    <ClCompile Include="src\Chart10K.cpp" />
+    <ClCompile Include="src\SightRead.cpp" />
+    <ClCompile Include="src\Lang.cpp" />
+    <ClCompile Include="src\KeyViewer.cpp" />
+    <ClCompile Include="src\GameDir.cpp" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lapi.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lauxlib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lbaselib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lbitlib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lcode.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lcorolib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lctype.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\ldblib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\ldebug.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\ldo.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\ldump.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lfunc.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lgc.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\linit.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\liolib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\llex.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lmathlib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lmem.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\loadlib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lobject.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lopcodes.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\loslib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lparser.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lstate.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lstring.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lstrlib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\ltable.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\ltablib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\ltm.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lundump.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lutf8lib.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lvm.c" />
+    <ClCompile Include="$(RepoRoot)deps\lua\lzio.c" />
     <ResourceCompile Include="ADOFAIPerfect.rc" />
     <ClCompile Include="$(RepoRoot)deps\imgui\imgui.cpp" />
     <ClCompile Include="$(RepoRoot)deps\imgui\imgui_draw.cpp" />
@@ -130,6 +174,9 @@
     <ClInclude Include="src\RenderHook.h" />
     <ClInclude Include="src\Menu.h" />
     <ClInclude Include="src\Chart4K.h" />
+    <ClInclude Include="src\ChartCore.h" />
+    <ClInclude Include="src\Lang.h" />
+    <ClInclude Include="src\GameDir.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

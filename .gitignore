@@ -1,4 +1,4 @@
-# ---- 构建产物 ----
+# ---- 构建产物（不提交，源码可完整重建）----
 bin/
 obj/
 release/
@@ -16,10 +16,15 @@ release/
 *.VC.db
 *.opendb
 
-# ---- 本地开发沙箱（反编译参考、测试脚本、截图）——不可发布 ----
+# ---- 本地开发/测试脚手架（不可发布）----
 .reverse/
 dumps/
 *.log
+.test/
+.testlogs/
+.testrec/
+.buildtmp/
+.build.ps1
 
 # ---- 临时文件 ----
 *.tmp

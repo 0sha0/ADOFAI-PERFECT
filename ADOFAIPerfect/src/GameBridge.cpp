@@ -1,12 +1,15 @@
-#include "GameBridge.h"
+﻿#include "GameBridge.h"
 #include "MonoApi.h"
 #include "CheatState.h"
 #include "Chart4K.h"
 #include "Log.h"
+#include "GameDetour.h"
 
 #include <windows.h>
 #include <cstring>
 #include <cstdio>
+#include <vector>
+#include <mutex>
 
 // ============================================================
 // 关键设计（由崩溃转储分析得出）：
@@ -39,6 +42,10 @@ namespace GameBridge
     static MonoClass* g_clsPlayer = nullptr;          // scrPlayer
     static MonoClass* g_clsGCS = nullptr;             // GCS
     static MonoClass* g_clsTracker = nullptr;         // scrMarginTracker
+    static MonoClass* g_clsPlanetSys = nullptr;       // PlanetarySystem
+    static MonoClass* g_clsPlanet = nullptr;          // scrPlanet
+    static MonoClass* g_clsFloorBr = nullptr;         // scrFloor（marginScale / nextfloor）
+    static MonoClass* g_clsConductor = nullptr;       // scrConductor（crotchetAtStart）
     static bool g_vtTrackerOK = false;                // tracker 类无需 vtable，仅标记 init 过
 
     static MonoVTable* g_vtController = nullptr;
@@ -46,6 +53,7 @@ namespace GameBridge
     static MonoVTable* g_vtPlayerMgr = nullptr;
     static MonoVTable* g_vtMistakes = nullptr;
     static MonoVTable* g_vtGCS = nullptr;
+    static MonoVTable* g_vtConductor = nullptr;
 
     // 缓存的字段偏移（运行时只用偏移，不再触碰 mono API）
     // 缓存的字段偏移（运行时只用偏移，不再触碰 mono API）
@@ -59,7 +67,9 @@ namespace GameBridge
     static StaticRefSlot g_rdData;
     static StaticRefSlot g_mgrInst;
     static StaticRefSlot g_trackerArr;
+    static StaticRefSlot g_csInst;                     // scrConductor._instance
     static uint32_t g_offNoFail = 0;
+    static uint32_t g_offLevelSkipped = 0;   // scrController.levelWasSkipped
     static uint32_t g_offGameworld = 0;
     static uint32_t g_offCurrentSeqID = 0;
     static uint32_t g_offLevelName = 0;
@@ -76,6 +86,22 @@ namespace GameBridge
     static uint32_t g_offTrackerXAcc = 0;
     static uint32_t g_offTrackerHits = 0;      // scrMarginTracker.hitMargins (List<HitMargin>)
     static uint32_t g_offTrackerCounts = 0;    // scrMarginTracker.hitMarginsCount (int[])
+    // 实时判定角度（scrPlanet / PlanetarySystem / scrFloor，全部逆向确认的字段名）
+    static uint32_t g_offPlayerPS = 0;         // scrPlayer.planetarySystem
+    static uint32_t g_offPSChosen = 0;         // PlanetarySystem.chosenPlanet
+    static uint32_t g_offPSSpeed = 0;          // PlanetarySystem.speed (double)
+    static uint32_t g_offPSCw = 0;             // PlanetarySystem.isCW (bool)
+    static uint32_t g_offPAngle = 0;           // scrPlanet.angle (double)
+    static uint32_t g_offPTarget = 0;          // scrPlanet.<targetExitAngle>k__BackingField (double)
+    static uint32_t g_offPlanetFloor = 0;      // scrPlanet.currfloor
+    static uint32_t g_offFloorNext = 0;        // scrFloor.nextfloor
+    static uint32_t g_offFloorMargin = 0;      // scrFloor.marginScale (double)
+    static uint32_t g_offGcsDiff = 0;          // GCS.difficulty (static int)
+    static uint32_t g_offGcsTrial = 0;         // GCS.currentSpeedTrial (static float)
+    static uint32_t g_offFloorSeq = 0;         // scrFloor.seqID (int)
+    static uint32_t g_offFloorHoldLen = 0;     // scrFloor.holdLength (int)
+    static uint32_t g_offFloorHoldComp = 0;    // scrFloor.holdCompletion (float)
+    static uint32_t g_offCsCrotchet = 0;       // scrConductor.crotchetAtStart (double)
     static int      g_maxCombo = 0;            // 本关历史最大连击（桥接侧统计）
 
     // 主线程开关应用（mono API 只能在游戏主线程调用）
@@ -342,6 +368,10 @@ namespace GameBridge
             g_clsPlayer = mono_class_from_name(g_img, "", "scrPlayer");
             g_clsGCS = mono_class_from_name(g_img, "", "GCS");
             g_clsTracker = mono_class_from_name(g_img, "", "scrMarginTracker");
+            g_clsPlanetSys = mono_class_from_name(g_img, "", "PlanetarySystem");
+            g_clsPlanet = mono_class_from_name(g_img, "", "scrPlanet");
+            g_clsFloorBr = mono_class_from_name(g_img, "", "scrFloor");
+            g_clsConductor = mono_class_from_name(g_img, "", "scrConductor");
             if (!g_clsController || !g_clsRDConstants || !g_clsPlayerMgr || !g_clsMistakes || !g_clsPlayer)
                 return false;
             Log::Printf("[Bridge] classes resolved");
@@ -411,6 +441,11 @@ namespace GameBridge
                 mono_class_init(g_clsTracker);
                 g_vtTrackerOK = true;
             }
+            if (g_clsConductor && !g_vtConductor)
+            {
+                mono_class_init(g_clsConductor);
+                g_vtConductor = mono_class_vtable(dom, g_clsConductor);
+            }
         }
 
         if (!g_ctrlInst.valid)
@@ -431,6 +466,8 @@ namespace GameBridge
             g_offLevelName = FieldOffset(g_clsController, "levelName");
         if (!g_offCurrentState)
             g_offCurrentState = FieldOffset(g_clsController, "currentState");
+        if (!g_offLevelSkipped)
+            g_offLevelSkipped = FieldOffset(g_clsController, "levelWasSkipped");
         if (!g_offPaused)
             g_offPaused = FieldOffset(g_clsController, "_paused");
         if (!g_offDeaths)
@@ -481,6 +518,46 @@ namespace GameBridge
             g_offTrackerHits = FieldOffset(g_clsTracker, "hitMargins");
         if (!g_offTrackerCounts && g_clsTracker)
             g_offTrackerCounts = FieldOffset(g_clsTracker, "hitMarginsCount");
+        if (!g_offPlayerPS && g_clsPlayer)
+            g_offPlayerPS = FieldOffset(g_clsPlayer, "planetarySystem");
+        if (!g_offPSChosen && g_clsPlanetSys)
+        {
+            g_offPSChosen = FieldOffset(g_clsPlanetSys, "chosenPlanet");
+            g_offPSSpeed = FieldOffset(g_clsPlanetSys, "speed");
+            g_offPSCw = FieldOffset(g_clsPlanetSys, "isCW");
+        }
+        if (!g_offPAngle && g_clsPlanet)
+        {
+            g_offPAngle = FieldOffset(g_clsPlanet, "angle");
+            g_offPTarget = FieldOffset(g_clsPlanet, "<targetExitAngle>k__BackingField");
+            g_offPlanetFloor = FieldOffset(g_clsPlanet, "currfloor");
+        }
+        if (!g_offFloorNext && g_clsFloorBr)
+        {
+            g_offFloorNext = FieldOffset(g_clsFloorBr, "nextfloor");
+            g_offFloorMargin = FieldOffset(g_clsFloorBr, "marginScale");
+        }
+        if (!g_offFloorSeq && g_clsFloorBr)
+        {
+            g_offFloorSeq = FieldOffset(g_clsFloorBr, "seqID");
+            g_offFloorHoldLen = FieldOffset(g_clsFloorBr, "holdLength");
+            g_offFloorHoldComp = FieldOffset(g_clsFloorBr, "holdCompletion");
+        }
+        if (g_clsConductor && !g_offCsCrotchet)
+            g_offCsCrotchet = FieldOffset(g_clsConductor, "crotchetAtStart");
+        if (!g_csInst.valid)
+        {
+            uint32_t off = FieldOffset(g_clsConductor, "_instance");
+            if (off)
+                g_csInst = { off, true };
+            else if (g_vtConductor)
+                g_csInst = DiscoverStaticRef(g_vtConductor, g_clsConductor);
+        }
+        if (!g_offGcsDiff && g_clsGCS)
+        {
+            g_offGcsDiff = FieldOffset(g_clsGCS, "difficulty");
+            g_offGcsTrial = FieldOffset(g_clsGCS, "currentSpeedTrial");
+        }
 
         if (g_vtController && g_vtRDConstants && g_ctrlInst.valid && g_offNoFail &&
             g_rdData.valid && g_offAuto)
@@ -524,12 +601,30 @@ namespace GameBridge
     {
         if (!g_postToMainThread)
             return;
+        if (CheatState::GameQuitting.load(std::memory_order_relaxed))
+            return;                       // 游戏退出中：不再打扰主线程
         if ((InterlockedOr(&g_taskFlags, bit) & bit) == 0)
             g_postToMainThread();
     }
 
     void QueueMainThreadInit() { PostTask(kTaskInit); }
     void QueueCheatApply() { PostTask(kTaskCheats); }
+
+    // ---- 通用主线程任务队列 ----
+    struct MainWork { void (*fn)(void*); void* ctx; };
+    static std::mutex g_workMx;
+    static std::vector<MainWork> g_work;
+    static const long kTaskWork = 4;
+
+    void QueueMainThreadWork(void (*fn)(void*), void* ctx)
+    {
+        if (!fn) return;
+        {
+            std::lock_guard<std::mutex> lk(g_workMx);
+            g_work.push_back(MainWork{ fn, ctx });
+        }
+        PostTask(kTaskWork);
+    }
 
     static void ApplyCheatsMainThread();   // 定义见下（开关应用，仅主线程）
 
@@ -559,21 +654,258 @@ namespace GameBridge
         }
     }
 
-    void MainThreadInitTask()
+    static thread_local int t_initDepth = 0;
+
+    // ---- 测试钩子：ADOFAI_PERFECT_QUITTEST=<秒> ----
+    //   到点后用游戏自己的 UnityEngine.Application.Quit() 退出，
+    //   与点击游戏里的"退出游戏"按钮走完全相同的路径（仅自动化测试用）。
+    static void QuitTestTick()
     {
+        static int   s_delay = -2;
+        static DWORD s_t0 = 0;
+        static bool  s_fired = false;
+        if (s_fired) return;
+        if (s_delay == -2)
+        {
+            char v[16] = { 0 };
+            s_delay = (GetEnvironmentVariableA("ADOFAI_PERFECT_QUITTEST", v, sizeof(v)) > 0) ? atoi(v) : -1;
+            s_t0 = GetTickCount();
+        }
+        if (s_delay <= 0 || GetTickCount() - s_t0 < (DWORD)s_delay * 1000u)
+            return;
+        s_fired = true;
+        MonoImage* img = mono_image_loaded("UnityEngine.CoreModule");
+        MonoClass* cls = img ? mono_class_from_name(img, "UnityEngine", "Application") : nullptr;
+        MonoMethod* m = cls ? mono_class_get_method_from_name(cls, "Quit", 0) : nullptr;
+        if (!m) { Log::Printf("[quit] Application.Quit not found"); return; }
+        Log::Printf("[quit] calling Application.Quit()");
+        MonoObject* exc = nullptr;
+        mono_runtime_invoke(m, nullptr, nullptr, &exc);
+        Log::Printf("[quit] Application.Quit() returned exc=%p", (void*)exc);
+    }
+
+    // 测试钩子：ADOFAI_PERFECT_TESTLEVEL=<自定义关卡绝对路径> + 延迟秒数后，
+    // 由主线程调用 scrController.LoadCustomLevel(path) 自动进入关卡
+    // （用于自动化验证冰与火宏/4K 谱面提取；普通运行零开销）
+    static std::atomic<bool> g_levelTestDone{ false };
+    static void* CtrlInstanceMainThread();   // 定义见下
+    // 主菜单直载关卡：复刻 scrController.LoadCustomLevel 的静态赋值 + scrLoader 切场景。
+    // 逆向依据（decomp/scrController.cs:2067）：LoadCustomLevel →
+    //   GCS.sceneToLoad="scnGame"; GCS.customLevelPaths=new string[1]{path};
+    //   GCS.loadCustomFromBundle=fromBundle; StartLoadingScene() →
+    //   ADOBase.loader.LoadSceneWithTransition(wipeDirection)。
+    // 主菜单（scnLevelSelect）里没有 scrController 实例，故走这条等价路径。
+    static bool LoadLevelViaLoaderMainThread(const char* path)
+    {
+        if (!MonoApi::Ready() || !mono_array_new || !mono_string_new || !mono_runtime_invoke ||
+            !mono_image_loaded || !mono_class_from_name || !mono_class_vtable ||
+            !mono_field_static_set_value || !mono_array_addr_with_size || !mono_domain_get ||
+            !mono_class_get_field_from_name || !mono_class_get_method_from_name)
+            return false;
+        MonoImage* img = mono_image_loaded("Assembly-CSharp");
+        MonoClass* clsGCS = img ? mono_class_from_name(img, "", "GCS") : nullptr;
+        MonoClass* clsLoader = img ? mono_class_from_name(img, "", "scrLoader") : nullptr;
+        MonoImage* imgCore = mono_image_loaded("mscorlib");
+        MonoClass* clsString = imgCore ? mono_class_from_name(imgCore, "System", "String") : nullptr;
+        if (!clsGCS || !clsLoader || !clsString)
+            return false;
+        MonoDomain* dom = mono_domain_get();
+        MonoVTable* vtGCS = dom ? mono_class_vtable(dom, clsGCS) : nullptr;
+        if (!vtGCS)
+            return false;
+        MonoClassField* fScene  = mono_class_get_field_from_name(clsGCS, "sceneToLoad");
+        MonoClassField* fPaths  = mono_class_get_field_from_name(clsGCS, "customLevelPaths");
+        MonoClassField* fBundle = mono_class_get_field_from_name(clsGCS, "loadCustomFromBundle");
+        if (!fScene || !fPaths || !fBundle)
+            return false;
+        MonoString* scene = mono_string_new(dom, "scnGame");
+        MonoArray*  paths = mono_array_new(dom, clsString, 1);
+        MonoString* level = mono_string_new(dom, path);
+        if (!scene || !paths || !level)
+            return false;
+        *(MonoString**)mono_array_addr_with_size((MonoObject*)paths, (int)sizeof(void*), 0) = level;
+        bool fromBundle = false;
+        mono_field_static_set_value(vtGCS, fScene, &scene);
+        mono_field_static_set_value(vtGCS, fPaths, &paths);
+        mono_field_static_set_value(vtGCS, fBundle, &fromBundle);
+
+        MonoMethod* mInst = mono_class_get_method_from_name(clsLoader, "get_instance", 0);
+        MonoObject* exc = nullptr;
+        MonoObject* loader = mInst ? mono_runtime_invoke(mInst, nullptr, nullptr, &exc) : nullptr;
+        if (!loader || exc)
+        {
+            Log::Printf("[test] level auto-load: scrLoader.instance null (%p exc=%p)", (void*)loader, (void*)exc);
+            return false;
+        }
+        MonoMethod* mLoad = mono_class_get_method_from_name(clsLoader, "LoadSceneWithTransition", 2);
+        if (!mLoad)
+        {
+            Log::Printf("[test] level auto-load: LoadSceneWithTransition not found");
+            return false;
+        }
+        int32_t wipe = 1;   // WipeDirection.StartsFromRight（LoadCustomLevel 的默认值）
+        void* args[2] = { &wipe, nullptr };
+        exc = nullptr;
+        mono_runtime_invoke(mLoad, loader, args, &exc);
+        Log::Printf("[test] level auto-load via loader: '%s' exc=%p", path, (void*)exc);
+        return !exc;
+    }
+    static void LevelTestTick()
+    {
+        static int   s_state = 0;      // 0=初始化 1=等待 2=完成
+        static DWORD s_t0 = 0;
+        static int   s_delay = 20;
+        static char  s_path[MAX_PATH * 2] = { 0 };
+        if (s_state >= 2) return;
+        if (s_state == 0)
+        {
+            s_state = 2;
+            if (GetEnvironmentVariableA("ADOFAI_PERFECT_TESTLEVEL", s_path, sizeof(s_path)) <= 0 || !s_path[0])
+            {
+                g_levelTestDone.store(true, std::memory_order_relaxed);
+                return;
+            }
+            char dv[16] = { 0 };
+            if (GetEnvironmentVariableA("ADOFAI_PERFECT_TESTDELAY", dv, sizeof(dv)) > 0)
+                s_delay = atoi(dv);
+            if (s_delay < 2) s_delay = 2;
+            s_t0 = GetTickCount();
+            s_state = 1;
+            Log::Printf("[test] level auto-load armed: '%s' in %ds", s_path, s_delay);
+            return;
+        }
+        if (GetTickCount() - s_t0 < (DWORD)s_delay * 1000u) return;
+        if (!g_clsController || !mono_string_new || !mono_runtime_invoke)
+        {
+            s_state = 2;
+            g_levelTestDone.store(true, std::memory_order_relaxed);
+            Log::Printf("[test] level auto-load: runtime not ready");
+            return;
+        }
+        void* ctrl = CtrlInstanceMainThread();
+        if (!ctrl)
+        {
+            if (LoadLevelViaLoaderMainThread(s_path))
+            {
+                s_state = 2;
+                g_levelTestDone.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                // 开场 logo / 运行时未就绪：等下一轮（BridgeLoop 每 2s 投递一次任务）
+                static DWORD s_lastWaitLog = 0;
+                if (GetTickCount() - s_t0 > 180000u)
+                {
+                    s_state = 2;
+                    g_levelTestDone.store(true, std::memory_order_relaxed);
+                    Log::Printf("[test] level auto-load: controller/loader path never ready");
+                }
+                else if (GetTickCount() - s_lastWaitLog > 10000u)
+                {
+                    s_lastWaitLog = GetTickCount();
+                    Log::Printf("[test] level auto-load: waiting for controller/loader ...");
+                }
+            }
+            return;
+        }
+        s_state = 2;
+        g_levelTestDone.store(true, std::memory_order_relaxed);
+        MonoMethod* m = mono_class_get_method_from_name(g_clsController, "LoadCustomLevel", 3);
+        if (!m)
+        {
+            Log::Printf("[test] level auto-load: LoadCustomLevel not found (m=null)");
+            return;
+        }
+        MonoDomain* dom = mono_domain_get ? mono_domain_get() : nullptr;
+        MonoString* sp = dom ? mono_string_new(dom, s_path) : nullptr;
+        int32_t fromBundle = 0;
+        void* args[3] = { sp, nullptr, &fromBundle };
+        MonoObject* exc = nullptr;
+        mono_runtime_invoke(m, ctrl, args, &exc);
+        Log::Printf("[test] level auto-load invoked: '%s' exc=%p", s_path, (void*)exc);
+    }
+    struct InitDepthScope { InitDepthScope() { ++t_initDepth; } ~InitDepthScope() { --t_initDepth; } };
+
+    // 真正的主线程工作（含 C++ 对象，不能直接放进 __try）
+    static void MainThreadInitTaskInner()
+    {
+        InitDepthScope depthScope;
         long flags = InterlockedExchange(&g_taskFlags, 0);
         static DWORD s_lastInitLog = 0;
-        if ((flags & kTaskInit) && GetTickCount() - s_lastInitLog > 2000)
+        if ((flags & kTaskInit) && GetTickCount() - s_lastInitLog > 60000)
         {
             s_lastInitLog = GetTickCount();
-            Log::Printf("[Bridge] main-thread init task running");
+            Log::Printf("[Bridge] main-thread init task running tid=%lu depth=%d",
+                        (unsigned long)GetCurrentThreadId(), t_initDepth);
         }
         InitCore(true);                 // 元数据解析（主线程 = mono 托管线程）
+        QuitTestTick();
+        LevelTestTick();
+        // 退出钩子：mono_compile_method 必须在托管主线程调用（协作式 Mono 约束），
+        // 幂等；装好后此调用立即返回。
+        GameDetour::TickQuitHookOnMainThread();
+        // 冰与火宏：scrPlayer 判定入口钩子（同样受 mono_compile_method 主线程约束）
+        GameDetour::TickInputHookOnMainThread();
         RefreshControllerInstanceMainThread();
         Chart4K::MainThreadResolve();   // 4K 辅助：主线程安全创建 vtable / 解析偏移
+        // 只要队列里有工作就跑（不再依赖 kTaskWork 标志）：
+        //   某些 MOD 的 Load/OnToggle 会弹出 Win32 模态对话框（如 Creplay 的
+        //   System.Windows.Forms.MessageBox）。模态循环仍会 DispatchMessage 本线程所有窗口的消息，
+        //   于是 kMsgBridgeInit -> MainThreadInitTask 会被重入；此时若坚持看 kTaskWork 标志，
+        //   排在后面的 MOD 就永远加载不到。无条件排空队列后，后续 MOD 在重入帧里继续加载。
+        // 逐条"取出即执行"（而不是一次性 swap 到局部数组）：
+        //   Creplay 这类 MOD 会在 Load/OnToggle 里弹 Win32 模态对话框，模态循环仍会
+        //   DispatchMessage 本线程的消息 -> kMsgBridgeInit -> 本函数被重入（depth=2）。
+        //   任务保留在共享队列里，重入帧才能继续把后面的 MOD 加载完（官方 UMM 在这里会整体卡死）。
+        for (;;)
+        {
+            MainWork job;
+            {
+                std::lock_guard<std::mutex> lk(g_workMx);
+                if (g_work.empty()) break;
+                job = g_work.front();
+                g_work.erase(g_work.begin());
+            }
+            if (job.fn) job.fn(job.ctx);
+        }
         if ((flags & kTaskCheats) || CheatState::NoDeath.load(std::memory_order_relaxed) ||
             CheatState::AutoCombo.load(std::memory_order_relaxed))
             ApplyCheatsMainThread();
+    }
+
+    void MainThreadInitTask()
+    {
+        // 卸载路径的摘钩请求优先处理：即使游戏已进入退出流程也必须执行，
+        // 否则 FreeLibrary 后残留的 detour 会让下一次 Application.Quit 跳到已卸载内存。
+        if (GameDetour::QuitHookDetachRequested())
+        {
+            GameDetour::TickQuitHookOnMainThread();   // 只做 DetourDetach，不调用 mono
+            return;
+        }
+        if (GameDetour::InputHookDetachRequested())
+        {
+            GameDetour::TickInputHookOnMainThread();  // 只做 DetourDetach，不调用 mono
+            return;
+        }
+        if (CheatState::GameQuitting.load(std::memory_order_relaxed))
+            return;                       // 退出流程里不再调用 Mono（否则可能与运行时锁死锁）
+        // 游戏已经不出帧（退出中 / 设备丢失 / 长时间挂起）：本帧不执行 Mono 工作。
+        // 这是"点退出游戏卡死"的第二道保险 —— 关停中的 Mono 运行时一旦被外部调用就可能死锁。
+        {
+            const unsigned long last = CheatState::LastPresentMs.load(std::memory_order_relaxed);
+            if (last != 0 && (GetTickCount() - last) > 4000ul)
+                return;
+        }
+        __try
+        {
+            MainThreadInitTaskInner();
+        }
+        __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                      ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+        {
+            Log::Printf("[Bridge] AV in MainThreadInitTask -> tool dormant");
+            CheatState::GameQuitting.store(true, std::memory_order_relaxed);
+        }
     }
 
     // 由 RenderHook 注入投递函数（PostMessage 到游戏窗口）
@@ -595,10 +927,23 @@ namespace GameBridge
             return nullptr;
         if (!g_fieldInstance)
             g_fieldInstance = mono_class_get_field_from_name(g_clsController, "_instance");
-        if (!g_fieldInstance)
-            return nullptr;
         void* obj = nullptr;
-        mono_field_static_get_value(g_vtController, g_fieldInstance, &obj);
+        if (g_fieldInstance)
+            mono_field_static_get_value(g_vtController, g_fieldInstance, &obj);
+        if (!obj)
+        {
+            // _instance 只有被 instance 属性访问过才有值；直接调 getter（内部 FindAnyObjectByType）
+            static MonoMethod* mInst = nullptr;
+            if (!mInst)
+                mInst = mono_class_get_method_from_name(g_clsController, "get_instance", 0);
+            if (mInst)
+            {
+                MonoObject* exc = nullptr;
+                MonoObject* o = mono_runtime_invoke(mInst, nullptr, nullptr, &exc);
+                if (!exc && o)
+                    obj = o;
+            }
+        }
         return obj;
     }
 
@@ -609,6 +954,14 @@ namespace GameBridge
 
         bool wantNoFail = CheatState::NoDeath.load(std::memory_order_relaxed);
         bool wantAuto = CheatState::AutoCombo.load(std::memory_order_relaxed);
+
+        // 冰与火宏模式：宏要自己按键打歌 ⇒ 抑制游戏内置自动演奏（RDC.auto），
+        // 同时强制不死，避免宏的拟人失误直接判定死亡（判定本身仍照常记 MISS）。
+        if (Chart4K::FireMacroEnabled())
+        {
+            wantAuto = false;
+            wantNoFail = true;
+        }
 
         // ---- 不死模式：scrController.noFail ----
         if (!g_fieldNoFail)
@@ -808,7 +1161,232 @@ namespace GameBridge
                 st.maxCombo = g_maxCombo;
             }
         }
+
+        // ---- 判定窗口参数（慢循环）：GCS 难度 / 试炼倍率 / 下一块 marginScale ----
+        //   scrMisc.GetAdjustedAngleBoundaryInDeg 依赖这三个值 + bpm*speed + pitch；
+        //   marginScale 取自 currfloor.nextfloor.marginScale（scrPlanet.SwitchChosen 同源）。
+        if (g_vtGCS && g_offGcsDiff)
+            st.difficulty = ReadStatic<int>(g_vtGCS, g_offGcsDiff, 1);
+        if (g_vtGCS && g_offGcsTrial)
+            st.speedTrial = ReadStatic<float>(g_vtGCS, g_offGcsTrial, 1.f);
+        if (player && g_offPlayerPS && g_offPSChosen && g_offPlanetFloor &&
+            g_offFloorNext && g_offFloorMargin)
+        {
+            void* ps = ReadInst<void*>(player, g_offPlayerPS, nullptr);
+            void* planet = ps ? ReadInst<void*>(ps, g_offPSChosen, nullptr) : nullptr;
+            if (planet)
+            {
+                void* cf = ReadInst<void*>(planet, g_offPlanetFloor, nullptr);
+                void* nf = cf ? ReadInst<void*>(cf, g_offFloorNext, nullptr) : nullptr;
+                if (nf)
+                    st.marginScale = ReadInst<double>(nf, g_offFloorMargin, 1.0);
+            }
+        }
         PublishStatus(st);
+    }
+
+    // ============================================================
+    // 实时判定角度快循环（7ms）：player → planetarySystem → chosenPlanet
+    //   scrPlanet.angle / <targetExitAngle>k__BackingField 均为 double（弧度），
+    //   PlanetarySystem.speed / isCW 为速度倍率与旋转方向（均逆向确认的字段）。
+    //   误差采用 scrMisc.GetHitMargin 的约定：
+    //     err = (angle - targetExitAngle) * (isCW ? 1 : -1)
+    //   换算成度后：负 = 早（星球还没转到目标角），正 = 晚（已经越过）。
+    // ============================================================
+    static std::atomic<bool>   s_plOk{ false };
+    static std::atomic<double> s_plErrDeg{ 0.0 };
+    static std::atomic<double> s_plSpeed{ 1.0 };
+    static DWORD               s_plFaultUntil = 0;
+
+    static void ReadPlanetFastInner()
+    {
+        if (!g_offPlayerPS || !g_offPAngle)
+        {
+            s_plOk.store(false, std::memory_order_relaxed);
+            return;
+        }
+        void* mgr = g_mgrInst.valid
+                        ? ReadStatic<void*>(g_vtPlayerMgr, g_mgrInst.offset, nullptr)
+                        : nullptr;
+        void* playersArr = mgr ? ReadInst<void*>(mgr, g_offMgrPlayers, nullptr) : nullptr;
+        void* player = ArrayElement(playersArr, 0);
+        void* ps = player ? ReadInst<void*>(player, g_offPlayerPS, nullptr) : nullptr;
+        void* planet = (ps && g_offPSChosen) ? ReadInst<void*>(ps, g_offPSChosen, nullptr) : nullptr;
+        if (!planet)
+        {
+            s_plOk.store(false, std::memory_order_relaxed);
+            return;
+        }
+        double angle  = ReadInst<double>(planet, g_offPAngle, 0.0);
+        double target = g_offPTarget ? ReadInst<double>(planet, g_offPTarget, 0.0) : angle;
+        bool   cw     = (ps && g_offPSCw) ? ReadInst<bool>(ps, g_offPSCw, true) : true;
+        double speed  = (ps && g_offPSSpeed) ? ReadInst<double>(ps, g_offPSSpeed, 1.0) : 1.0;
+        double err = (angle - target) * (cw ? 1.0 : -1.0);
+        const double kPi = 3.14159265358979323846;
+        static bool s_plLogged = false;
+        if (!s_plLogged)
+        {
+            s_plLogged = true;
+            Log::Printf("[Bridge] planet live: angle=%.3f target=%.3f errDeg=%.1f cw=%d speed=%.2f",
+                        angle, target, err * 180.0 / kPi, (int)cw, speed);
+        }
+        s_plErrDeg.store(err * 180.0 / kPi, std::memory_order_relaxed);
+        s_plSpeed.store((speed > 0.02 && speed < 100.0) ? speed : 1.0, std::memory_order_relaxed);
+        s_plOk.store(true, std::memory_order_relaxed);
+    }
+
+    static void ReadPlanetFastSafe()
+    {
+        DWORD now = GetTickCount();
+        if (s_plFaultUntil && now < s_plFaultUntil)
+            return;
+        __try
+        {
+            ReadPlanetFastInner();
+        }
+        __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                      ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+        {
+            s_plFaultUntil = now + 500;   // 切场景瞬间对象销毁：短退避后自动重试
+            s_plOk.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    void GetPlanetLive(PlanetLive* out)
+    {
+        if (!out)
+            return;
+        out->ok     = s_plOk.load(std::memory_order_relaxed);
+        out->errDeg = s_plErrDeg.load(std::memory_order_relaxed);
+        out->speed  = s_plSpeed.load(std::memory_order_relaxed);
+    }
+
+    // ============================================================
+    // 冰与火宏模式：判定现场同步读取（游戏主线程输入钩子每帧调用）
+    //   读取链 = ReadPlanetFastInner + scrController(gameworld/paused/state)
+    //            + scrPlanet.currfloor(seqID / holdLength / holdCompletion)
+    //   与慢循环不同，这里每次都读最新值；调用点就是游戏本帧判定输入的位置。
+    // ============================================================
+    static void ReadFireCtxInner(FireCtx* out)
+    {
+        out->ok = false;
+        if (!g_offPlayerPS || !g_offPAngle)
+            return;
+
+        void* mgr = g_mgrInst.valid
+                        ? ReadStatic<void*>(g_vtPlayerMgr, g_mgrInst.offset, nullptr)
+                        : nullptr;
+        void* playersArr = mgr ? ReadInst<void*>(mgr, g_offMgrPlayers, nullptr) : nullptr;
+        void* player = ArrayElement(playersArr, 0);
+        out->player = player;
+        void* ps = player ? ReadInst<void*>(player, g_offPlayerPS, nullptr) : nullptr;
+        void* planet = (ps && g_offPSChosen) ? ReadInst<void*>(ps, g_offPSChosen, nullptr) : nullptr;
+
+        void* ctrl = g_ctrlFreshPub.load(std::memory_order_acquire)
+                         ? g_ctrlFresh.load(std::memory_order_acquire)
+                         : (g_ctrlInst.valid
+                                ? ReadStatic<void*>(g_vtController, g_ctrlInst.offset, nullptr)
+                                : nullptr);
+        if (ctrl)
+        {
+            if (g_offGameworld)    out->gameworld = ReadInst<bool>(ctrl, g_offGameworld, false);
+            if (g_offPaused)       out->paused    = ReadInst<bool>(ctrl, g_offPaused, false);
+            if (g_offCurrentState)
+            {
+                out->state     = ReadInst<int>(ctrl, g_offCurrentState, -1);
+                out->inControl = (out->state == 4);      // States.PlayerControl
+            }
+        }
+        else if (g_offCurrentState)
+        {
+            out->inControl = false;
+        }
+
+        double speed = (ps && g_offPSSpeed) ? ReadInst<double>(ps, g_offPSSpeed, 1.0) : 1.0;
+        out->speed = (speed > 0.02 && speed < 100.0) ? speed : 1.0;
+
+        // 每秒 180°（π/拍，与 scrPlanet.Update_RefreshAngles 的角度公式同源）：
+        //   angle = snappedLastAngle + (songpos - player.lastHit)/crotchet * π * speed * dir
+        // 由此 1ms 对应的角度 = 180*speed/(crotchet*1000) 度。
+        if (g_csInst.valid && g_offCsCrotchet)
+        {
+            void* cs = ReadStatic<void*>(g_vtConductor, g_csInst.offset, nullptr);
+            double crotchet = cs ? ReadInst<double>(cs, g_offCsCrotchet, 0.0) : 0.0;
+            if (crotchet > 0.0005 && crotchet < 60.0)
+                out->crotchet = crotchet;
+        }
+
+        if (!planet)
+            return;
+        double angle  = ReadInst<double>(planet, g_offPAngle, 0.0);
+        double target = g_offPTarget ? ReadInst<double>(planet, g_offPTarget, angle) : angle;
+        bool   cw     = (ps && g_offPSCw) ? ReadInst<bool>(ps, g_offPSCw, true) : true;
+        const double kPi = 3.14159265358979323846;
+        out->errDeg = (angle - target) * (cw ? 1.0 : -1.0) * 180.0 / kPi;
+
+        void* floor = g_offPlanetFloor ? ReadInst<void*>(planet, g_offPlanetFloor, nullptr) : nullptr;
+        if (floor)
+        {
+            if (g_offFloorSeq)      out->floorIndex = ReadInst<int>(floor, g_offFloorSeq, -1);
+            if (g_offFloorHoldLen)  out->holdLength = ReadInst<int>(floor, g_offFloorHoldLen, -1);
+            if (g_offFloorHoldComp) out->holdCompletion = (double)ReadInst<float>(floor, g_offFloorHoldComp, 0.f);
+            void* nf = g_offFloorNext ? ReadInst<void*>(floor, g_offFloorNext, nullptr) : nullptr;
+            out->hasNext = (nf != nullptr);
+            if (nf && g_offFloorMargin)
+            {
+                double ms = ReadInst<double>(nf, g_offFloorMargin, 1.0);
+                out->marginScale = (ms > 0.01 && ms < 100.0) ? ms : 1.0;
+            }
+        }
+        out->ok = true;
+    }
+
+    bool ReadFireCtx(FireCtx* out)
+    {
+        if (!out)
+            return false;
+        *out = FireCtx{};
+        DWORD now = GetTickCount();
+        if (s_plFaultUntil && now < s_plFaultUntil)
+            return false;
+        __try
+        {
+            ReadFireCtxInner(out);
+        }
+        __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                      ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+        {
+            out->ok = false;
+        }
+        return out->ok;
+    }
+
+    // 「Press to start」等待输入：宏模式下自动置 levelWasSkipped（游戏 debug 的
+    // BeatLevel 也只置这一个标记 + 结算；这里只置标记，不结算关卡）。
+    // 逆向依据：scrController.WaitForStartCo() 的
+    //   while (!levelWasSkipped && (!AnyValidInputWasTriggered() || isCutscene)) yield return null;
+    // 置位后协程立刻进入 ShowGetReady → conductor.Start() → Start_Rewind()。
+    bool SetLevelWasSkipped(bool on)
+    {
+        if (!g_offLevelSkipped)
+            return false;
+        __try
+        {
+            void* ctrl = g_ctrlFreshPub.load(std::memory_order_acquire)
+                             ? g_ctrlFresh.load(std::memory_order_acquire)
+                             : (g_ctrlInst.valid
+                                    ? ReadStatic<void*>(g_vtController, g_ctrlInst.offset, nullptr)
+                                    : nullptr);
+            if (!ctrl)
+                return false;
+            *reinterpret_cast<bool*>(reinterpret_cast<char*>(ctrl) + g_offLevelSkipped) = on;
+            return true;
+        }
+        __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                      ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+        {
+            return false;
+        }
     }
 
     // ---------------- SEH 包装 ----------------
@@ -855,6 +1433,12 @@ namespace GameBridge
         int tickCount = 0;
         while (!CheatState::ExitRequested.load(std::memory_order_relaxed))
         {
+            if (CheatState::GameQuitting.load(std::memory_order_relaxed))
+            {
+                // 游戏退出中：不再读游戏状态 / 不再投递主线程任务，安静待着
+                Sleep(50);
+                continue;
+            }
             if (g_monoDisabled && g_monoDisableUntil && GetTickCount() > g_monoDisableUntil)
             {
                 g_monoDisabled = false;
@@ -872,6 +1456,9 @@ namespace GameBridge
                 TickSafe();
                 // 4K 辅助：歌曲时钟 + 谱面提取（纯内存读取，独立于 mono 禁用状态）
                 Chart4K::Tick();
+                // 实时判定角度（读谱辅助的角度判定条，7ms 刷新）
+                if (!g_monoDisabled)
+                    ReadPlanetFastSafe();
                 // 就绪后继续补齐 gameplay 引用（playerMgr / marginTrackers
                 // 需要游戏实际创建这些单例后才能发现）
                 if (!g_mgrInst.valid || !g_trackerArr.valid || !g_offTrackerAcc || !g_offMgrPlayers)
@@ -880,6 +1467,9 @@ namespace GameBridge
                     if ((s_slow++ % 60) == 0) // ~0.5s 一次
                         QueueMainThreadInit();
                 }
+                // 退出钩子尚未装好时周期性重投（幂等，装好后零开销）
+                if (!GameDetour::QuitHookSettled() && (tickCount % 140) == 0)
+                    QueueMainThreadInit();
                 if (!g_monoDisabled && (tickCount % 10) == 0)
                     ReadStatusSafe();
             }
@@ -887,6 +1477,12 @@ namespace GameBridge
             if ((CheatState::NoDeath.load(std::memory_order_relaxed) ||
                  CheatState::AutoCombo.load(std::memory_order_relaxed)) && (tickCount % 30) == 0)
                 QueueCheatApply();
+            // 冰与火宏模式：输入钩子的安装/摘除只能在游戏主线程（mono_compile_method 约束）
+            if (!GameDetour::InputHookSettled() && (tickCount % 20) == 0)
+                QueueMainThreadInit();
+            // 测试钩子：待自动载入关卡时周期投递主线程任务
+            if (!g_levelTestDone.load(std::memory_order_relaxed) && (tickCount % 60) == 0)
+                QueueMainThreadInit();
             tickCount++;
             Sleep(g_ready ? 7 : 100);
         }

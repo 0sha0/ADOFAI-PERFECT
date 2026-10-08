@@ -1,9 +1,9 @@
-// ADOFAI PERFECT - DLL version resource
+// ADOFAI PERFECT - DLL version resource + embedded logo (RCDATA)
 #include <windows.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,1,0,0
- PRODUCTVERSION 1,1,0,0
+ FILEVERSION 1,2,0,0
+ PRODUCTVERSION 1,2,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -16,12 +16,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "SHASHEN4404"
             VALUE "FileDescription", "ADOFAI PERFECT overlay module"
-            VALUE "FileVersion", "1.1.0.0"
+            VALUE "FileVersion", "1.2.0.0"
             VALUE "InternalName", "ADOFAIPerfect"
             VALUE "LegalCopyright", "Copyright (C) 2026 SHASHEN4404 - MIT License"
             VALUE "OriginalFilename", "ADOFAIPerfect.dll"
             VALUE "ProductName", "ADOFAI PERFECT"
-            VALUE "ProductVersion", "1.1.0.0"
+            VALUE "ProductVersion", "1.2.0.0"
         END
     END
     BLOCK "VarFileInfo"
@@ -29,3 +29,7 @@ BEGIN
         VALUE "Translation", 0x804, 1200
     END
 END
+
+// Embedded app logo for the About page. ID must match kLogoResId in Menu.cpp
+#define IDR_ADOFAI_LOGO 101
+IDR_ADOFAI_LOGO  RCDATA  "../assets/adoFaiPerfect-icon.png"

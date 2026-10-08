@@ -1,6 +1,7 @@
-#include "RenderHook.h"
+﻿#include "RenderHook.h"
 #include "CheatState.h"
 #include "GameBridge.h"
+#include "GameRecorder.h"
 #include "Log.h"
 #include "Menu.h"
 
@@ -72,6 +73,10 @@ namespace RenderHook
     {
         ID3D12CommandAllocator* allocator = nullptr;
         UINT64 fenceValue = 0;
+        ID3D12Resource* recBuf = nullptr;      // 录制回读（READBACK 堆）
+        UINT   recW = 0, recH = 0, recPitch = 0;
+        bool   recValid = false;
+        bool   recSwap = false;                // 来源为 RGBA（R8G8B8A8）时写盘前交换 R/B
     };
     static FrameCtx12 g_frames12[kNumFramesInFlight];
     static ID3D12GraphicsCommandList* g_cmdList12 = nullptr;
@@ -91,6 +96,7 @@ namespace RenderHook
     // 在 Present 钩子内、绘制覆盖层"之前"把后缓冲拷进独立纹理 —— 得到的是
     // 游戏自己的干净画面（Unity 渲染结果，不含本工具任何 UI）。
     static std::atomic<bool> g_capWanted{ false };
+    static std::atomic<bool> g_recWanted{ false };   // 录制开关（渲染线程每帧设置）
     static ID3D11Texture2D*          g_capTex11 = nullptr;
     static ID3D11ShaderResourceView* g_capSrv11 = nullptr;
     static UINT g_capW11 = 0, g_capH11 = 0;
@@ -144,6 +150,16 @@ namespace RenderHook
     // ============ WndProc ============
     static LRESULT WINAPI HK_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
+        // 游戏退出中：立刻停手（不再派发桥接任务、不再碰 ImGui），把消息原样还给 Unity。
+        if (msg == WM_CLOSE || msg == WM_DESTROY || msg == WM_NCDESTROY ||
+            msg == WM_QUERYENDSESSION || msg == WM_ENDSESSION)
+        {
+            if (!CheatState::GameQuitting.exchange(true, std::memory_order_relaxed))
+                Log::Printf("[Main] game shutdown detected (msg=0x%04X) - tool dormant", (unsigned)msg);
+            return CallWindowProcW(g_origWndProc, hwnd, msg, wp, lp);
+        }
+        if (CheatState::GameQuitting.load(std::memory_order_relaxed))
+            return CallWindowProcW(g_origWndProc, hwnd, msg, wp, lp);
         if (msg == kMsgBridgeInit)
         {
             GameBridge::MainThreadInitTask(); // 在游戏主线程（mono 托管线程）执行
@@ -332,6 +348,43 @@ namespace RenderHook
         return true;
     }
 
+    // 录制回读缓冲（D3D12，READBACK 堆；每帧槽一份，尺寸随窗口）
+    static bool EnsureRecBuf12(FrameCtx12& fc, ID3D12Resource* capTex)
+    {
+        if (!g_dev12 || !capTex) return false;
+        D3D12_RESOURCE_DESC cd = capTex->GetDesc();
+        DXGI_FORMAT cf = cd.Format;
+        if (cf == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) cf = DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (cf == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) cf = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (cf != DXGI_FORMAT_B8G8R8A8_UNORM && cf != DXGI_FORMAT_R8G8B8A8_UNORM)
+            return false;
+        const UINT w = (UINT)cd.Width, h = cd.Height;
+        const UINT pitch = (w * 4 + 255u) & ~255u;
+        if (fc.recBuf && fc.recW == w && fc.recH == h)
+            return true;
+        if (fc.recBuf) { fc.recBuf->Release(); fc.recBuf = nullptr; }
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = (UINT64)pitch * h;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* buf = nullptr;
+        if (FAILED(g_dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buf))) || !buf)
+            return false;
+        fc.recBuf = buf;
+        fc.recW = w; fc.recH = h; fc.recPitch = pitch;
+        fc.recValid = false;
+        fc.recSwap = (cf == DXGI_FORMAT_R8G8B8A8_UNORM);
+        Log::Printf("[rec] DX12 readback %ux%u pitch=%u fmt=%d", w, h, pitch, (int)cd.Format);
+        return true;
+    }
+
     // ============ ImGui 初始化 ============
     static bool InitImGui(IDXGISwapChain* sc, Api api)
     {
@@ -341,6 +394,9 @@ namespace RenderHook
 
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
+
+        // 不写 imgui.ini：避免在游戏/运行目录留下临时文件（窗口位置由代码持久管理）
+        ImGui::GetIO().IniFilename = nullptr;
 
         ImGuiStyle& style = ImGui::GetStyle();
         style.WindowRounding = 12.f;
@@ -491,6 +547,26 @@ namespace RenderHook
         if (flags & DXGI_PRESENT_TEST)
             return;
 
+        // 每帧打点：主线程侧凭它判断"游戏还在出帧"，退出/设备丢失时自动停手
+        CheatState::LastPresentMs.store((unsigned long)GetTickCount(), std::memory_order_relaxed);
+
+        // 游戏已进入退出流程：不做任何绘制/捕获/录制（录制只收尾一次），
+        // 避免在设备销毁过程中与 Unity 抢资源或阻塞退出。
+        if (CheatState::GameQuitting.load(std::memory_order_relaxed))
+        {
+            static bool s_recStopped = false;
+            if (!s_recStopped)
+            {
+                s_recStopped = true;
+                GameRecorder::Stop();
+                RenderHook_SetCaptureWanted(false);
+                g_capWanted.store(false, std::memory_order_relaxed);
+                g_recWanted.store(false, std::memory_order_relaxed);
+                Log::Printf("[Main] render hook dormant (game quitting)");
+            }
+            return;
+        }
+
         // 调试开关：ADOF_NOUI=1 禁用覆盖层（仅挂钩不绘制）
         static bool s_noUi = false;
         {
@@ -587,6 +663,20 @@ namespace RenderHook
             WaitForSingleObject(g_fenceEvent12, 1000);
         }
 
+        // 录制回读（D3D12）：上一轮用该槽写好的 staging 已由上面的 fence 保证完成
+        if (g_recWanted.load(std::memory_order_relaxed) && fc.recValid && fc.recBuf)
+        {
+            void* p = nullptr;
+            D3D12_RANGE rr = { 0, (SIZE_T)fc.recPitch * fc.recH };
+            if (SUCCEEDED(fc.recBuf->Map(0, &rr, &p)) && p)
+            {
+                GameRecorder::PushPixels(p, (int)fc.recW, (int)fc.recH, (int)fc.recPitch, fc.recSwap);
+                D3D12_RANGE wr = { 0, 0 };
+                fc.recBuf->Unmap(0, &wr);
+            }
+            fc.recValid = false;
+        }
+
         if (!EnsureRT12(sc3))
             return;
 
@@ -621,6 +711,37 @@ namespace RenderHook
             g_cmdList12->ResourceBarrier(1, &cb);
         }
 
+        // 录制：capture 贴图 → READBACK 缓冲（下一轮的 fence 之后再 Map）
+        if (g_recWanted.load(std::memory_order_relaxed) && g_capTex12 &&
+            EnsureRecBuf12(fc, g_capTex12))
+        {
+            D3D12_RESOURCE_BARRIER rb = {};
+            rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb.Transition.pResource = g_capTex12;
+            rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            rb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            g_cmdList12->ResourceBarrier(1, &rb);
+            D3D12_TEXTURE_COPY_LOCATION dst = {};
+            dst.pResource = fc.recBuf;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Offset = 0;
+            dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            dst.PlacedFootprint.Footprint.Width = fc.recW;
+            dst.PlacedFootprint.Footprint.Height = fc.recH;
+            dst.PlacedFootprint.Footprint.Depth = 1;
+            dst.PlacedFootprint.Footprint.RowPitch = fc.recPitch;
+            D3D12_TEXTURE_COPY_LOCATION src = {};
+            src.pResource = g_capTex12;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = 0;
+            g_cmdList12->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            rb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            g_cmdList12->ResourceBarrier(1, &rb);
+            fc.recValid = true;
+        }
+
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         g_cmdList12->ResourceBarrier(1, &barrier);
@@ -651,6 +772,84 @@ namespace RenderHook
     }
 
     // ============ D3D11 渲染 ============
+    // 录制回读（D3D11）：3 槽 staging 环；Map(DO_NOT_WAIT) 永远只读"两帧前"的槽，
+    // GPU 此时已完成该拷贝 —— 渲染线程零等待，读不到就丢这一帧。
+    static ID3D11Texture2D* g_stage11[3] = {};
+    static int g_stageW11 = 0, g_stageH11 = 0, g_stageIdx11 = 0;
+
+    static void RecordFrameDX11(ID3D11Texture2D* back)
+    {
+        if (!g_ctx11 || !g_dev11 || !back || !GameRecorder::Active())
+            return;
+        D3D11_TEXTURE2D_DESC d{};
+        back->GetDesc(&d);
+        // 后缓冲常见两种：B8G8R8A8（BGRA，直接用）与 R8G8B8A8（RGBA，编码前交换 R/B）
+        DXGI_FORMAT bf = d.Format;
+        if (bf == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) bf = DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (bf == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) bf = DXGI_FORMAT_R8G8B8A8_UNORM;
+        const bool swapRB = (bf == DXGI_FORMAT_R8G8B8A8_UNORM);
+        if (bf != DXGI_FORMAT_B8G8R8A8_UNORM && bf != DXGI_FORMAT_R8G8B8A8_UNORM)
+        {
+            static bool s_fmtLogged = false;
+            if (!s_fmtLogged)
+            {
+                s_fmtLogged = true;
+                Log::Printf("[rec] unsupported backbuffer format %d -> recording disabled", (int)d.Format);
+            }
+            return;
+        }
+        if (!g_stage11[0] || g_stageW11 != (int)d.Width || g_stageH11 != (int)d.Height)
+        {
+            for (int i = 0; i < 3; i++)
+                if (g_stage11[i]) { g_stage11[i]->Release(); g_stage11[i] = nullptr; }
+            D3D11_TEXTURE2D_DESC sd = d;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.BindFlags = 0;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            sd.MiscFlags = 0;
+            sd.MipLevels = 1;
+            sd.ArraySize = 1;
+            sd.SampleDesc.Count = 1;
+            sd.SampleDesc.Quality = 0;
+            for (int i = 0; i < 3; i++)
+                if (FAILED(g_dev11->CreateTexture2D(&sd, nullptr, &g_stage11[i])))
+                    g_stage11[i] = nullptr;
+            if (!g_stage11[0] || !g_stage11[1] || !g_stage11[2])
+            {
+                for (int i = 0; i < 3; i++)
+                    if (g_stage11[i]) { g_stage11[i]->Release(); g_stage11[i] = nullptr; }
+                return;
+            }
+            g_stageW11 = (int)d.Width;
+            g_stageH11 = (int)d.Height;
+            g_stageIdx11 = 0;
+            Log::Printf("[rec] DX11 staging ring %dx%d", g_stageW11, g_stageH11);
+        }
+        const int i = g_stageIdx11;
+        g_stageIdx11 = (g_stageIdx11 + 1) % 3;
+        g_ctx11->CopyResource(g_stage11[i], back);
+        const int r = (i + 1) % 3;
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (g_ctx11->Map(g_stage11[r], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m) == S_OK)
+        {
+            GameRecorder::PushPixels(m.pData, g_stageW11, g_stageH11, (int)m.RowPitch, swapRB);
+            g_ctx11->Unmap(g_stage11[r], 0);
+            static bool s_pushLogged = false;
+            if (!s_pushLogged)
+            {
+                s_pushLogged = true;
+                Log::Printf("[rec] first DX11 frame pushed %dx%d rowPitch=%u fmt=%d swapRB=%d",
+                            g_stageW11, g_stageH11, m.RowPitch, (int)d.Format, (int)swapRB);
+            }
+        }
+        else
+        {
+            static int s_mapFail = 0;
+            if (++s_mapFail == 60)
+                Log::Printf("[rec] staging map still busy after 60 frames");
+        }
+    }
+
     static void RenderDX11(IDXGISwapChain* sc)
     {
         if (!EnsureRT11(sc))
@@ -673,6 +872,17 @@ namespace RenderHook
             if (SUCCEEDED(sc->GetBuffer(bb, IID_PPV_ARGS(&back))) && back)
             {
                 g_ctx11->CopyResource(g_capTex11, back);
+                back->Release();
+            }
+        }
+
+        // 录制：干净画面 → staging 环（独立于小窗）
+        if (g_recWanted.load(std::memory_order_relaxed))
+        {
+            ID3D11Texture2D* back = nullptr;
+            if (SUCCEEDED(sc->GetBuffer(bb, IID_PPV_ARGS(&back))) && back)
+            {
+                RecordFrameDX11(back);
                 back->Release();
             }
         }
@@ -1064,6 +1274,73 @@ namespace RenderHook
         return s_cache;
     }
 
+    // WIC 内存解码（RCDATA 内嵌 PNG 用；流式解码，无需落盘）
+    static bool DecodeImageRGBAFromMemory(const void* data, size_t size,
+                                          std::vector<BYTE>* px, UINT* outW, UINT* outH)
+    {
+        if (!data || size < 8)
+            return false;
+        IWICImagingFactory* wic = nullptr;
+        IWICStream* stream = nullptr;
+        IWICBitmapDecoder* dec = nullptr;
+        IWICBitmapFrameDecode* frame = nullptr;
+        IWICFormatConverter* conv = nullptr;
+        bool ok = false;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARGS(&wic))) &&
+            SUCCEEDED(wic->CreateStream(&stream)) &&
+            SUCCEEDED(stream->InitializeFromMemory((BYTE*)data, (DWORD)size)) &&
+            SUCCEEDED(wic->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnDemand, &dec)) &&
+            SUCCEEDED(dec->GetFrame(0, &frame)) &&
+            SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
+            SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+                                       WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
+        {
+            UINT w = 0, h = 0;
+            conv->GetSize(&w, &h);
+            px->resize((size_t)w * h * 4);
+            WICRect rc = { 0, 0, (INT)w, (INT)h };
+            if (SUCCEEDED(conv->CopyPixels(&rc, w * 4, (UINT)px->size(), px->data())) && w && h)
+            {
+                *outW = w; *outH = h;
+                ok = true;
+            }
+        }
+        if (conv) conv->Release();
+        if (frame) frame->Release();
+        if (dec) dec->Release();
+        if (stream) stream->Release();
+        if (wic) wic->Release();
+        return ok;
+    }
+
+    // DX11：RGBA 像素 → 不可变贴图 + SRV
+    static void* UploadRGBA11(const BYTE* px, UINT w, UINT h)
+    {
+        if (!g_dev11 || !px || !w || !h)
+            return nullptr;
+        void* srv = nullptr;
+        ID3D11Texture2D* tex = nullptr;
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = w; td.Height = h;
+        td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd = { px, w * 4, 0 };
+        if (SUCCEEDED(g_dev11->CreateTexture2D(&td, &sd, &tex)))
+        {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd2 = {};
+            sd2.Format = td.Format;
+            sd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd2.Texture2D.MipLevels = 1;
+            g_dev11->CreateShaderResourceView(tex, &sd2, (ID3D11ShaderResourceView**)&srv);
+            tex->Release();
+        }
+        return srv;
+    }
+
     void* RenderHook_LoadTextureDX11(const char* path)
     {
         if (g_api.load(std::memory_order_relaxed) != Api::D3D11 || !g_dev11)
@@ -1077,27 +1354,8 @@ namespace RenderHook
         void* srv = nullptr;
         std::vector<BYTE> px;
         UINT w = 0, h = 0;
-        ID3D11Texture2D* tex = nullptr;
         if (DecodeImageRGBA(path, &px, &w, &h))
-        {
-                D3D11_TEXTURE2D_DESC td = {};
-                td.Width = w; td.Height = h;
-                td.MipLevels = 1; td.ArraySize = 1;
-                td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                td.SampleDesc.Count = 1;
-                td.Usage = D3D11_USAGE_IMMUTABLE;
-                td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                D3D11_SUBRESOURCE_DATA sd = { px.data(), w * 4, 0 };
-                if (SUCCEEDED(g_dev11->CreateTexture2D(&td, &sd, &tex)))
-                {
-                    D3D11_SHADER_RESOURCE_VIEW_DESC sd2 = {};
-                    sd2.Format = td.Format;
-                    sd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                    sd2.Texture2D.MipLevels = 1;
-                    g_dev11->CreateShaderResourceView(tex, &sd2, (ID3D11ShaderResourceView**)&srv);
-                    tex->Release();
-                }
-        }
+            srv = UploadRGBA11(px.data(), w, h);
         if (srv)
             cache[path] = srv;
         return srv;
@@ -1115,26 +1373,14 @@ namespace RenderHook
         return true;
     }
 
-    void* RenderHook_LoadTextureDX12(const char* path)
+    // DX12：RGBA 像素 → 默认堆贴图 + SRV（上传后同步等待拷贝完成）
+    //   依赖尚未就绪时返回 nullptr，调用方下一帧重试
+    static void* UploadRGBA12(const BYTE* px, UINT w, UINT h)
     {
-        if (g_api.load(std::memory_order_relaxed) != Api::D3D12)
-            return nullptr;
-        // 依赖尚未就绪时返回 nullptr，调用方下一帧重试
         if (!g_dev12 || !g_srvHeap12 || !g_queue12 || !g_fence12 || !g_fenceEvent12)
             return nullptr;
-
-        auto& cache = TextureCache();
-        auto it = cache.find(path);
-        if (it != cache.end())
-            return it->second;
-
-        std::vector<BYTE> px;
-        UINT w = 0, h = 0;
-        if (!DecodeImageRGBA(path, &px, &w, &h))
-        {
-            Log::Printf("[Render] DX12 tex decode failed: %s", path);
+        if (!px || !w || !h)
             return nullptr;
-        }
 
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -1195,7 +1441,7 @@ namespace RenderHook
         for (UINT y = 0; y < numRows; y++)
         {
             memcpy((BYTE*)mapped + fp.Offset + (UINT64)y * fp.Footprint.RowPitch,
-                   px.data() + (size_t)y * (size_t)w * 4, (size_t)w * 4);
+                   px + (size_t)y * (size_t)w * 4, (size_t)w * 4);
         }
         upload->Unmap(0, nullptr);
 
@@ -1259,9 +1505,77 @@ namespace RenderHook
         sd.Texture2D.MipLevels = 1;
         g_dev12->CreateShaderResourceView(tex, &sd, srvCpu);
 
-        void* id = (void*)(uintptr_t)srvGpu.ptr;
-        cache[path] = id;
+        return (void*)(uintptr_t)srvGpu.ptr;
+    }
+
+    void* RenderHook_LoadTextureDX12(const char* path)
+    {
+        if (g_api.load(std::memory_order_relaxed) != Api::D3D12)
+            return nullptr;
+        if (!g_dev12)
+            return nullptr;
+
+        auto& cache = TextureCache();
+        auto it = cache.find(path);
+        if (it != cache.end())
+            return it->second;
+
+        std::vector<BYTE> px;
+        UINT w = 0, h = 0;
+        if (!DecodeImageRGBA(path, &px, &w, &h))
+        {
+            Log::Printf("[Render] DX12 tex decode failed: %s", path);
+            return nullptr;
+        }
+        void* id = UploadRGBA12(px.data(), w, h);
+        if (id)
+            cache[path] = id;
         return id;
+    }
+
+    // ============ 内嵌资源贴图（LOGO）：RCDATA(PNG) → WIC 内存解码 → 上传 ============
+    //   资源随 DLL 编译进来，不依赖外部文件；同一 key 只解码/上传一次。
+    void* RenderHook_LoadEmbeddedPng(int resId, const char* key)
+    {
+        auto& cache = TextureCache();
+        std::string k = std::string("res:") + (key ? key : "");
+        auto it = cache.find(k);
+        if (it != cache.end())
+            return it->second;
+
+        HMODULE hm = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCSTR)&RenderHook_LoadEmbeddedPng, &hm) || !hm)
+            return nullptr;
+        HRSRC hr = FindResourceA(hm, MAKEINTRESOURCEA(resId), (LPCSTR)RT_RCDATA);
+        if (!hr)
+            return nullptr;
+        DWORD size = SizeofResource(hm, hr);
+        HGLOBAL hg = LoadResource(hm, hr);
+        const void* data = hg ? LockResource(hg) : nullptr;
+        if (!data || size < 8)
+            return nullptr;
+
+        std::vector<BYTE> px;
+        UINT w = 0, h = 0;
+        if (!DecodeImageRGBAFromMemory(data, size, &px, &w, &h))
+        {
+            Log::Printf("[Render] embedded png decode failed: %s", key ? key : "?");
+            return nullptr;
+        }
+        void* srv = nullptr;
+        Api api = g_api.load(std::memory_order_relaxed);
+        if (api == Api::D3D12)
+            srv = UploadRGBA12(px.data(), w, h);
+        else if (api == Api::D3D11)
+            srv = UploadRGBA11(px.data(), w, h);
+        if (srv)
+        {
+            cache[k] = srv;
+            Log::Printf("[Render] embedded png ok: %s (%ux%u)", key ? key : "?", w, h);
+        }
+        return srv;
     }
 
     // 统一入口：按当前图形 API 分派
@@ -1279,6 +1593,12 @@ namespace RenderHook
     void SetCaptureWanted(bool on)
     {
         g_capWanted.store(on, std::memory_order_relaxed);
+    }
+
+    // 录制开关：开启时渲染线程按 GAME→staging→CPU 回读（DO_NOT_WAIT，不阻塞）
+    void SetRecordWanted(bool on)
+    {
+        g_recWanted.store(on, std::memory_order_relaxed);
     }
 
     void* GetCaptureTex(int* w, int* h)
@@ -1304,6 +1624,58 @@ namespace RenderHook
         }
         return nullptr;
     }
+
+    // ---- 皮肤贴图信息：自然尺寸 + 非透明包围盒（缓存） ----
+    struct ImgInfo { int w = 0, h = 0, bx = 0, by = 0, bw = 0, bh = 0; bool ok = false; };
+    static std::map<std::string, ImgInfo>& InfoCache()
+    {
+        static std::map<std::string, ImgInfo> c;
+        return c;
+    }
+    bool RenderHook_ImageInfo(const char* path, int* w, int* h, int* bx, int* by, int* bw, int* bh)
+    {
+        if (!path || !path[0]) return false;
+        auto& cache = InfoCache();
+        auto it = cache.find(path);
+        if (it == cache.end())
+        {
+            ImgInfo inf{};
+            std::vector<BYTE> px;
+            UINT iw = 0, ih = 0;
+            if (DecodeImageRGBA(path, &px, &iw, &ih) && iw > 0 && ih > 0 && px.size() >= (size_t)iw * ih * 4)
+            {
+                int x0 = (int)iw, y0 = (int)ih, x1 = -1, y1 = -1;
+                for (UINT y = 0; y < ih; y++)
+                {
+                    const BYTE* row = &px[(size_t)y * iw * 4];
+                    for (UINT x = 0; x < iw; x++)
+                    {
+                        if (row[x * 4 + 3] > 8)
+                        {
+                            if ((int)x < x0) x0 = (int)x;
+                            if ((int)x > x1) x1 = (int)x;
+                            if ((int)y < y0) y0 = (int)y;
+                            if ((int)y > y1) y1 = (int)y;
+                        }
+                    }
+                }
+                inf.w = (int)iw; inf.h = (int)ih;
+                if (x1 >= x0 && y1 >= y0) { inf.bx = x0; inf.by = y0; inf.bw = x1 - x0 + 1; inf.bh = y1 - y0 + 1; }
+                else { inf.bx = 0; inf.by = 0; inf.bw = (int)iw; inf.bh = (int)ih; }
+                inf.ok = true;
+            }
+            it = cache.emplace(path, inf).first;
+        }
+        const ImgInfo& inf = it->second;
+        if (!inf.ok) return false;
+        if (w) *w = inf.w;
+        if (h) *h = inf.h;
+        if (bx) *bx = inf.bx;
+        if (by) *by = inf.by;
+        if (bw) *bw = inf.bw;
+        if (bh) *bh = inf.bh;
+        return true;
+    }
 }
 
 // 全局包装（供 Chart4K 调用）
@@ -1317,9 +1689,24 @@ void* RenderHook_LoadTexture(const char* path)
     return RenderHook::RenderHook_LoadTexture(path);
 }
 
+void* RenderHook_LoadEmbeddedPng(int resId, const char* key)
+{
+    return RenderHook::RenderHook_LoadEmbeddedPng(resId, key);
+}
+
+bool RenderHook_ImageInfo(const char* path, int* w, int* h, int* bx, int* by, int* bw, int* bh)
+{
+    return RenderHook::RenderHook_ImageInfo(path, w, h, bx, by, bw, bh);
+}
+
 void RenderHook_SetCaptureWanted(bool on)
 {
     RenderHook::SetCaptureWanted(on);
+}
+
+void RenderHook_SetRecordWanted(bool on)
+{
+    RenderHook::SetRecordWanted(on);
 }
 
 void* RenderHook_GetCaptureTex(int* w, int* h)

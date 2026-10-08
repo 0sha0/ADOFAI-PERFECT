@@ -23,9 +23,35 @@ namespace Chart4K
     void DrawPlayfield();     // 渲染线程：绘制下坠谱面（独立透明窗口）
     void DrawSettingsPage();  // 渲染线程：主窗口里的 4K辅助 设置页
     void DrawSettings6KPage();// 渲染线程：主窗口里的 6K模式 设置页
+    void DrawSettings5KPage();// 渲染线程：主窗口里的 5K模式 设置页
+    void DrawSettings10KPage();// 渲染线程：主窗口里的 10K模式 设置页
+    void DrawReadOverlay();    // 渲染线程：辅助读谱（无轨）叠加层（独立于 4K/5K/6K/10K）
+    void DrawReadSettingsPage();// 渲染线程：主窗口里的 辅助读谱 设置页
+    void DrawKeyViewerOverlay();     // 渲染线程：KeyViewer 游戏内叠加层（打歌时自动显示）
+    void DrawKeyViewerSettingsPage();// 渲染线程：主窗口里的 KeyViewer 设置页
+    void DrawMacroPage();            // 渲染线程：主窗口里的 宏模式 页（宏打歌 + 自动录制）
+    void DrawRecordPage();           // 渲染线程：主窗口里的 录制 页（小窗录制：开始/暂停/继续）
     void MainThreadResolve(); // 仅游戏主线程调用：安全创建所需类的 vtable
 
     bool HasChart();                       // 是否已成功解析出谱面
     int  NoteCount();                      // 当前谱面音符数
     void GetDiag(char* buf, int n);         // 诊断文本（供设置页显示）
+
+    // ---- 宏 / 录制 配置（设置页档案 + 宏页共用；rec_dir 持久化在 adofai_perfect.cfg）----
+    int         MacroAccGet();  void MacroAccSet(int v);     // 目标精准度 90..100
+    int         MacroHumanGet(); void MacroHumanSet(int v);  // 拟人程度 0..100
+    int         RecOnGet();     void RecOnSet(int v);
+    int         RecAutoGet();   void RecAutoSet(int v);
+    int         RecFpsGet();    void RecFpsSet(int v);
+    int         RecMbpsGet();   void RecMbpsSet(int v);
+    const char* RecDirGet();    void RecDirSet(const char* dir);
+    void        RecCfgApply();
+    void        RecStatsGet(int* in, int* written, int* dropped, const char** file);
+    int         RecPausedGet(); void RecPausedSet(int v);
+
+    // ---- 冰与火宏（原生关卡）：宏直接代打游戏本体判定线 ----
+    //   逆向链：scrController.PlayerControl_Update → scrPlayer.Simulated_PlayerControl_Update
+    //   → Hit(bool) → scrPlanet.SwitchChosen → scrMisc.GetHitMargin(cachedAngle, targetExitAngle)
+    bool        FireMacroEnabled(); void FireMacroSet(int v);
+    double      MacroTimingOffsetMs(double winMs);   // 复用宏打歌拟人抖动模型（毫秒）
 }

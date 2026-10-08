@@ -16,6 +16,7 @@
 #include "Log.h"
 #include "MonoApi.h"
 #include "GameBridge.h"
+#include "GameDetour.h"
 #include "RenderHook.h"
 
 #include <windows.h>
@@ -53,6 +54,8 @@ std::atomic<bool> CheatState::NoDeath{ false };
 std::atomic<bool> CheatState::AutoCombo{ false };
 std::atomic<bool> CheatState::MenuVisible{ true };
 std::atomic<bool> CheatState::ExitRequested{ false };
+std::atomic<bool> CheatState::GameQuitting{ false };
+std::atomic<unsigned long> CheatState::LastPresentMs{ 0 };
 
 static HMODULE g_hSelf = nullptr;
 
@@ -67,6 +70,29 @@ static void CleanupAndUnload()
 
     // 2) 还原游戏状态（恢复 noFail / RDC.auto 原值）
     GameBridge::Restore();
+
+    // 2.5) 摘除 Application.Quit 钩子：trampoline 位于本模块内，FreeLibrary
+    //      之前必须还原，否则游戏下一次退出会跳进已卸载的内存。
+    //      摘钩只能在托管主线程执行（mono 约束），故投递主线程任务并等待；
+    //      MainThreadInitTask 里有专门的高速通道处理该请求。
+    GameDetour::RequestQuitHookDetach();
+    for (int i = 0; i < 40 && !GameDetour::QuitHookDetached(); i++)
+    {
+        GameBridge::QueueMainThreadInit();
+        Sleep(50);
+    }
+    if (!GameDetour::QuitHookDetached())
+        Log::Printf("[Main] quit-hook detach timed out - game thread not pumping");
+
+    // 2.6) 摘除冰与火宏的 scrPlayer 判定钩子（trampoline 同样位于本模块内）
+    GameDetour::RequestInputHookDetach();
+    for (int i = 0; i < 40 && !GameDetour::InputHookDetached(); i++)
+    {
+        GameBridge::QueueMainThreadInit();
+        Sleep(50);
+    }
+    if (!GameDetour::InputHookDetached())
+        Log::Printf("[Main] input-hook detach timed out - game thread not pumping");
 
     // 3) 渲染侧完整清理：恢复 WndProc、ImGui 关闭、摘 DXGI 钩
     RenderHook::Shutdown();
@@ -127,6 +153,11 @@ static DWORD WINAPI WorkerMain(LPVOID)
     // 崩溃（见崩溃转储分析）。noFail 字段已覆盖官方关卡的全部死亡
     // 类型（失误/超载/保持失败），hitbox 死亡仅存在于自定义关卡的
     // 特殊地块，正常游玩不受影响。
+    //
+    // 退出安全：改为挂钩 UnityEngine.Application.Quit（游戏内"退出游戏"
+    // 按钮的调用点，逆向证据见 GameDetour.h）。钩子由主线程任务安装
+    // （mono_compile_method 仅托管主线程安全），命中后立即 GameQuitting
+    // + 录制收尾，杜绝退出期崩溃与 MP4 无 moov 尾部。
 
     // 渲染钩子（等 dxgi.dll）
     {
