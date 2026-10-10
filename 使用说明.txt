@@ -82,6 +82,15 @@ ADOFAI PERFECT v2.0 - 使用说明
       点「保存设置」会先写回设置文件，再热应用进正在运行的 MOD —— 参数与语言立即生效，
       不必重启游戏（MOD 自己有界面时也可用「打开界面」）
     · MOD 开关状态与 MOD 设置会随「设置 → 配置档案」一起保存，下次读档自动写回并热应用
+    · 与原版 UnityModManager 共存（v2.0 起）：
+      - 检测到原版 UMM（doorstop_config.ini 指向 Managed\UnityModManager）时，
+        本工具绝不覆写它的启动配置，也绝不把 MOD 重复加载第二遍；
+        游戏内加载器转入「复用模式」：MOD 列表 / 开关 / 打开界面 / 设置热应用
+        全部通过反射直接作用于原版 UMM 加载的那一批 MOD，两套工具看到的是同一份状态
+      - 存储与原版 UMM 完全互通，生态可直接迁移：配置读 Config.xml、
+        MOD 启用状态读写 Params.xml（原版目录里已有就接手，本工具改动会镜像回原版目录）、
+        MOD 设置读写 <MOD>\Settings.xml（老版本写过的 <类名>.xml 会自动升级迁移过去）
+      - 没装原版 UMM 时行为不变：由本工具的加载器在游戏启动前加载 MOD
 
 ■ 目录说明
   Injector.exe          注入器（必须与 ADOFAIPerfect.dll 放在同一目录）

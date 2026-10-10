@@ -139,6 +139,8 @@ namespace ModLoader
         std::string  g_log;
         std::string  g_err;
         std::atomic<bool> g_ready{ false };
+        // 原版 UMM 在场：加载器进入 passive 复用模式（不再自己加载 MOD）
+        std::atomic<bool> g_passive{ false };
 
         // 「设置是否真的应用进 MOD」的异步回报（apply 命令用）
         std::mutex   g_applyMx;
@@ -248,7 +250,16 @@ namespace ModLoader
             if (cmd == "start")
             {
                 std::string r = CallBridge("StartWith", 1, arg.c_str(), nullptr);
-                SetResultError(r == "ok" ? std::string() : r);
+                if (r == "passive")
+                {
+                    // 原版 UMM 已经把 MOD 加载过了：本工具转入复用模式，不再重复加载
+                    g_passive.store(true);
+                    SetResultError(std::string());
+                    Log::Printf("[mod] native UMM detected in-game; passive reuse mode");
+                }
+                else if (r == "ok")
+                    g_passive.store(false);
+                SetResultError(r == "ok" || r == "passive" ? std::string() : r);
             }
             else if (cmd == "state")
             {
@@ -356,8 +367,32 @@ namespace ModLoader
         WriteAll(JoinPath(ld, "AdofPerfectUmm.json"), json);
     }
 
+    // ---------------- 原版 UMM 共存 ----------------
+    // 用户的游戏目录里可能已经装着「原生 UnityModManager」（doorstop 启动时
+    // 加载 Managed\UnityModManager\UnityModManager.dll）。那种情况下：
+    //   · 绝不覆写 doorstop_config.ini（那等于抢走整个 MOD 生态的启动权）；
+    //   · 游戏内加载器转入 passive 复用模式（C# 侧 Foreign.cs 反射转发）。
+    bool ForeignDoorstop()
+    {
+        std::string g = GameDir::Get();
+        if (g.empty()) return false;
+        std::string ini = ReadAll(JoinPath(g, "doorstop_config.ini"));
+        if (ini.empty()) return false;
+        size_t p = ini.find("target_assembly");
+        if (p == std::string::npos) return false;
+        // 指向我们的 AdofPerfectUmm 目录 → 不是外来配置
+        if (ini.find("AdofPerfectUmm", p) != std::string::npos) return false;
+        // 指向任何 UnityModManager.dll（原版 UMM / 其他分发版）→ 外来
+        return ini.find("UnityModManager.dll", p) != std::string::npos;
+    }
+
     bool Installed()
     {
+        // 原版 UMM 已经接管启动钩子：视为「已安装」，我们的 Tick 不再去
+        // 覆写它的 doorstop_config.ini（过去这里会把生态覆盖掉 —— 用户反馈的
+        // 「我这个还加载一次覆盖了原有的生态」）。工具侧走 passive 复用。
+        if (ForeignDoorstop()) return true;
+
         std::string src = JoinPath(DllDir() + "umm", "UnityModManager.dll");
         std::string ld = LoaderDirPath();
         if (ld.empty() || !FileExists(src)) return false;
@@ -375,10 +410,16 @@ namespace ModLoader
 
     // UnityDoorstop：把「游戏启动时加载哪个程序集」指向我们的加载器。
     // 原配置只备份一次，用户可随时还原。
-    static bool WriteDoorstopConfig()
+    // force=false 时若检测到原版 UMM 的 doorstop 配置则拒绝覆写（保护生态）。
+    static bool WriteDoorstopConfig(bool force)
     {
         std::string g = GameDir::Get();
         if (g.empty()) return false;
+        if (!force && ForeignDoorstop())
+        {
+            Log::Printf("[mod] foreign doorstop_config.ini present; keep it (passive mode)");
+            return true;
+        }
         std::string srcDir = DllDir() + "umm";
         std::string winhttp = JoinPath(srcDir, "winhttp_x64.dll");
         std::string dstWinhttp = JoinPath(g, "winhttp.dll");
@@ -397,7 +438,7 @@ namespace ModLoader
         return WriteAll(ini, doc);
     }
 
-    bool Install(std::string* message)
+    bool Install(std::string* message, bool force)
     {
         std::string g = GameDir::Get();
         std::string managed = ManagedDir();
@@ -406,6 +447,12 @@ namespace ModLoader
         {
             if (message) *message = "game folder not set";
             return false;
+        }
+        if (!force && ForeignDoorstop())
+        {
+            // 原版 UMM 在场：只落我们自己的文件（供 passive 复用），不动它的启动钩子
+            if (message) *message = "native UMM detected; passive mode (not overriding)";
+            Log::Printf("[mod] native UMM detected; installing loader files only (doorstop untouched)");
         }
 
         std::string srcDir = DllDir() + "umm";
@@ -436,8 +483,9 @@ namespace ModLoader
         SetModsDir(ModsDir());
 
         // UnityDoorstop：让下次启动游戏时直接加载我们的加载器
-        // （这样 MOD 能在游戏启动前打补丁；注入器路径只是兜底）
-        WriteDoorstopConfig();
+        // （这样 MOD 能在游戏启动前打补丁；注入器路径只是兜底）。
+        // 原版 UMM 在场且未强制时保持沉默（保护它的启动钩子）。
+        WriteDoorstopConfig(force);
 
         if (!ok && message) *message = "copy failed (game running? close it and retry)";
         else if (message) *message = "installed to " + ld;
@@ -463,7 +511,8 @@ namespace ModLoader
         {
             std::lock_guard<std::mutex> lk(g_jobMx);
             if (g_jobs.size() > 256) return;   // 主线程长时间没跑：别无限堆积
-            g_jobs.push_back({ "start", dir });
+            // passive 模式下不再催「start」（加载器已让位给原版 UMM），只轮询状态
+            if (!g_passive.load()) g_jobs.push_back({ "start", dir });
             g_jobs.push_back({ "state", "" });
         }
         // 不依赖 g_queued：GameBridge::PostTask 内部已按位去重；
@@ -475,6 +524,10 @@ namespace ModLoader
     bool Ready()
     {
         return g_ready.load();
+    }
+    bool Passive()
+    {
+        return g_passive.load();
     }
     std::string StateJson()
     {

@@ -42,3 +42,6 @@ _testlog/
 _stage/
 _verify/
 _tmptest/
+
+# ---- 用户解压在仓库根目录的发布包测试副本（不入库）----
+ADOFAI-PERFECT-v*-win64/

@@ -26,13 +26,15 @@ namespace ModLoader
     std::string LoaderDirPath();             // <游戏>_Data\Managed\UnityModManager
     std::string ModsDir();                   // 当前生效的 MOD 目录
     void        SetModsDir(const std::string& dir);   // 写入 AdofPerfectUmm.json
-    bool        Install(std::string* message);        // 安装/更新加载器（幂等）
+    bool        Install(std::string* message, bool force = false);   // 安装/更新加载器（幂等）
+                                                             // force=true 时允许覆盖原版 UMM 的启动钩子
 
     // ---- 每帧驱动（渲染线程）----
     void        Tick();                      // 节流轮询：确保加载器启动 + 取状态
 
     // ---- 结果读取（渲染线程；来自最近一次主线程查询）----
     bool        Ready();                     // 加载器已在游戏里跑起来
+    bool        Passive();                   // 原版 UMM 在场：已转入 passive 复用模式（不重复加载）
     std::string StateJson();                 // [{id,name,version,author,enabled,active,loaded,error,gui,open}]
     std::string LogTail();                   // 加载器最近日志
     std::string LastError();

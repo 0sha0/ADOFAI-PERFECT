@@ -50,6 +50,11 @@ namespace UnityModManagerNet
 
         // ------------------------------------------------------------
         //  Param —— Params.xml（启用状态）
+        //  与原版 UMM 同名同格式：<加载器目录>\Params.xml，形状
+        //  <Param><ModParams><Mod Id=".." Enabled="true" />。</Param>
+        //  为了「生态直接迁移」：原版 UMM 目录（Managed\UnityModManager）
+        //  里也有 Params.xml 时，读：自己没有就读它；写：两边都写，
+        //  这样两边看到的启用状态永远一致。
         // ------------------------------------------------------------
         [XmlRoot("Param")]
         public sealed class Param
@@ -70,16 +75,38 @@ namespace UnityModManagerNet
 
             public static string FilePath { get { return filepath; } }
 
+            // 原版 UMM 的 Params.xml（若它也装在这台机器上）
+            public static string ForeignFilePath
+            {
+                get
+                {
+                    string dir = ForeignDir();
+                    return string.IsNullOrEmpty(dir) ? null : Path.Combine(dir, "Params.xml");
+                }
+            }
+
             public void Save()
             {
+                SaveTo(filepath);
+                // 生态迁移：原版 UMM 在场就把同一份状态镜像过去（它的 GUI / 下次
+                // 启动的 doorstop 加载读到的就是同一份启用状态）
+                string foreign = ForeignFilePath;
+                if (!string.IsNullOrEmpty(foreign) &&
+                    !string.Equals(foreign, filepath, StringComparison.OrdinalIgnoreCase))
+                    SaveTo(foreign);
+            }
+
+            private void SaveTo(string path)
+            {
+                if (string.IsNullOrEmpty(path)) return;
                 try
                 {
-                    using (StreamWriter writer = new StreamWriter(filepath))
+                    using (StreamWriter writer = new StreamWriter(path))
                         new XmlSerializer(typeof(Param)).Serialize(writer, this);
                 }
                 catch (Exception e)
                 {
-                    Logger.Error("Can't write file '" + filepath + "'.");
+                    Logger.Error("Can't write file '" + path + "'.");
                     Logger.LogException(e);
                 }
             }
@@ -88,18 +115,36 @@ namespace UnityModManagerNet
             {
                 if (File.Exists(filepath))
                 {
-                    try
+                    Param own = ReadFile(filepath);
+                    if (own != null) return own;
+                }
+                // 自己还没有：接手原版 UMM 已经写好的那份（保留用户已有的启用状态）
+                string foreign = ForeignFilePath;
+                if (!string.IsNullOrEmpty(foreign) && File.Exists(foreign))
+                {
+                    Param p = ReadFile(foreign);
+                    if (p != null)
                     {
-                        using (FileStream stream = File.OpenRead(filepath))
-                            return new XmlSerializer(typeof(Param)).Deserialize(stream) as Param;
-                    }
-                    catch (Exception e)
-                    {
-                        Logger.Error("Can't read file '" + filepath + "'.");
-                        Logger.LogException(e);
+                        Logger.Log("Params: adopting '" + foreign + "'.");
+                        return p;
                     }
                 }
                 return new Param();
+            }
+
+            private static Param ReadFile(string path)
+            {
+                try
+                {
+                    using (FileStream stream = File.OpenRead(path))
+                        return new XmlSerializer(typeof(Param)).Deserialize(stream) as Param;
+                }
+                catch (Exception e)
+                {
+                    Logger.Error("Can't read file '" + path + "'.");
+                    Logger.LogException(e);
+                    return null;
+                }
             }
 
             internal void ReadModParams()
@@ -113,11 +158,34 @@ namespace UnityModManagerNet
         }
 
         // ------------------------------------------------------------
-        //  GameInfo —— 加载器配置（本实现用 AdofPerfectUmm.json）
+        //  目录：我们自己（Managed\AdofPerfectUmm）与原版 UMM（Managed\UnityModManager）
+        // ------------------------------------------------------------
+        internal static string OwnDir
+        {
+            get { return Path.GetDirectoryName(typeof(UnityModManager).Assembly.Location); }
+        }
+
+        internal static string ForeignDir()
+        {
+            try
+            {
+                // <自己目录>\..\UnityModManager —— 同一个 Managed 下的原版 UMM 目录
+                string candidate = Path.GetFullPath(Path.Combine(OwnDir, "..", "UnityModManager"));
+                if (File.Exists(Path.Combine(candidate, "UnityModManager.dll"))) return candidate;
+            }
+            catch { }
+            return null;
+        }
+
+        // ------------------------------------------------------------
+        //  GameInfo —— 加载器配置
+        //  生态兼容：优先读原版 UMM 的 Config.xml（与它的 XmlSerializer 形状
+        //  完全一致：Name 是根属性、其余是元素），自己的 AdofPerfectUmm.json
+        //  只作为老部署的回退。
         // ------------------------------------------------------------
         public class GameInfo
         {
-            public string Name = "A Dance of Fire and Ice";
+            [XmlAttribute] public string Name = "A Dance of Fire and Ice";
             public string Folder = "ADOFAI";
             public string ModsDirectory = "Mods";
             public string ModInfo = "Info.json";
@@ -144,6 +212,26 @@ namespace UnityModManagerNet
         internal static bool initialized;
         internal static bool started;
         internal static bool forbidDisableMods;
+        // 原版 UMM 在场（doorstop 已把它加载进进程）：我们整体转入 passive 复用模式，
+        // 不扫 MOD、不加载、不出 GUI，Bridge 的操作经 AdofPerfectUmm.Foreign 反射转发。
+        internal static bool passive;
+
+        // Bridge.State() 的行结构（我们自己的 modEntries 与 passive 模式下的
+        // 原版 modEntries 都映射成这个，工具侧 JSON 形状保持一致）
+        public class BridgeState
+        {
+            public string id;
+            public string name;
+            public string author;
+            public string version;
+            public bool enabled;
+            public bool active;
+            public bool loaded;
+            public bool error;
+            public bool gui;
+            public bool open;
+            public string assembly;
+        }
 
         public static event ToggleModsListen toggleModsListen;
 

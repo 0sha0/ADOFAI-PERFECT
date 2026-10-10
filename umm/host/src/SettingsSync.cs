@@ -1,13 +1,17 @@
 // ============================================================
 //  SettingsSync.cs — 让工具侧写进设置文件的值对正在运行的 MOD 立刻生效
 //
-//  MOD 在加载时把 <MOD>/Settings.xml(或 .json) 反序列化成内存对象，
+//  MOD 在加载时把 <MOD>\Settings.xml 反序列化成内存对象，
 //  之后基本不再回读文件。工具直接改文件，MOD 自然「参数不生效」，
 //  「语言设成中文却还是显示英文」也是同一个根因。本类做三件事：
 //    1) 记住 MOD 通过 ModSettings.Load<T>() 读进来的对象引用；
 //    2) 反射找 MOD 程序集里的静态设置对象（Settings / Config / …）；
 //    3) 用文件里的值就地覆盖这些对象；必要时再调用 MOD 自己的
 //       OnToggle（关掉→打开），让它重新读取并应用设置。
+//
+//  passive 模式（原版 UMM 在场）下同样适用：MOD 实例是原版加载的，
+//  但「扫程序集里的静态设置对象 + 用文件值覆盖 + 开关重读」这套
+//  反射逻辑不挑加载器，照样能把 Settings.xml 的新值推进活对象。
 // ============================================================
 using System;
 using System.Collections.Generic;
@@ -35,6 +39,21 @@ namespace UnityModManagerNet
                 public string key;
                 public string val;
                 public bool isNull;
+            }
+
+            // 应用目标：自己的 ModEntry，或 passive 模式下原版 UMM 的 ModEntry（反射操作）
+            private class Ctx
+            {
+                public ModEntry own;        // 非空 = 我们自己加载的 MOD
+                public object foreign;      // 非空 = 原版 UMM 的 ModEntry
+                public string dir;          // MOD 目录
+                public string asmName;      // Info.json 的 AssemblyName
+
+                public string LogId()
+                {
+                    if (own != null) return own.Info.Id;
+                    return foreign != null ? AdofPerfectUmm.Foreign.IdOf(foreign) : "?";
+                }
             }
 
             private static readonly List<Reg> regs = new List<Reg>();
@@ -66,12 +85,29 @@ namespace UnityModManagerNet
                 }
                 catch { }
             }
+
             // ---------- 对外的「应用设置」入口 ----------
             // id    : MOD 的 Id
             // toggle: true 时，改完内存后再把 MOD 关掉/打开一次，
             //         让只在 OnToggle 里应用设置的 MOD（例如 Overlayer）也生效
             public static string Apply(string id, bool toggle)
             {
+                // passive：MOD 是原版 UMM 加载的 —— 用同一套反射机制操作它的实例
+                if (UnityModManager.passive)
+                {
+                    object fe = AdofPerfectUmm.Foreign.Entry(id);
+                    if (fe == null)
+                    {
+                        Defer(id, toggle);
+                        return "deferred";
+                    }
+                    Ctx c = new Ctx();
+                    c.foreign = fe;
+                    c.dir = AdofPerfectUmm.Foreign.PathOf(fe);
+                    c.asmName = AdofPerfectUmm.Foreign.AssemblyNameOf(fe);
+                    return ApplyCtx(c, toggle);
+                }
+
                 ModEntry mod = FindMod(id);
                 if (mod == null)
                 {
@@ -80,8 +116,16 @@ namespace UnityModManagerNet
                     Defer(id, toggle);
                     return "deferred";
                 }
+                Ctx own = new Ctx();
+                own.own = mod;
+                own.dir = mod.Path;
+                own.asmName = mod.Info != null ? mod.Info.AssemblyName : null;
+                return ApplyCtx(own, toggle);
+            }
 
-                List<string> files = ModSettingFiles(mod);
+            private static string ApplyCtx(Ctx c, bool toggle)
+            {
+                List<string> files = DirSettingFiles(c.dir);
                 int applied = 0;
                 bool reloaded = false;
 
@@ -90,15 +134,19 @@ namespace UnityModManagerNet
                 lock (gate)
                 {
                     for (int i = 0; i < regs.Count; i++)
-                        if (regs[i].mod == mod || (regs[i].mod != null && regs[i].mod.Info != null && regs[i].mod.Info.Id == id))
+                    {
+                        string rid = regs[i].mod != null && regs[i].mod.Info != null ? regs[i].mod.Info.Id : null;
+                        if (regs[i].mod == c.own || (c.own != null && rid == c.own.Info.Id) ||
+                            (c.own == null && rid == c.LogId()))
                             mine.Add(regs[i]);
+                    }
                 }
                 for (int i = 0; i < mine.Count; i++)
                 {
                     try
                     {
                         Reg r = mine[i];
-                        string p = !string.IsNullOrEmpty(r.path) ? r.path : DefaultPath(mod);
+                        string p = !string.IsNullOrEmpty(r.path) ? r.path : DefaultPath(c.dir);
                         if (r.instance is ModSettings && (!File.Exists(p) || ApplyFull(r.instance, p) == 0))
                             applied += ApplyScalars(r.instance, p);
                         else
@@ -108,35 +156,76 @@ namespace UnityModManagerNet
                 }
 
                 // 2) 反射扫描 MOD 程序集里的静态设置对象
-                try { applied += ScanStatics(mod, files); }
+                try { applied += ScanStatics(c, files); }
                 catch (Exception e) { UnityModManager.Logger.LogException("apply/scan", e); }
 
                 // 3) 关掉再打开：让 MOD 自己重新读取并应用（语言/贴图之类）
-                if (toggle && mod.Active)
+                if (toggle && IsActive(c))
                 {
                     Dictionary<string, string> snapshot = Snapshot(files);
-                    bool wasOpen = UI.IsOpen(mod);
                     try
                     {
-                        mod.Active = false;
+                        SetActive(c, false);
                         RestoreIfExists(snapshot);
-                        mod.Active = true;
+                        SetActive(c, true);
                         reloaded = true;
                     }
                     catch (Exception e) { UnityModManager.Logger.LogException("apply/toggle", e); }
-                    if (wasOpen)
-                    {
-                        try { UI.Open(mod); } catch { }
-                    }
                 }
 
-                mod.Logger.Log("Settings applied (" + applied + " field(s))" + (reloaded ? " + reload." : "."));
+                UnityModManager.Logger.Log("[" + c.LogId() + "] Settings applied (" + applied + " field(s))" + (reloaded ? " + reload." : "."));
                 if (applied > 0) return "ok:" + applied;
                 // 没找到实时字段、但整只 MOD 已经重载过一次：MOD 会在 OnToggle 里
                 // 自己重读设置文件（Overlayer 就是这样），对用户同样算应用成功，
                 // 不能在界面上报「应用失败」。
                 if (reloaded) return "ok:reload";
                 return "err:no-live-settings";
+            }
+
+            private static bool IsActive(Ctx c)
+            {
+                if (c.own != null) return c.own.Active;
+                return c.foreign != null && AdofPerfectUmm.Foreign.ActiveOf(c.foreign);
+            }
+
+            private static void SetActive(Ctx c, bool on)
+            {
+                if (c.own != null) { c.own.Active = on; return; }
+                if (c.foreign != null) AdofPerfectUmm.Foreign.SetEnabled(c.LogId(), on);
+            }
+
+            // ---------- SaveSettingsAndParams 用：把登记过的实例写回文件 ----------
+            public static void SaveMod(ModEntry mod)
+            {
+                if (mod == null) return;
+                List<Reg> mine = new List<Reg>();
+                lock (gate)
+                {
+                    for (int i = 0; i < regs.Count; i++)
+                        if (regs[i].mod == mod ||
+                            (regs[i].mod != null && regs[i].mod.Info != null && regs[i].mod.Info.Id == mod.Info.Id))
+                            mine.Add(regs[i]);
+                }
+                for (int i = 0; i < mine.Count; i++)
+                {
+                    try
+                    {
+                        ModSettings ms = mine[i].instance as ModSettings;
+                        if (ms == null) continue;
+                        string p = !string.IsNullOrEmpty(mine[i].path) ? mine[i].path : ms.GetPath(mod);
+                        try
+                        {
+                            using (StreamWriter writer = new StreamWriter(p))
+                                new XmlSerializer(ms.GetType()).Serialize(writer, ms);
+                        }
+                        catch (Exception e)
+                        {
+                            mod.Logger.Error("Can't save " + p + ".");
+                            mod.Logger.LogException(e);
+                        }
+                    }
+                    catch (Exception e) { UnityModManager.Logger.LogException("SaveMod", e); }
+                }
             }
 
             // ---------- 延迟应用（MOD 尚未加载时）----------
@@ -199,10 +288,14 @@ namespace UnityModManagerNet
 
             private static List<string> ModSettingFiles(ModEntry mod)
             {
+                return mod != null ? DirSettingFiles(mod.Path) : new List<string>();
+            }
+
+            private static List<string> DirSettingFiles(string dir)
+            {
                 List<string> list = new List<string>();
                 try
                 {
-                    string dir = mod.Path;
                     if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return list;
                     string[] all = Directory.GetFiles(dir, "*.xml");
                     string[] all2 = Directory.GetFiles(dir, "*.json");
@@ -215,13 +308,13 @@ namespace UnityModManagerNet
                 return list;
             }
 
-            private static string DefaultPath(ModEntry mod)
+            private static string DefaultPath(string dir)
             {
-                string p = Path.Combine(mod.Path, "Settings.xml");
+                string p = Path.Combine(dir ?? "", "Settings.xml");
                 if (File.Exists(p)) return p;
-                p = Path.Combine(mod.Path, "Settings.json");
+                p = Path.Combine(dir ?? "", "Settings.json");
                 if (File.Exists(p)) return p;
-                return Path.Combine(mod.Path, "Settings.xml");
+                return Path.Combine(dir ?? "", "Settings.xml");
             }
 
             // ---------- 切开关前先留一份设置文件快照 ----------
@@ -257,7 +350,7 @@ namespace UnityModManagerNet
             }
 
             // ---------- 反射扫描 MOD 程序集里的静态设置对象 ----------
-            private static int ScanStatics(ModEntry mod, List<string> files)
+            private static int ScanStatics(Ctx c, List<string> files)
             {
                 int n = 0;
                 List<object> done = new List<object>();
@@ -267,7 +360,7 @@ namespace UnityModManagerNet
                 for (int a = 0; a < asms.Length; a++)
                 {
                     Assembly asm = asms[a];
-                    if (!IsModAssembly(asm, mod)) continue;
+                    if (!IsModAssembly(asm, c)) continue;
                     Type[] types;
                     try { types = asm.GetTypes(); }
                     catch (ReflectionTypeLoadException e) { types = e.Types; }
@@ -277,20 +370,20 @@ namespace UnityModManagerNet
                     {
                         Type t = types[i];
                         if (t == null) continue;
-                        n += ScanType(mod, t, files, done);
+                        n += ScanType(c, t, files, done);
                     }
                 }
                 return n;
             }
 
-            private static bool IsModAssembly(Assembly asm, ModEntry mod)
+            private static bool IsModAssembly(Assembly asm, Ctx c)
             {
                 if (asm == null) return false;
                 string name = null;
                 try { name = asm.GetName().Name; } catch { }
                 string loc = null;
                 try { loc = asm.Location; } catch { }
-                string dir = mod.Path;
+                string dir = c.dir;
                 if (!string.IsNullOrEmpty(loc) && !string.IsNullOrEmpty(dir))
                 {
                     try
@@ -303,7 +396,7 @@ namespace UnityModManagerNet
                 // 兜底 1：程序集名 == Info.json 里的 AssemblyName
                 try
                 {
-                    string want = mod.Info.AssemblyName;
+                    string want = c.asmName;
                     if (!string.IsNullOrEmpty(want) && want.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
                         want = want.Substring(0, want.Length - 4);
                     if (!string.IsNullOrEmpty(want) && string.Equals(name, want, StringComparison.OrdinalIgnoreCase))
@@ -324,7 +417,7 @@ namespace UnityModManagerNet
                 return false;
             }
 
-            private static int ScanType(ModEntry mod, Type t, List<string> files, List<object> done)
+            private static int ScanType(Ctx c, Type t, List<string> files, List<object> done)
             {
                 int n = 0;
                 List<object> cand = new List<object>();
@@ -370,21 +463,42 @@ namespace UnityModManagerNet
                     if (dup) continue;
                     done.Add(obj);
 
-                    string path = null;
-                    ModSettings ms = obj as ModSettings;
-                    if (ms != null)
-                    {
-                        try { path = ms.GetPath(mod); } catch { }
-                    }
+                    string path = SettingsObjPath(c, obj, candType[i]);
                     if (string.IsNullOrEmpty(path) || !File.Exists(path))
                         path = FindBestFile(candType[i], files);
                     if (string.IsNullOrEmpty(path)) continue;
 
-                    int c = ApplyFull(obj, path);
-                    if (c == 0) c = ApplyScalars(obj, path);
-                    n += c;
+                    int cc = ApplyFull(obj, path);
+                    if (cc == 0) cc = ApplyScalars(obj, path);
+                    n += cc;
                 }
                 return n;
+            }
+
+            // 设置对象对应的文件：自己的 ModSettings 走 GetPath；
+            // passive 模式下是原版 UMM 的实例，GetPath 经反射调用（参数是原版 ModEntry）
+            private static string SettingsObjPath(Ctx c, object obj, Type objType)
+            {
+                try
+                {
+                    if (c.own != null)
+                    {
+                        ModSettings ms = obj as ModSettings;
+                        if (ms != null) return ms.GetPath(c.own);
+                        return null;
+                    }
+                    if (c.foreign != null)
+                    {
+                        MethodInfo gp = objType.GetMethod("GetPath", BindingFlags.Public | BindingFlags.Instance);
+                        if (gp != null)
+                        {
+                            object r = gp.Invoke(obj, new object[] { c.foreign });
+                            return r as string;
+                        }
+                    }
+                }
+                catch { }
+                return null;
             }
 
             private static bool LooksLikeSettings(Type t)

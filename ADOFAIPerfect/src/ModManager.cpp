@@ -57,7 +57,7 @@ namespace ModManager
         MS_LOG_TITLE, MS_LOG_SUM, MS_LOG_NOLOG, MS_LOG_TIME, MS_LOG_LOADED,
         MS_LOG_SKIPPED, MS_LOG_ERROR, MS_LOG_NOTRUN,
         MS_LD_READY, MS_LD_OFFLINE, MS_LD_LOADED, MS_LD_DISABLED, MS_LD_ERROR,
-        MS_LD_LOADING, MS_LD_PENDING, MS_LD_UNSEEN, MS_LD_TIP,
+        MS_LD_LOADING, MS_LD_PENDING, MS_LD_UNSEEN, MS_LD_TIP, MS_LD_PASSIVE,
         MS_OPENUI, MS_CLOSEUI, MS_RELOAD, MS_LD_ERRTAG,
         MS_EXPAND,
         MS_SET_APPLIED, MS_SET_APPLYFAIL, MS_APPLYING,
@@ -215,6 +215,11 @@ namespace ModManager
             t[MS_LD_READY]   = I18N::Register("加载器已就绪（游戏内实时状态）", "載入器已就緒（遊戲內即時狀態）",
                                               "Loader ready (live in-game state)", "ローダー準備完了（ゲーム内の状態）",
                                               "Загрузчик готов (состояние в игре)");
+            t[MS_LD_PASSIVE] = I18N::Register("检测到原版 UnityModManager：已切换为复用模式（本工具不重复加载 MOD，开关与设置直接作用于原版加载的 MOD）",
+                                              "檢測到原版 UnityModManager：已切換為復用模式（本工具不重複載入 MOD，開關與設置直接作用於原版載入的 MOD）",
+                                              "Native UnityModManager detected: reuse mode (this tool no longer loads mods twice; toggles and settings act on the mods it loaded)",
+                                              "ネイティブ UnityModManager を検出：再利用モード（本ツールは MOD を二重に読み込まず、切り替えや設定は元のローダーが読込んだ MOD に反映されます）",
+                                              "Обнаружен оригинальный UnityModManager: режим повторного использования (моды не загружаются дважды; переключения и настройки применяются к модам оригинального загрузчика)");
             t[MS_LD_OFFLINE] = I18N::Register("加载器未运行：先启动游戏，MOD 才会真正被加载。",
                                               "載入器未執行：先啟動遊戲，MOD 才會真正被載入。",
                                               "Loader offline: launch the game so mods actually load.",
@@ -271,6 +276,10 @@ namespace ModManager
         {
             DWORD a = GetFileAttributesA(p.c_str());
             return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+        }
+        bool PathEquals(const std::string& a, const std::string& b)
+        {
+            return _stricmp(a.c_str(), b.c_str()) == 0;
         }
         std::string JoinPath(const std::string& a, const std::string& b)
         {
@@ -778,6 +787,18 @@ namespace ModManager
             std::string d = ModLoader::LoaderDirPath();
             return d.empty() ? std::string() : JoinPath(d, "Params.xml");
         }
+        // 原版 UMM 的 Params.xml（Managed\UnityModManager\Params.xml，若它也装着）
+        std::string ForeignParamsXmlPath()
+        {
+            // 我们加载器在 <Managed>\AdofPerfectUmm，原版在同级 <Managed>\UnityModManager
+            std::string ld = ModLoader::LoaderDirPath();
+            if (ld.empty()) return std::string();
+            size_t sep = ld.find_last_of("\\/");
+            if (sep == std::string::npos) return std::string();
+            std::string managed = ld.substr(0, sep);
+            std::string d = JoinPath(managed, "UnityModManager");
+            return DirExists(d) ? JoinPath(d, "Params.xml") : std::string();
+        }
         std::string DefaultModsDir()
         {
             std::string g = GameDir::Get();
@@ -1263,9 +1284,20 @@ namespace ModManager
             std::string xml = ReadAll(path, &ok);
             if (!ok || xml.empty())
             {
+                // 自己还没有：从原版 UMM 的 Params.xml 接手（保留用户已有启用状态）
+                std::string fp = ForeignParamsXmlPath();
+                if (!fp.empty()) xml = ReadAll(fp, &ok);
+            }
+            if (!ok || xml.empty())
+            {
                 xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Param>\n  <ModParams>\n  </ModParams>\n</Param>\n";
             }
-            return WriteAll(path, ParamsUpsert(xml, id, on));
+            std::string out = ParamsUpsert(xml, id, on);
+            // 生态迁移：原版 UMM 在场时把同一份状态镜像进它的 Params.xml，
+            // 它的 GUI / 下次 doorstop 启动读到的启用状态与本工具一致
+            std::string fp2 = ForeignParamsXmlPath();
+            if (!fp2.empty() && !PathEquals(fp2, path)) WriteAll(fp2, out);
+            return WriteAll(path, out);
         }
 
         // ---- 设置文件识别 ----
@@ -1316,6 +1348,18 @@ namespace ModManager
                 sf.path = JoinPath(m.folderPath, f);
                 sf.xml = false;
                 m.settings.push_back(sf);
+            }
+            // 默认编辑「settings.xml」——那是原版 UMM 与本加载器共用的规范
+            // 设置文件（生态迁移后两边读写同一家）。其余设置文件排后面。
+            for (size_t i = 0; i < m.settings.size(); i++)
+            {
+                if (ToLower(m.settings[i].name) == "settings.xml" && i > 0)
+                {
+                    SetFile first = m.settings[i];
+                    m.settings.erase(m.settings.begin() + i);
+                    m.settings.insert(m.settings.begin(), first);
+                    break;
+                }
             }
         }
 
@@ -1383,6 +1427,12 @@ namespace ModManager
                 bool ok = false;
                 std::string pp = ParamsXmlPath();
                 if (!pp.empty()) paramsXml = ReadAll(pp, &ok);
+                if (!ok || paramsXml.empty())
+                {
+                    // 自己还没有：接原版 UMM 已经写好的启用状态（生态迁移）
+                    std::string fp = ForeignParamsXmlPath();
+                    if (!fp.empty()) paramsXml = ReadAll(fp, &ok);
+                }
             }
 
             for (auto& folder : ListDirs(g_modsDirCache))
@@ -2150,9 +2200,17 @@ namespace ModManager
         {
             // 第一行：加载器是否已经在游戏里跑起来 —— 这才是“MOD 真的被加载”的依据
             const bool ready = g_ldReady;
-            TextCol(ready ? Th().good : Th().warn, "%s",
-                    ready ? T(MS_LD_READY) : T(MS_LD_OFFLINE));
-            if (!ready)
+            if (ModLoader::Passive())
+            {
+                // 原版 UMM 在场：显式告诉用户现在是复用模式，不会二次加载
+                TextCol(Th().accent, "%s", T(MS_LD_PASSIVE));
+            }
+            else
+            {
+                TextCol(ready ? Th().good : Th().warn, "%s",
+                        ready ? T(MS_LD_READY) : T(MS_LD_OFFLINE));
+            }
+            if (!ready && !ModLoader::Passive())
                 TextFaint("%s", T(MS_LD_TIP));
             else if (!g_ldErr.empty())
                 TextCol(Th().bad, "%s", g_ldErr.c_str());

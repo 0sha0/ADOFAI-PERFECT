@@ -109,20 +109,51 @@ namespace UnityModManagerNet
 
         // ------------------------------------------------------------
         //  ModSettings —— MOD 自己那份 Settings.xml 的读写
+        //  与原版 UMM 0.32 完全一致：<MOD目录>\Settings.xml 单文件
+        //  （静态 SettingsPath 可被 MOD 改写）。这是「生态直接迁移」的关键：
+        //  原版 UMM 写下的 Lang=zh-CN 等配置，我们读的就是同一个文件；
+        //  我们写回去的，原版 UMM 下次启动也照样认。
         // ------------------------------------------------------------
         public class ModSettings
         {
+            // 原版 UMM 的静态设置文件名（个别 MOD 会改写它，Load 时按反射读取）
+            public static string SettingsPath = "Settings.xml";
+
             public virtual void Save(ModEntry modEntry) { Save(this, modEntry); }
-            // 与原版 UMM 一致：默认设置文件是「类名.xml」（GetType().Name + ".xml"）。
-            // 兼容取舍：类名文件不存在、但同目录确实有 Settings.xml 时沿用 Settings.xml，
-            // 这样既符合 UMM 语义，又不会丢掉已经写在 Settings.xml 里的老配置。
+
             public virtual string GetPath(ModEntry modEntry)
             {
-                string named = Path.Combine(modEntry.Path, GetType().Name + ".xml");
-                if (File.Exists(named)) return named;
-                string legacy = Path.Combine(modEntry.Path, "Settings.xml");
-                if (File.Exists(legacy)) return legacy;
-                return named;
+                string name = SettingsPath;
+                try
+                {
+                    // MOD 若改写了静态 SettingsPath（如 "MySettings.xml"），尊重它
+                    FieldInfo sp = typeof(ModSettings).GetField("SettingsPath");
+                    if (sp != null)
+                    {
+                        object v = sp.GetValue(null);
+                        if (v is string && !string.IsNullOrEmpty((string)v)) name = (string)v;
+                    }
+                }
+                catch { }
+                string canonical = Path.Combine(modEntry.Path, name);
+
+                // 生态迁移：规范文件还不存在，但目录里有我们老版本写过的
+                // 「类名.xml」（旧实现的错误位置）时，把它升级成 Settings.xml，
+                // 这样原版 UMM 与本加载器读写的是同一份文件，配置不再分家。
+                if (!File.Exists(canonical))
+                {
+                    try
+                    {
+                        string legacy = Path.Combine(modEntry.Path, GetType().Name + ".xml");
+                        if (File.Exists(legacy))
+                        {
+                            File.Copy(legacy, canonical, true);
+                            modEntry.Logger.Log("Settings migrated '" + legacy + "' -> '" + canonical + "'.");
+                        }
+                    }
+                    catch { }
+                }
+                return canonical;
             }
 
             public static void Save<T>(T data, ModEntry modEntry) where T : ModSettings, new()
@@ -176,6 +207,33 @@ namespace UnityModManagerNet
                 }
                 SettingsSync.Register(modEntry, path, data);
                 return data;
+            }
+
+            // ---- 以下三个成员在原版 UMM 里存在，部分 MOD 会调用/重写 ----
+
+            // 原版 GUI 在设置页顶部画的灰字说明（MOD 常重写它）
+            public virtual string GetHeader(ModEntry modEntry)
+            {
+                return modEntry != null ? (modEntry.Info.Id + " " + modEntry.Info.Version) : string.Empty;
+            }
+
+            // 原版 GUI 改完一个值就回调它（MOD 常重写它做即时应用）
+            public virtual void OnChange() { }
+
+            // 反射改一个设置成员 + 触发 OnChange（部分 MOD 的自定义 GUI 走这条路）
+            public bool ChangeValue(string name, object value, object instance)
+            {
+                try
+                {
+                    Type t = (instance ?? this).GetType();
+                    const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                    FieldInfo f = t.GetField(name, flags);
+                    if (f != null) { f.SetValue(instance ?? this, value); OnChange(); return true; }
+                    PropertyInfo p = t.GetProperty(name, flags);
+                    if (p != null && p.CanWrite) { p.SetValue(instance ?? this, value, null); OnChange(); return true; }
+                }
+                catch { }
+                return false;
             }
         }
 
@@ -467,6 +525,16 @@ namespace UnityModManagerNet
                 mActive = false;
                 mStarted = false;
                 Logger.Log("Unloaded.");
+            }
+
+            // 原版 UMM 的同名 API：把「本 MOD 的设置文件 + 全局 Params.xml」一起落盘。
+            // 个别 MOD 会直接调用它；缺了就是 MissingMethodException。
+            public void SaveSettingsAndParams()
+            {
+                try { SettingsSync.SaveMod(this); }
+                catch (Exception e) { Logger.LogException("SaveSettingsAndParams", e); }
+                try { Params.Save(); }
+                catch (Exception e) { Logger.LogException("SaveSettingsAndParams/Params", e); }
             }
 
             public bool HasContentType(string str)

@@ -10,12 +10,14 @@
 //    · 给工具的 C++ 侧提供 Bridge（查询状态 / 开关 / 打开设置）
 // ============================================================
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Xml.Serialization;
 using HarmonyLib;
 using UnityModManagerNet;
 using TinyJson;
@@ -64,14 +66,44 @@ namespace UnityModManagerNet
         private static GameInfo LoadConfig()
         {
             GameInfo info = new GameInfo();
+            // ① 原版 UMM 生态的 Config.xml（XmlSerializer 形状，与它完全一致）：
+            //    先读自己目录的，没有就读原版 UMM 目录里那份 —— 两边从此共用同一份配置。
             try
             {
-                string dir = Path.GetDirectoryName(typeof(UnityModManager).Assembly.Location);
+                string own = Path.Combine(UnityModManager.OwnDir, "Config.xml");
+                string foreign = UnityModManager.ForeignDir();
+                string foreignCfg = string.IsNullOrEmpty(foreign) ? null : Path.Combine(foreign, "Config.xml");
+                string xml = File.Exists(own) ? own : (!string.IsNullOrEmpty(foreignCfg) && File.Exists(foreignCfg) ? foreignCfg : null);
+                if (xml != null)
+                {
+                    using (FileStream fs = File.OpenRead(xml))
+                    {
+                        GameInfo loaded = new XmlSerializer(typeof(GameInfo)).Deserialize(fs) as GameInfo;
+                        if (loaded != null)
+                        {
+                            info = loaded;
+                            Logger.Log("Config: '" + xml + "'.");
+                        }
+                    }
+                }
+            }
+            catch (Exception e) { Logger.LogException("LoadConfig/Config.xml", e); }
+            // ② 老部署的 AdofPerfectUmm.json 兜底（ModsPath 等字段仍以它为准补充）
+            try
+            {
+                string dir = UnityModManager.OwnDir;
                 string file = Path.Combine(dir, "AdofPerfectUmm.json");
                 if (File.Exists(file))
                 {
                     GameInfo loaded = File.ReadAllText(file).FromJson<GameInfo>();
-                    if (loaded != null) info = loaded;
+                    if (loaded != null)
+                    {
+                        if (string.IsNullOrEmpty(info.Name) || info.Name == "A Dance of Fire and Ice") info.Name = loaded.Name ?? info.Name;
+                        if (!string.IsNullOrEmpty(loaded.ModsPath)) info.ModsPath = loaded.ModsPath;
+                        if (string.IsNullOrEmpty(info.ModsDirectory)) info.ModsDirectory = loaded.ModsDirectory;
+                        if (string.IsNullOrEmpty(info.ModInfo)) info.ModInfo = loaded.ModInfo;
+                        if (string.IsNullOrEmpty(info.GameExe)) info.GameExe = loaded.GameExe;
+                    }
                 }
             }
             catch (Exception e) { Logger.LogException("LoadConfig", e); }
@@ -136,6 +168,10 @@ namespace UnityModManagerNet
             try { name = new AssemblyName(args.Name).Name; }
             catch { return null; }
 
+            // passive 模式下绝不掺和程序集解析：MOD 是原版 UMM 加载的，
+            // 它们对 UnityModManager / 0Harmony 的绑定必须落到原版那份上。
+            if (UnityModManager.passive) return null;
+
             if (name == "UnityModManager") return typeof(UnityModManager).Assembly;
             // 加载器自己的目录里带着 UMM 运行时依赖（0Harmony / dnlib …），
             // 先按文件名通用地找一遍，再退回游戏 Managed 目录。
@@ -188,6 +224,18 @@ namespace UnityModManagerNet
         public static void Start()
         {
             if (started) return;
+
+            // ★ 原版 UMM 共存守卫：进程里已经有一份别的 UnityModManager（doorstop
+            //   在游戏启动时加载的），说明 MOD 已经被它加载过一次。再扫一遍 Mods
+            //   目录就会把同一批程序集的静态单例二次初始化、Harmony 补丁打两遍、
+            //   两套 GUI 同时出现、设置被后加载方覆盖（zh-CN 变英文的元凶之一）。
+            //   此时整体转入 passive：只通过反射「复用」原版 UMM，绝不重复加载。
+            if (AdofPerfectUmm.Foreign.Active)
+            {
+                started = true;
+                passive = true;
+                return;
+            }
 
             RebuildModsPaths();
             if (modsPaths.Count == 0)
@@ -318,6 +366,8 @@ namespace UnityModManagerNet
         public static bool RunUI()
         {
             if (UI.Instance != null) return true;
+            // passive：原版 UMM 的 GUI 已在场，我们不再生成自己的 MOD 窗口（避免双 GUI）
+            if (UnityModManager.passive || AdofPerfectUmm.Foreign.Active) { uiPending = false; return true; }
             try
             {
                 GameObject go = new GameObject("AdofPerfectUMM");
@@ -546,6 +596,7 @@ namespace AdofPerfectUmm
 
     // ============================================================
     //  Bridge —— C++ 侧通过 Mono 调用本类来查询/操作加载器
+    //  passive 模式（原版 UMM 在场）下，所有查询/操作经 Foreign 反射转发
     // ============================================================
     public static class Bridge
     {
@@ -562,42 +613,56 @@ namespace AdofPerfectUmm
             try { Loader.EnsureStarted(); } catch (Exception e) { UnityModManager.Logger.LogException("EnsureStarted", e); }
         }
 
-        private class ModState
+        private static UnityModManager.BridgeState OwnState(UnityModManager.ModEntry entry)
         {
-            public string id;
-            public string name;
-            public string author;
-            public string version;
-            public bool enabled;
-            public bool active;
-            public bool loaded;
-            public bool error;
-            public bool gui;
-            public bool open;
-            public string assembly;
+            UnityModManager.BridgeState state = new UnityModManager.BridgeState();
+            state.id = entry.Info.Id;
+            state.name = string.IsNullOrEmpty(entry.Info.DisplayName) ? entry.Info.Id : entry.Info.DisplayName;
+            state.author = entry.Info.Author;
+            state.version = entry.Info.Version;
+            state.enabled = entry.Enabled;
+            state.active = entry.Active;
+            state.loaded = entry.Loaded;
+            state.error = entry.ErrorOnLoading;
+            state.gui = entry.OnGUI != null;
+            state.open = UnityModManager.UI.IsOpen(entry);
+            state.assembly = entry.Info.AssemblyName;
+            return state;
+        }
+
+        private static UnityModManager.BridgeState ForeignState(object entry)
+        {
+            UnityModManager.BridgeState state = new UnityModManager.BridgeState();
+            state.id = AdofPerfectUmm.Foreign.IdOf(entry) ?? "";
+            state.name = AdofPerfectUmm.Foreign.NameOf(entry) ?? state.id;
+            state.author = AdofPerfectUmm.Foreign.AuthorOf(entry);
+            state.version = AdofPerfectUmm.Foreign.VersionOf(entry);
+            state.enabled = AdofPerfectUmm.Foreign.EnabledOf(entry);
+            state.active = AdofPerfectUmm.Foreign.ActiveOf(entry);
+            state.loaded = AdofPerfectUmm.Foreign.LoadedOf(entry);
+            state.error = AdofPerfectUmm.Foreign.ErrorOf(entry);
+            state.gui = AdofPerfectUmm.Foreign.HasGui(entry);
+            state.open = AdofPerfectUmm.Foreign.ShowSettingsOf(entry);
+            state.assembly = AdofPerfectUmm.Foreign.AssemblyNameOf(entry);
+            return state;
         }
 
         public static string State()
         {
             try
             {
-                List<ModState> list = new List<ModState>();
-                for (int i = 0; i < UnityModManager.modEntries.Count; i++)
+                List<UnityModManager.BridgeState> list = new List<UnityModManager.BridgeState>();
+                if (UnityModManager.passive)
                 {
-                    var entry = UnityModManager.modEntries[i];
-                    ModState state = new ModState();
-                    state.id = entry.Info.Id;
-                    state.name = string.IsNullOrEmpty(entry.Info.DisplayName) ? entry.Info.Id : entry.Info.DisplayName;
-                    state.author = entry.Info.Author;
-                    state.version = entry.Info.Version;
-                    state.enabled = entry.Enabled;
-                    state.active = entry.Active;
-                    state.loaded = entry.Loaded;
-                    state.error = entry.ErrorOnLoading;
-                    state.gui = entry.OnGUI != null;
-                    state.open = UnityModManager.UI.IsOpen(entry);
-                    state.assembly = entry.Info.AssemblyName;
-                    list.Add(state);
+                    IList entries = AdofPerfectUmm.Foreign.Entries();
+                    if (entries != null)
+                        foreach (object entry in entries)
+                            if (entry != null) list.Add(ForeignState(entry));
+                }
+                else
+                {
+                    for (int i = 0; i < UnityModManager.modEntries.Count; i++)
+                        list.Add(OwnState(UnityModManager.modEntries[i]));
                 }
                 return list.ToJson();
             }
@@ -610,6 +675,11 @@ namespace AdofPerfectUmm
 
         public static string ModsPath()
         {
+            if (UnityModManager.passive)
+            {
+                string p = AdofPerfectUmm.Foreign.ModsPath();
+                return p ?? string.Empty;
+            }
             return UnityModManager.modsPath ?? string.Empty;
         }
 
@@ -619,6 +689,13 @@ namespace AdofPerfectUmm
             try
             {
                 Loader.Boot();
+                // 原版 UMM 在场：立即转入 passive，不接管 MOD 目录、不加载任何东西
+                if (AdofPerfectUmm.Foreign.Active)
+                {
+                    UnityModManager.passive = true;
+                    UnityModManager.started = true;
+                    return "passive";
+                }
                 if (!string.IsNullOrEmpty(modsDir) && Directory.Exists(modsDir)) UnityModManager.SetModsPath(modsDir);
                 Loader.EnsureStarted();
                 return UnityModManager.started ? "ok" : "err:start-failed";
@@ -634,6 +711,7 @@ namespace AdofPerfectUmm
         {
             try
             {
+                if (UnityModManager.passive) return AdofPerfectUmm.Foreign.LogTail(maxLines);
                 string[] lines = UnityModManager.Logger.History;
                 int from = lines.Length > maxLines ? lines.Length - maxLines : 0;
                 StringBuilder sb = new StringBuilder();
@@ -659,10 +737,21 @@ namespace AdofPerfectUmm
                     case "disable": return SetEnabled(argument, false);
                     case "open": return Open(argument);
                     case "close": return Close(argument);
-                    case "closeAll": UnityModManager.UI.CloseAll(); return "ok";
+                    case "closeAll":
+                        if (UnityModManager.passive)
+                        {
+                            IList all = AdofPerfectUmm.Foreign.Entries();
+                            if (all != null)
+                                foreach (object e in all)
+                                    if (e != null) AdofPerfectUmm.Foreign.SetShowSettings(AdofPerfectUmm.Foreign.IdOf(e), false);
+                            return "ok";
+                        }
+                        UnityModManager.UI.CloseAll(); return "ok";
                     case "theme":
                     {
                         // 工具侧把当前皮肤强调色推过来：让游戏内的 MOD 窗口同色
+                        // （passive 模式下没有我们的窗口，空操作）
+                        if (UnityModManager.passive) return "ok";
                         float r, g, b;
                         if (TryParseHexColor(argument, out r, out g, out b))
                             UnityModManager.UI.SetAccent(r, g, b);
@@ -670,6 +759,15 @@ namespace AdofPerfectUmm
                     }
                     case "hasGui":
                     {
+                        if (UnityModManager.passive)
+                        {
+                            IList entries = AdofPerfectUmm.Foreign.Entries();
+                            if (entries != null)
+                                foreach (object e in entries)
+                                    if (e != null && string.Equals(AdofPerfectUmm.Foreign.IdOf(e), argument, StringComparison.Ordinal))
+                                        return AdofPerfectUmm.Foreign.HasGui(e) ? "1" : "0";
+                            return "0";
+                        }
                         var entry = UnityModManager.FindMod(argument);
                         return entry != null && entry.OnGUI != null ? "1" : "0";
                     }
@@ -716,12 +814,15 @@ namespace AdofPerfectUmm
 
         private static string Reload()
         {
+            if (UnityModManager.passive) return "passive";   // 复用模式没有可重载的自己
             Loader.EnsureStarted();
             return "ok";
         }
 
         private static string SetEnabled(string id, bool value)
         {
+            if (UnityModManager.passive)
+                return AdofPerfectUmm.Foreign.SetEnabled(id, value) ? "ok" : "err:not-found";
             var entry = UnityModManager.FindMod(id);
             if (entry == null) return "err:not-found";
             entry.Enabled = value;
@@ -741,6 +842,11 @@ namespace AdofPerfectUmm
 
         private static string Open(string id)
         {
+            if (UnityModManager.passive)
+            {
+                // 原版 UMM：翻它的 ShowModSettings 开关，它的 GUI 会展示该 MOD 的设置页
+                return AdofPerfectUmm.Foreign.SetShowSettings(id, true) ? "ok" : "err:not-found";
+            }
             var entry = UnityModManager.FindMod(id);
             if (entry == null) return "err:not-found";
             if (entry.OnGUI == null) return "err:no-gui";
@@ -750,6 +856,8 @@ namespace AdofPerfectUmm
 
         private static string Close(string id)
         {
+            if (UnityModManager.passive)
+                return AdofPerfectUmm.Foreign.SetShowSettings(id, false) ? "ok" : "err:not-found";
             var entry = UnityModManager.FindMod(id);
             if (entry == null) return "err:not-found";
             UnityModManager.UI.Close(entry);
