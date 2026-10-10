@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 // Lang.cpp — i18n 实现（表驱动）
 //   每行一条：{ 简中, 繁中, English, 日本語, Русский }
 //   后续更新只需在 g_table 里按同名枚举顺序追加，或用 I18N::Register 动态注册。
@@ -274,6 +274,7 @@ namespace I18N
         { { "跟随游戏自动开始/停止", "跟隨遊戲自動開始/停止", "Auto start/stop with gameplay", "ゲームに追従して自動開始/停止", "Авто-старт/стоп с игрой" } },  // REC_AUTO
         { { "输出目录", "輸出目錄", "Output folder", "出力フォルダ", "Папка вывода" } },                        // REC_DIR
         { { "打开目录", "開啟目錄", "Open folder", "フォルダを開く", "Открыть папку" } },                       // REC_OPEN
+        { { "预览", "預覽", "Preview", "プレビュー", "Просмотр" } },                                            // REC_PREVIEW
         { { "帧率", "影格率", "FPS", "FPS", "FPS" } },                                                          // REC_FPS
         { { "码率", "位元率", "Bitrate", "ビットレート", "Битрейт" } },                                        // REC_MBPS
         { { "状态", "狀態", "Status", "状態", "Статус" } },                                                     // REC_STATS
@@ -305,6 +306,55 @@ namespace I18N
         { { "继续录制", "繼續錄製", "Resume", "再開", "Продолжить" } },  // REC_RESUME
         { { "暂停会结束当前分段，继续录制会写入新文件。", "暫停會結束目前分段，繼續錄製會寫入新檔案。", "Pausing finalizes the current segment; resuming starts a new file.", "一時停止で現在のセグメントを確定し、再開で新しいファイルに書き込みます。", "Пауза завершает текущий сегмент, продолжение пишет новый файл." } },  // REC_PAUSED_HINT
         { { "小窗录制：把游戏原生画面（不含本工具覆盖层）录成 H.264/MP4 文件。", "小窗錄製：把遊戲原生畫面（不含本工具覆蓋層）錄成 H.264/MP4 檔案。", "Window recording: captures the native game frame (without this tool's overlay) into H.264/MP4.", "ウィンドウ録画：ゲーム本来の画面（本ツールのオーバーレイなし）を H.264/MP4 に保存します。", "Запись окна: нативное изображение игры (без оверлея) в H.264/MP4." } },  // REC_PAGEDESC
+        /* ---- 本轮新增 ---- */
+        { { "16K", "16K", "16K", "16K", "16K" } },                                                              // TAB_16K
+        { { "居中", "置中", "Center", "中央", "По центру" } },                                                  // LBL_POS_CT
+        { { "伪双押优化", "偽雙押優化", "Merge near-simultaneous", "疑似同時押し補正", "Слияние псевдо-дублей" } },  // LBL_PSEUDO2
+        { { "16K（PAD）：Malody Pad 式 4×4 方形面板；音符在对应方块上收缩，缩到边界时按下该方块的键。每个方块可单独设键。", "16K（PAD）：Malody Pad 式 4×4 方形面板；音符在對應方塊上收縮，縮到邊界時按下該方塊的鍵。每個方塊可單獨設鍵。", "16K (PAD): a Malody Pad-style 4x4 square panel; notes shrink on their pad and you hit when the shrinking square meets the border. Every pad has its own key.", "16K（PAD）：Malody Pad 風の4×4パネル。音符は対応パッド上で縮小し、枠に重なった瞬間にそのパッドのキーを押します。各パッドに個別キーを設定できます。", "16K (PAD): панель 4x4 в стиле Malody Pad; нота сжимается на своём квадрате, нажатие — когда квадрат совпадёт с рамкой. У каждого квадрата своя клавиша." } },  // LBL_PAD_HINT
+        { { "CATCH", "CATCH", "CATCH", "CATCH", "CATCH" } },  // TAB_CATCH
+        { { "拖尾", "拖尾", "Tail", "トレイル", "Шлейф" } },  // KV_TRAIL
+        { { "一键接：无需按键，用鼠标左右移动底部接盘；雨点落线瞬间被接盘盖住即自动接住（正中 MARVELOUS / 靠边 GOOD），没盖住判 MISS；判定按同一档位同步给冰与火本体（PERFECT→PERFECT、GOOD→GOOD 并显示快/慢、MISS→本体也 MISS 并断连击）。打歌算法为本模式独立实现（与冰与火宏不共用代码）。MISS 不会自动返回或重开，与 PERFECT/GOOD 一样照常显示判定、继续游玩；本页还可切换多种生成手法（经典 / 走 / 冲 / 超冲 / 边冲 / 阶梯）。", "一鍵接：無需按鍵，用滑鼠左右移動底部接盤；雨點落線瞬間被接盤蓋住即自動接住（正中 MARVELOUS / 靠邊 GOOD），沒蓋住判 MISS；判定按同一檔位同步給冰與火本體（PERFECT→PERFECT、GOOD→GOOD 並顯示快/慢、MISS→本體也 MISS 並斷連擊）。打歌演算法為本模式獨立實作（與冰與火巨集不共用程式碼）。MISS 不會自動返回或重開，與 PERFECT/GOOD 一樣照常顯示判定、繼續遊玩；本頁還可切換多種生成手法（經典 / 走 / 衝 / 超衝 / 邊衝 / 階梯）。", "Mouse catcher: no keys needed - move the bottom catcher with the mouse. A drop is caught the moment it reaches the line if the catcher covers it (center = MARVELOUS, edge = GOOD); otherwise MISS. The same grade is pushed to the native Fire&Ice level (PERFECT->PERFECT, GOOD->GOOD with a FAST/SLOW tag, MISS->native MISS and combo break) by this mode own standalone play algorithm (no code shared with the Fire&Ice macro). A MISS never auto-restarts: it shows a normal judgment and play continues just like PERFECT/GOOD. Several generation styles (Classic / Walk / Dash / Hyper / Edge / Stair) can be picked on this page.", "マウスキャッチャー：キー不要。マウスで下部のキャッチャーを左右に動かします。雨がラインに達した瞬間キャッチャーが覆っていれば自動キャッチ（中央=MARVELOUS / 端=GOOD）、覆っていなければ MISS。同じ判定が Fire&Ice 本体にも同期されます（PERFECT→PERFECT、GOOD→GOOD と FAST/SLOW 表示、MISS→本体も MISS でコンボ切れ）。打鍵アルゴリズムは本モード専用の独立実装です（Fire&Ice マクロとコードを共有しません）。MISS でも自動リトライせず、PERFECT/GOOD と同様に判定を表示してそのまま続行します。本ページで複数の生成手法（クラシック / ウォーク / ダッシュ / ハイパー / エッジ / ステア）を選べます。", "Мышиный ловец: нажатия не нужны — двигайте нижний ловец мышью. Капля ловится в момент достижения линии, если ловец её накрывает (центр = MARVELOUS, край = GOOD); иначе MISS. Та же оценка передаётся нативной Fire&Ice (PERFECT→PERFECT, GOOD→GOOD с меткой FAST/SLOW, MISS→MISS и обрыв комбо) отдельным алгоритмом этого режима (общий код с макросом Fire&Ice не используется). MISS не перезапускает уровень автоматически: показывается обычная оценка, игра продолжается как при PERFECT/GOOD. На этой странице можно выбрать несколько стилей генерации (классика / шаг / рывок / гипер / край / лестница)." } },  // LBL_CATCH_HINT
+        { { "方块键位", "方塊鍵位", "Pad keys", "パッドキー", "Клавиши пада" } },  // LBL_PAD_KEYS
+        { { "接盘键位", "接盤鍵位", "Catcher keys", "キャッチャーキー", "Клавиши ловца" } },  // LBL_CATCH_KEYS
+        { { "硬抗 BPM（越低越偏轮指）", "硬抗 BPM（越低越偏輪指）", "Hard-resist BPM (lower = more rolls)", "硬抗BPM（低いほどロール寄り）", "Жёсткий BPM (ниже = больше роллов)" } },  // LBL_HARDRESIST
+        { { "内轮指（J K / F D）", "內輪指（J K / F D）", "Inner roll (J K / F D)", "内ロール（J K / F D）", "Внутренний ролл (J K / F D)" } },  // LBL_INNERROLL
+        { { "16K（PAD）仅支持内置皮肤：4×4 面板是 Malody Pad 布局，外部 MSP 轨道皮肤不适用于该模式。", "16K（PAD）僅支援內建面板：4×4 面板是 Malody Pad 佈局，外部 MSP 軌道面板不適用於該模式。", "16K (PAD) supports the built-in skin only: the 4x4 panel is a Malody Pad layout, so external MSP track skins do not apply.", "16K（PAD）は内蔵スキンのみ対応：4×4 パネルは Malody Pad レイアウトのため、外部 MSP レーンスキンは適用されません。", "16K (PAD) поддерживает только встроенный скин: панель 4x4 — это раскладка Malody Pad, внешние MSP-скины дорожек не подходят." } },  // LBL_16K_BUILTIN_ONLY
+        { { "选中某个模式会同时启用该模式的辅助（四模式互斥）；再次点击取消。",
+            "選中某個模式會同時啟用該模式的輔助（四模式互斥）；再次點擊取消。",
+            "Selecting a mode also enables that mode's assist (the four modes are mutually exclusive); click again to turn it off.",
+            "モードを選ぶとそのモードの補助も有効になります（4モードは排他）。もう一度押すと解除。",
+            "Выбор режима включает и вспомогательный слой этого режима (режимы взаимоисключающие); нажмите снова, чтобы выключить." } },  // MACRO_MODES_HINT
+        { { "冰与火原生钩子：已装好，代打生效。", "冰與火原生鉤子：已裝好，代打生效。", "Fire & Ice native hook: installed — auto-play is active.", "氷と炎ネイティブフック：導入済み — 代打有効。", "Нативный хук Fire & Ice: установлен — автопрогон работает." } },  // MACRO_HOOK_ON
+        { { "冰与火原生钩子：未装好，代打无法生效（请看日志或重启游戏）。", "冰與火原生鉤子：未裝好，代打無法生效（請看日誌或重啟遊戲）。", "Fire & Ice native hook: NOT installed — auto-play will not work (check the log or restart the game).", "氷と炎ネイティブフック：未導入 — 代打は機能しません（ログ確認かゲーム再起動）。", "Нативный хук Fire & Ice: не установлен — автопрогон не работает (см. лог или перезапустите игру)." } },  // MACRO_HOOK_OFF
+        { { "自适应窗口", "自適應窗口", "Adaptive window", "自動調整窓", "Адаптивное окно" } },  // LBL_PSEUDO2_ADAPT
+        { { "漏音即死", "漏音即死", "Miss = death", "ミス即死", "Промах = смерть" } },  // LBL_CATCH_KILL
+        { { "接盘宽度", "接盤寬度", "Catcher width", "キャッチャー幅", "Ширина ловца" } },  // LBL_CATCH_PLATEW
+        { { "漏音，判定失败", "漏音，判定失敗", "Missed — failed", "ミス — 失敗", "Промах — провал" } },  // LBL_CATCH_DEAD
+        { { "打歌精准度", "打歌精準度", "Playback accuracy", "演奏精度", "Точность игры" } },  // LBL_CATCH_PLAYACC
+        // ---- 直播模式（防采集覆盖层）----
+        { { "直播模式", "直播模式", "Stream mode", "配信モード", "Режим стрима" } },  // TAB_LIVE
+        { { "直播模式（防采集）", "直播模式（防擷取）", "Stream mode (capture-proof)", "配信モード（キャプチャ対策）", "Режим стрима" } },  // LIVE_TITLE
+        { { "开启后这些元素在直播 / 录像里看不到，但本机屏幕上照常显示；左上角会带 ADOFAI-PERFECT 水印。", "開啟後這些元素在直播 / 錄影裡看不到，但本機螢幕上照常顯示；左上角會帶 ADOFAI-PERFECT 浮水印。", "While enabled these elements are hidden from capture (OBS etc.) but still visible on your own screen; an ADOFAI-PERFECT watermark is drawn on the game.", "有効にするとこれらの要素は配信/録画に映らず、自分の画面には表示されたままです。左上に ADOFAI-PERFECT の透かしが出ます。", "Включив это, элементы не попадут в стрим/запись, но останутся видны на вашем экране; слева вверху — водяной знак ADOFAI-PERFECT." } },  // LIVE_DESC
+        { { "不显示 IMGUI 界面", "不顯示 IMGUI 介面", "Hide IMGUI menu", "IMGUI 画面を隠す", "Скрыть меню IMGUI" } },  // LIVE_HIDE_MENU
+        { { "不显示一般轨道辅助", "不顯示一般軌道輔助", "Hide track assist", "通常トラック補助を隠す", "Скрыть дорожки" } },  // LIVE_HIDE_TRACK
+        { { "不显示辅助读谱", "不顯示輔助讀譜", "Hide sightread", "譜面補助を隠す", "Скрыть чтение" } },  // LIVE_HIDE_READ
+        { { "不显示按键反馈", "不顯示按鍵回饋", "Hide key feedback", "キー表示を隠す", "Скрыть клавиши" } },  // LIVE_HIDE_KV
+        { { "直播推送软件（OBS / 直播姬 / 各种录像机）里看不到被勾选的元素；人眼在显示器上仍然能看到。", "直播推送軟體（OBS / 直播姬 / 各種錄影機）裡看不到被勾選的元素；人眼在螢幕上仍然能看到。", "Capture software cannot see the checked elements, but your own eyes still can.", "配信ソフト（OBS 等）にはチェックした要素が映りませんが、自分の目には見えたままです。", "Программы захвата не увидят отмеченные элементы, но вы их по-прежнему видите." } },  // LIVE_HINT
+        { { "覆盖窗口不可用（显卡/驱动不支持），直播模式暂时停用；已自动回退为普通显示。", "覆蓋視窗不可用（顯示卡/驅動不支援），直播模式暫時停用；已自動回退為普通顯示。", "Overlay window unavailable (GPU/driver); stream mode is inactive and fell back to normal drawing.", "オーバーレイウィンドウが利用できません（GPU/ドライバ）；通常描画にフォールバックしました。", "Оверлей недоступен (GPU/драйвер); режим отключён, обычная отрисовка." } },  // LIVE_UNAVAIL
+        { { "覆盖层状态", "覆蓋層狀態", "Overlay", "オーバーレイ状態", "Оверлей" } },  // LIVE_STATUS
+        // ---- CATCH 宏代打 / 快慢 ----
+        { { "宏代打（自动接盘）", "巨集代打（自動接盤）", "Macro auto-catch", "マクロ自動キャッチ", "Макрос-ловля" } },  // LBL_CATCH_AUTO
+        { { "宏精准度", "巨集精準度", "Macro accuracy", "マクロ精度", "Точность макроса" } },  // LBL_CATCH_MACC
+    { { "快", "快", "FAST", "早い", "РАНО" } },        // LBL_CATCH_FAST
+    { { "慢", "慢", "SLOW", "遅い", "ПОЗДНО" } },      // LBL_CATCH_SLOW
+    // ---- 8K / OSU（戳泡泡）模式页 ----
+    { { "8K", "8K", "8K", "8K", "8K" } },  // TAB_8K
+    { { "OSU!", "OSU!", "OSU!", "OSU!", "OSU!" } },  // TAB_OSU
+    { { "鼠标移动瞄准泡泡，判定环收缩到与圈外沿重合时左/右键（或 Z / X）点击。判定窗按 OD 换算：300 = 80-6*OD · 100 = 140-8*OD · 50 = 200-10*OD，超窗 MISS。",
+        "滑鼠移動瞄準泡泡，判定環收縮到與圈外沿重合時左/右鍵（或 Z / X）點擊。判定窗按 OD 換算：300 = 80-6*OD · 100 = 140-8*OD · 50 = 200-10*OD，超窗 MISS。",
+        "Aim with the mouse; click left/right button (or Z / X) when the approach ring meets the circle edge. Windows follow OD: 300 = 80-6*OD, 100 = 140-8*OD, 50 = 200-10*OD, else MISS.",
+        "マウスで照準し、判定サークルが重なった瞬間に左/右クリック（または Z / X）。判定幅は OD 換算：300 = 80-6*OD · 100 = 140-8*OD · 50 = 200-10*OD、外れは MISS。",
+        "Наводите мышью и щёлкайте левой/правой кнопкой (или Z / X), когда кольцо сойдётся с кругом. Окна по OD: 300 = 80-6*OD · 100 = 140-8*OD · 50 = 200-10*OD, иначе MISS." } },  // LBL_OSU_CAL_HINT
     };
     static_assert(sizeof(g_table) / sizeof(g_table[0]) == (size_t)BUILTIN_N, "table/enum mismatch");
 

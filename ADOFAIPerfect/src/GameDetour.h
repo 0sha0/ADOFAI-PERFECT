@@ -35,6 +35,7 @@ namespace GameDetour
     //   代打 = 在宏选定的时机调用 Hit(false)：判定仍走游戏本体角度判定，成绩真实。
     void TickInputHookOnMainThread();  // 安装 / 按请求卸载；幂等，可反复调用
     bool InputHookSettled();           // 任意线程：已装好或确认不可用
+    bool InputHookActive();            // 任意线程：原生输入钩子当前是否真的挂上了
     bool InputHookDetachRequested();   // 任意线程：是否已被请求摘钩
     void RequestInputHookDetach();     // 任意线程：请求摘钩（卸载流程）
     bool InputHookDetached();          // 任意线程：钩子已摘除 / 从未安装

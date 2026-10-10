@@ -68,7 +68,10 @@ namespace SkinLua
     };
     int Extras(Extra* out, int maxN);
 
-    void PushHit(int kind, double offsetMs);
+    // lane：命中轨（1 起，与 Malody HitEvent:HitX() 一致）。
+    // 皮肤脚本用它算特效 X（如 Phigros phi.lua：spx = 11.34 + 22.68*(hitx-1)），
+    // 旧实现固定传 1 → 任何一轨的特效都画在第一轨位置（用户反馈"打击特效位置不对"）。
+    void PushHit(int kind, double offsetMs, int lane = 1);
     void PushInput(int type, int hitx);
 
     const char* LastError();

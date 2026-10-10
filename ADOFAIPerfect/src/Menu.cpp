@@ -7,6 +7,10 @@
 #include "Lang.h"
 #include "Log.h"
 #include "RenderHook.h"
+#include "StreamMode.h"
+#include "UiKit.h"
+#include "ModManager.h"
+#include "ModLoader.h"
 #include <cstring>
 #include <cstdlib>
 
@@ -23,141 +27,227 @@
 #pragma comment(lib, "ole32.lib")
 
 // ============================================================
-// Menu.cpp — ImGui 界面（自定义风格）
-//   · 半透明正方形小窗，双页：功能 / 实时状态
-//   · 可折叠成一颗可拖动的小圆点，点击展开
+// Menu.cpp — 主界面（NEVERLOSE 风格）
+//   · 左侧边栏 7 项 + 右侧卡片内容区（不再使用顶部 TAB）
+//   · 所有控件由 UiKit 自绘（Toggle / Slider / Combo / CardAction …）
+//   · 可折叠成一颗可拖动的小圆点
 // ============================================================
 namespace Menu
 {
+    using namespace UiKit;
+
     // ---- 本地状态 ----
-    static bool  s_collapsed = false;      // 是否缩成小圆点
-    static ImVec2 s_mainSize(448, 430);    // 主窗口尺寸（可拖右下角调整，控件随宽度自适应）
-    static ImVec2 s_mainPos(60, 60);       // 主窗口位置（折叠/展开间保持）
-    static ImVec2 s_dotPos(60, 60);        // 小圆点位置
-    static float s_anim[2] = { 0.f, 0.f }; // 开关动画 0..1
-    // ---- 应用信息（关于页）----
-    static const char* kAppVersion  = "1.2";
+    static bool   s_collapsed = false;
+    static ImVec2 s_mainSize(900.f, 560.f);
+    static ImVec2 s_mainPos(60.f, 60.f);
+    static ImVec2 s_dotPos(60.f, 60.f);
+
+    static const char* kAppVersion  = "1.3";
     static const char* kAppVideoUrl = "https://www.bilibili.com/video/BV115aQ6iEqJ/";
     static const char* kAppRepoUrl  = "https://github.com/0sha0/ADOFAI-PERFECT";
-    static const int   kLogoResId   = 101;   // 与 ADOFAIPerfect.rc 的 IDR_ADOFAI_LOGO 一致
-    static const int   kPageAbout   = 11;    // 页 id（渲染分支见 DrawMain）
-    static const int   kPageRecord  = 12;    // 录制页（小窗录制：开始/暂停/继续）
+    static const int   kLogoResId   = 101;
 
-    // 调试：ADOFAI_PERFECT_PAGE=N 指定启动页（0..12）
-    static int S_PageFromEnv()
+    // ---- 侧边栏页 ----
+    enum { PG_BASIC = 0, PG_STATUS, PG_READ, PG_TRACK, PG_MISC, PG_MODMGR, PG_SET, PG_ABOUT, PG_N };
+    // ---- 「一般轨道」子页 ----
+    enum { TR_4K = 0, TR_5K, TR_6K, TR_10K, TR_16K, TR_CATCH, TR_8K, TR_OSU, TR_N };
+    // ---- 「其他」子页 ----
+    enum { MI_MACRO = 0, MI_RECORD, MI_SKIN, MI_KV, MI_LIVE, MI_N };
+    // ---- 「设置」子页 ----
+    enum { SE_MAIN = 0, SE_KV, SE_N };
+
+    static int  s_page  = PG_BASIC;
+    static int  s_subTR = -1;          // -1 = 显示「一般轨道」入口页
+    static int  s_subMI = -1;          // -1 = 显示「其他」入口页
+    static int  s_subSE = SE_MAIN;
+    // ---- 前置声明（各页实现按主题分组排在后面）----
+    static void DrawBasicPage();
+    static void DrawStatusPage();
+    static void DrawReadPage();
+    static void DrawTrackHub();
+    static void DrawTrackSub();
+    static void DrawMiscHub();
+    static void DrawMiscSub();
+    static void DrawSettingsPage();
+    static void DrawSkinPage();
+    static void DrawAboutPage();
+    static void DrawSidebar();
+    static void DrawPageBody();
+    static void DrawMain();
+    static void DrawDot();
+
+    // ============================================================
+    //  新界面文案（运行时注册，5 语言；只在首次绘制时注册一次）
+    // ============================================================
+    enum NSId
     {
+        NS_BASIC, NS_STATUS, NS_READ, NS_TRACK, NS_MISC, NS_MODMGR, NS_SET, NS_ABOUT,
+        NS_FEATURES, NS_HUB_TRACK, NS_HUB_MISC, NS_GLOBAL,
+        NS_TRACK_DESC, NS_MISC_DESC, NS_BACK, NS_OPEN,
+        NS_CORE_DESC, NS_LIVE, NS_LIVE_DESC,
+        NS_UI_STYLE, NS_UI_STYLE_DESC, NS_PROFILE, NS_PROFILE_DESC,
+        NS_SAVE, NS_LOAD, NS_DELETE, NS_OPEN_DIR, NS_NAME_HINT,
+        NS_KV_TITLE, NS_KEYBIND, NS_KEYBIND_DESC,
+        NS_COMBO, NS_ACC, NS_BPM, NS_NOTES, NS_MAXCOMBO, NS_DEATHS, NS_CP,
+        NS_MARV, NS_PERF, NS_GOOD, NS_MISS,
+        NS_MODE_ON, NS_MODE_DESC, NS_UNLOAD_HINT, NS_VERSION,
+        NS_NOTREADY, NS_PLAYING, NS_PAUSED, NS_IDLE, NS_LV,
+        NS_NODEATH_DESC, NS_AUTOCOMBO_DESC, NS_COLLAPSE, NS_SELECT, NS_N
+    };
+    static int NSI(int i)
+    {
+        static int  t[NS_N];
+        static bool init = false;
+        if (!init)
+        {
+            init = true;
+            for (int k = 0; k < NS_N; k++) t[k] = -1;
+            t[NS_BASIC]   = I18N::Register("基础功能", "基礎功能", "General", "基本機能", "Основное");
+            t[NS_STATUS]  = I18N::Register("实时状态", "即時狀態", "Live Status", "リアルタイム状態", "Состояние");
+            t[NS_READ]    = I18N::Register("辅助读谱", "輔助讀譜", "Sightread", "譜面補助", "Чтение");
+            t[NS_TRACK]   = I18N::Register("一般轨道", "一般軌道", "Tracks", "通常トラック", "Дорожки");
+            t[NS_MISC]    = I18N::Register("其他", "其他", "More", "その他", "Прочее");
+            t[NS_MODMGR]  = I18N::Register("MOD 管理器", "MOD 管理器", "Mod Manager", "MOD マネージャー", "Mod Manager");
+            t[NS_SET]     = I18N::Register("设置", "設定", "Settings", "設定", "Настройки");
+            t[NS_ABOUT]   = I18N::Register("关于", "關於", "About", "このアプリ", "О программе");
+            t[NS_FEATURES]= I18N::Register("功能", "功能", "FEATURES", "機能", "ФУНКЦИИ");
+            t[NS_HUB_TRACK] = I18N::Register("选择轨道模式", "選擇軌道模式", "Choose a track mode", "トラックモードを選択", "Выберите режим");
+            t[NS_HUB_MISC]  = I18N::Register("更多功能", "更多功能", "More tools", "その他の機能", "Дополнительно");
+            t[NS_GLOBAL]  = I18N::Register("全局", "全域", "GLOBAL", "グローバル", "ОБЩЕЕ");
+            t[NS_TRACK_DESC] = I18N::Register("把冰与火谱面转成对应模式的下坠谱；点进去可调整流速、延迟、风格与键位。",
+                                              "把冰與火譜面轉成對應模式的下墜譜；點進去可調整流速、延遲、風格與鍵位。",
+                                              "Convert an ADOFAI chart into the selected falling-note mode. Tune speed, offset, style and keys inside.",
+                                              "ADOFAI譜面を選択モードの落下譜へ変換。中で速度・オフセット・スタイル・キーを調整できます。",
+                                              "Преобразует чарт ADOFAI в падающий режим. Внутри — скорость, смещение, стиль и клавиши.");
+            t[NS_MISC_DESC] = I18N::Register("宏打歌 / 画面录制 / 皮肤管理。",
+                                             "巨集打歌 / 畫面錄影 / 面板管理。",
+                                             "Auto-play macro, screen recording and skin management.",
+                                             "マクロ演奏・画面録画・スキン管理。",
+                                             "Макрос, запись экрана и скины.");
+            t[NS_BACK]    = I18N::Register("返回", "返回", "Back", "戻る", "Назад");
+            t[NS_OPEN]    = I18N::Register("打开", "開啟", "Open", "開く", "Открыть");
+            t[NS_CORE_DESC] = I18N::Register("游戏本体的两个总开关；立即生效，重开游戏后仍保留。",
+                                             "遊戲本體的兩個總開關；立即生效，重開遊戲後仍保留。",
+                                             "Two master switches applied directly to the game. Effective immediately.",
+                                             "ゲーム本体の2つのスイッチ。即時反映されます。",
+                                             "Два основных переключателя игры. Действуют сразу.");
+            t[NS_LIVE]    = I18N::Register("关卡信息", "關卡資訊", "Level info", "レベル情報", "Уровень");
+            t[NS_LIVE_DESC] = I18N::Register("读取游戏内部状态（只读，不会修改存档）。",
+                                             "讀取遊戲內部狀態（唯讀，不會修改存檔）。",
+                                             "Reads the game state (read-only).",
+                                             "ゲーム内部状態を読み取ります（読み取り専用）。",
+                                             "Читает состояние игры (только чтение).");
+            t[NS_UI_STYLE] = I18N::Register("界面风格", "介面風格", "UI style", "UIスタイル", "Стиль интерфейса");
+            t[NS_UI_STYLE_DESC] = I18N::Register("切换强调色；立即生效并记住。",
+                                                 "切換強調色；立即生效並記住。",
+                                                 "Accent colour. Applied instantly and remembered.",
+                                                 "アクセントカラー。即時反映され保存されます。",
+                                                 "Акцентный цвет. Применяется сразу и сохраняется.");
+            t[NS_PROFILE] = I18N::Register("配置档案", "設定檔", "Profiles", "プロファイル", "Профили");
+            t[NS_PROFILE_DESC] = I18N::Register("把键位、皮肤记忆、各模式参数、读谱与录制设置整包保存/读取。",
+                                                "把鍵位、面板記憶、各模式參數、讀譜與錄影設定整包儲存/讀取。",
+                                                "Save/load keys, skin memory, per-mode options, sightread and recorder settings as one bundle.",
+                                                "キー・スキン・各モード設定・譜面読み・録画設定をまとめて保存/読込。",
+                                                "Сохраняет и загружает клавиши, скины, режимы, чтение и запись одним файлом.");
+            t[NS_SAVE]    = I18N::Register("保存", "儲存", "Save", "保存", "Сохранить");
+            t[NS_LOAD]    = I18N::Register("读取", "讀取", "Load", "読込", "Загрузить");
+            t[NS_DELETE]  = I18N::Register("删除", "刪除", "Delete", "削除", "Удалить");
+            t[NS_OPEN_DIR]= I18N::Register("打开目录", "開啟目錄", "Open folder", "フォルダを開く", "Открыть папку");
+            t[NS_NAME_HINT] = I18N::Register("档案名称", "設定檔名稱", "Profile name", "プロファイル名", "Имя профиля");
+            t[NS_KV_TITLE]= I18N::Register("按键反馈", "按鍵回饋", "Key feedback", "キー表示", "Клавиши");
+            t[NS_KEYBIND] = I18N::Register("键位设置", "鍵位設定", "Key bindings", "キー設定", "Раскладка");
+            t[NS_KEYBIND_DESC] = I18N::Register("每个模式独立键位；支持字母、数字、符号键（如 ; ' [ 空格 Enter 等）。",
+                                                "每個模式獨立鍵位；支援字母、數字、符號鍵（如 ; ' [ 空格 Enter 等）。",
+                                                "Per-mode key bindings. Letters, digits and symbol keys ( ; ' [ Space Enter ... ) are supported.",
+                                                "モードごとのキー設定。英数字・記号キー（; ' [ Space Enter など）に対応。",
+                                                "Раскладка для каждого режима. Поддерживаются буквы, цифры и символы ( ; ' [ Space Enter ).");
+            t[NS_COMBO]   = I18N::Register("连击", "連擊", "Combo", "コンボ", "Комбо");
+            t[NS_ACC]     = I18N::Register("精准度", "精準度", "Accuracy", "精度", "Точность");
+            t[NS_BPM]     = I18N::Register("BPM", "BPM", "BPM", "BPM", "BPM");
+            t[NS_NOTES]   = I18N::Register("音符", "音符", "Notes", "ノーツ", "Ноты");
+            t[NS_MAXCOMBO]= I18N::Register("最大连击", "最大連擊", "Max combo", "最大コンボ", "Макс. комбо");
+            t[NS_DEATHS]  = I18N::Register("死亡", "死亡", "Deaths", "ミス", "Смерти");
+            t[NS_CP]      = I18N::Register("检查点", "檢查點", "Checkpoints", "チェックポイント", "Чекпоинты");
+            t[NS_MARV]    = I18N::Register("完美", "完美", "MARV", "MARV", "MARV");
+            t[NS_PERF]    = I18N::Register("优秀", "優秀", "PERF", "PERF", "PERF");
+            t[NS_GOOD]    = I18N::Register("良好", "良好", "GOOD", "GOOD", "GOOD");
+            t[NS_MISS]    = I18N::Register("失误", "失誤", "MISS", "MISS", "MISS");
+            t[NS_MODE_ON] = I18N::Register("启用", "啟用", "Enable", "有効", "Включить");
+            t[NS_MODE_DESC] = I18N::Register("开启后进入关卡即显示该模式的下坠谱面（模式互斥）。",
+                                             "開啟後進入關卡即顯示該模式的下墜譜面（模式互斥）。",
+                                             "Shows this mode's falling chart once you enter a level (modes are exclusive).",
+                                             "レベル進入時にこのモードの落下譜を表示（排他）。",
+                                             "Показывает чарт этого режима при входе в уровень (режимы исключают друг друга).");
+            t[NS_NODEATH_DESC] = I18N::Register("失误不再中断关卡：地球闪红但连击保留、自动补拍继续。",
+                                                "失誤不再中斷關卡：地球閃紅但連擊保留、自動補拍繼續。",
+                                                "Mistakes no longer break the run: the planet flashes but the combo survives.",
+                                                "ミスでも中断されず、コンボが維持されます。",
+                                                "Ошибки не прерывают уровень: комбо сохраняется.");
+            t[NS_AUTOCOMBO_DESC] = I18N::Register("由游戏自身的 Auto 接管，自动完成演奏（不影响判定统计）。",
+                                                  "由遊戲自身的 Auto 接管，自動完成演奏（不影響判定統計）。",
+                                                  "The game's own Auto mode plays the chart for you.",
+                                                  "ゲーム内蔵のAutoが自動演奏します。",
+                                                  "Встроенный Auto игры играет чарт за вас.");            t[NS_UNLOAD_HINT] = I18N::Register("卸载模块并恢复游戏原始状态。", "卸載模組並還原遊戲原始狀態。",
+                                               "Unload the module and restore the game.", "モジュールを解除してゲームを元に戻します。",
+                                               "Выгрузить модуль и вернуть игру в исходное состояние.");
+            t[NS_SELECT] = I18N::Register("选择", "選擇", "Select", "選択", "Выбор");
+            t[NS_COLLAPSE] = I18N::Register("折叠", "摺疊", "Collapse", "折りたたむ", "Свернуть");
+            t[NS_VERSION] = I18N::Register("版本", "版本", "Version", "バージョン", "Версия");
+            t[NS_NOTREADY]= I18N::Register("桥接尚未就绪，请先进入一次游戏关卡。", "橋接尚未就緒，請先進入一次遊戲關卡。",
+                                           "Bridge not ready yet - enter a level once.", "ブリッジ未準備 - 一度レベルに入ってください。",
+                                           "Мост не готов — войдите в уровень.");
+            t[NS_PLAYING] = I18N::Register("游戏进行中", "遊戲進行中", "Playing", "プレイ中", "Игра");
+            t[NS_PAUSED]  = I18N::Register("已暂停", "已暫停", "Paused", "一時停止", "Пауза");
+            t[NS_IDLE]    = I18N::Register("未开始", "未開始", "Idle", "待機", "Ожидание");
+            t[NS_LV]      = I18N::Register("难度", "難度", "Level", "レベル", "Сложность");
+        }
+        if (i < 0 || i >= NS_N) return -1;
+        return t[i];
+    }
+    static const char* TT(int i) { return I18N::Tr(NSI(i)); }
+
+    // 进入某页（统一入口，负责记住滚动位置）
+    static void GoPage(int pg, int subTR = -1, int subMI = -1, int subSE = SE_MAIN)
+    {
+        s_page  = pg;
+        s_subTR = subTR;
+        s_subMI = subMI;
+        s_subSE = subSE;
+    }
+
+    // 启动页（调试钩子 ADOFAI_PERFECT_PAGE=0..14，保持与旧版一致）
+    static void S_PageFromEnv()
+    {
+        static bool s_once = false;
+        if (s_once) return;   // 只在启动时读一次，否则会覆盖用户点击
+        s_once = true;
         char v[16] = { 0 };
-        if (GetEnvironmentVariableA("ADOFAI_PERFECT_PAGE", v, sizeof(v)) > 0)
+        if (GetEnvironmentVariableA("ADOFAI_PERFECT_PAGE", v, sizeof(v)) <= 0) return;
+        const int p = atoi(v);
+        switch (p)
         {
-            int p = atoi(v);
-            if (p >= 0 && p <= 12) return p;
-            return 0;
+        case 0:  GoPage(PG_BASIC); break;
+        case 1:  GoPage(PG_STATUS); break;
+        case 2:  GoPage(PG_READ); break;
+        case 3:  GoPage(PG_TRACK, TR_4K); break;
+        case 4:  GoPage(PG_TRACK, TR_5K); break;
+        case 5:  GoPage(PG_TRACK, TR_6K); break;
+        case 6:  GoPage(PG_TRACK, TR_10K); break;
+        case 13: GoPage(PG_TRACK, TR_16K); break;
+        case 14: GoPage(PG_TRACK, TR_CATCH); break;
+        case 7:  GoPage(PG_MISC, -1, MI_KV); break;
+        case 8:  GoPage(PG_MISC, -1, MI_SKIN); break;
+        case 9:  GoPage(PG_SET); break;
+        case 10: GoPage(PG_MISC, -1, MI_MACRO); break;
+        case 11: GoPage(PG_ABOUT); break;
+        case 12: GoPage(PG_MISC, -1, MI_RECORD); break;
+        case 16: GoPage(PG_MISC, -1, MI_LIVE); break;      // 直播模式（独立页）
+        case 17: GoPage(PG_TRACK, TR_8K); break;           // 8K
+        case 18: GoPage(PG_TRACK, TR_OSU); break;          // OSU（戳泡泡）
+        case 15: GoPage(PG_MODMGR); break;
+        default: break;
         }
-        return 0;
     }
-    static int   s_page = S_PageFromEnv();  // 0=功能 1=状态
-
-    // ---- 调色板 ----
-    static const ImVec4 kAccent    = ImVec4(0.24f, 0.85f, 0.72f, 1.f);  // 青绿
-    static const ImVec4 kAccent2   = ImVec4(1.00f, 0.48f, 0.60f, 1.f);  // 暖粉
-    static const ImVec4 kTextDim   = ImVec4(0.62f, 0.65f, 0.72f, 1.f);
-    static const ImVec4 kCardBg    = ImVec4(1.f, 1.f, 1.f, 0.045f);
-    static const ImVec4 kCardLine  = ImVec4(1.f, 1.f, 1.f, 0.10f);
-
-    // ---------- 工具 ----------
-    static ImU32 Col(const ImVec4& c, float alphaMul = 1.f)
-    {
-        return IM_COL32((int)(c.x * 255), (int)(c.y * 255), (int)(c.z * 255),
-                        (int)(c.w * 255 * alphaMul));
-    }
-
-    // ---------- 开关（药丸形，带动画） ----------
-    static bool ToggleSwitch(const char* id, bool* v, float* anim, float width = 54.f, float height = 28.f)
-    {
-        float target = *v ? 1.f : 0.f;
-        float dt = ImGui::GetIO().DeltaTime;
-        *anim += (target - *anim) * (1.f - expf(-dt * 14.f));
-        if (fabsf(target - *anim) < 0.002f)
-            *anim = target;
-
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-
-        bool clicked = ImGui::InvisibleButton(id, ImVec2(width, height));
-        // 防止同一物理点击在多帧中被重复上报（Present 多次触发的场景）
-        {
-            static DWORD s_lastTick = 0;
-            DWORD now = GetTickCount();
-            if (clicked && now - s_lastTick < 200)
-                clicked = false;
-            if (clicked)
-            {
-                s_lastTick = now;
-                *v = !*v; // ★ 翻转状态
-            }
-        }
-
-        ImU32 bg = *v ? Col(kAccent, 0.92f) : IM_COL32(0, 0, 0, 110);
-        if (ImGui::IsItemHovered())
-            bg = *v ? Col(kAccent, 1.f) : IM_COL32(255, 255, 255, 40);
-        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + height), bg, height * 0.5f);
-        // 内圈微光
-        if (*v)
-            dl->AddRectFilled(ImVec2(p.x + 2, p.y + 2), ImVec2(p.x + width - 2, p.y + height - 2),
-                              IM_COL32(255, 255, 255, 18), height * 0.5f - 2);
-
-        float knobD = height - 8.f;
-        float kx = p.x + 4.f + *anim * (width - 8.f - knobD);
-        dl->AddCircleFilled(ImVec2(kx + knobD * 0.5f, p.y + height * 0.5f), knobD * 0.5f,
-                            IM_COL32(250, 250, 252, 255));
-        return clicked;
-    }
-
-    // ---------- 圆角卡片 ----------
-    static void BeginCard(const char* id, float height)
-    {
-        (void)height;   // 卡片高度随内容自适应，滚动交给页面外层
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, kCardBg);
-        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 10));
-        ImGui::BeginChild(id, ImVec2(0.f, 0.f), ImGuiChildFlags_AutoResizeY);
-    }
-    static void EndCard()
-    {
-        ImGui::EndChild();
-        ImGui::PopStyleVar(2);
-        ImGui::PopStyleColor();
-    }
-
-    // ---------- 文件夹选择框（浏览游戏目录 / 皮肤目录） ----------
-    static bool BrowseFolderDlg(const char* title, char* out, int n)
-    {
-        if (!out || n <= 0) return false;
-        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        const bool comOk = SUCCEEDED(hr);
-        bool ok = false;
-        wchar_t wtitle[160] = L"Select folder";
-        if (title && title[0])
-            MultiByteToWideChar(CP_UTF8, 0, title, -1, wtitle, 160);
-        BROWSEINFOW bi = {};
-        bi.lpszTitle = wtitle;
-        // 新版对话框需要 STA；线程已是其它 COM 模式时退回经典对话框
-        bi.ulFlags = BIF_RETURNONLYFSDIRS | (comOk ? (BIF_NEWDIALOGSTYLE | BIF_USENEWUI) : 0);
-        LPITEMIDLIST idl = SHBrowseForFolderW(&bi);
-        if (idl)
-        {
-            wchar_t wpath[MAX_PATH * 2] = {};
-            if (SHGetPathFromIDListW(idl, wpath))
-            {
-                WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out, n, nullptr, nullptr);
-                ok = true;
-            }
-            CoTaskMemFree(idl);
-        }
-        if (comOk) CoUninitialize();
-        return ok;
-    }
-
     // ---------- 配置档案（保存 4K/5K/6K/10K + 键位 + KeyViewer + MOD 加载器） ----------
     static std::string ProfileDir()
     {
@@ -175,30 +265,34 @@ namespace Menu
         if (fopen_s(&f, path.c_str(), "wb") != 0 || !f)
             return false;
         fprintf(f, "# ADOFAI-PERFECT profile (modes / keys / keyviewer / mods)\n");
-        static const char* kKn[10] = { "en", "speed", "offset", "style", "judge", "uphide", "dnhide",
-                                       "autooff", "autoplay", "macro" };
-        for (int mi = 0; mi < 4; mi++)
+        static const char* kKn[15] = { "en", "speed", "offset", "style", "judge", "uphide", "dnhide",
+                                       "autooff", "autoplay", "macro", "pseudo2", "hardresist", "innerroll",
+                                       "catchkill", "catchplate" };
+        for (int mi = 0; mi < Chart4K::kModeN; mi++)
         {
-            for (int w = 0; w < 10; w++)
+            for (int w = 0; w < 15; w++)
                 fprintf(f, "mode%d.%s=%d\n", mi, kKn[w], Chart4K::ModeSettingGet(mi, w));
             int n = Chart4K::ModeLaneCount(mi);
             for (int sl = 0; sl < n; sl++)
                 fprintf(f, "mode%d.key%d=%d\n", mi, sl, Chart4K::ModeKeyGet(mi, sl));
         }
-        for (int w = 0; w < 14; w++)
+        for (int w = 0; w < 15; w++)
             fprintf(f, "kv.s%d=%d\n", w, Chart4K::KVSettingGet(w));
         int kn = Chart4K::KVKeyCount();
         fprintf(f, "kv.n=%d\n", kn);
         for (int i = 0; i < kn; i++)
             fprintf(f, "kv.k%d=%d\n", i, Chart4K::KVKeyGet(i));
-        // 宏打歌 / 自动录制（rec.dir 也写进档案，便于整套搬迁）
-        fprintf(f, "macro.acc=%d\n", Chart4K::MacroAccGet());
-        fprintf(f, "macro.human=%d\n", Chart4K::MacroHumanGet());
-        fprintf(f, "rec.on=%d\n", Chart4K::RecOnGet());
-        fprintf(f, "rec.auto=%d\n", Chart4K::RecAutoGet());
-        fprintf(f, "rec.fps=%d\n", Chart4K::RecFpsGet());
-        fprintf(f, "rec.mbps=%d\n", Chart4K::RecMbpsGet());
+        // 全量全局设置（辅助读谱 / 录制 / 小窗 / 特效 / 宏），rec.dir 一并写入便于整套搬迁
+        for (int gid = 0; gid < Chart4K::GlobalSettingCount(); gid++)
+            fprintf(f, "g.%s=%d\n", Chart4K::GlobalSettingKey(gid), Chart4K::GlobalSettingGet(gid));
+        // 直播模式（防采集）开关一并写进档案，便于整套搬迁
+        fprintf(f, "stream.on=%d\n",    StreamMode::SettingGet(0));
+        fprintf(f, "stream.menu=%d\n",  StreamMode::SettingGet(1));
+        fprintf(f, "stream.track=%d\n", StreamMode::SettingGet(2));
+        fprintf(f, "stream.read=%d\n",  StreamMode::SettingGet(3));
+        fprintf(f, "stream.kv=%d\n",    StreamMode::SettingGet(4));
         fprintf(f, "rec.dir=%s\n", Chart4K::RecDirGet());
+        ModManager::ProfileWrite(f);
         fclose(f);
         return true;
     }
@@ -239,10 +333,11 @@ namespace Menu
             return std::string();
         };
 
-        int enMode[4] = { 0, 0, 0, 0 };
-        static const char* kKn[10] = { "en", "speed", "offset", "style", "judge", "uphide", "dnhide",
-                                       "autooff", "autoplay", "macro" };
-        for (int mi = 0; mi < 4; mi++)
+        int enMode[Chart4K::kModeN] = { 0, 0, 0, 0, 0 };
+        static const char* kKn[15] = { "en", "speed", "offset", "style", "judge", "uphide", "dnhide",
+                                       "autooff", "autoplay", "macro", "pseudo2", "hardresist", "innerroll",
+                                       "catchkill", "catchplate" };
+        for (int mi = 0; mi < Chart4K::kModeN; mi++)
         {
             int n = Chart4K::ModeLaneCount(mi);
             for (int sl = 0; sl < n; sl++)
@@ -252,7 +347,7 @@ namespace Menu
                 int vk = gi(key, 0);
                 if (vk > 0) Chart4K::ModeKeySet(mi, sl, vk);
             }
-            for (int w = 0; w < 10; w++)
+            for (int w = 0; w < 15; w++)
             {
                 char key[32];
                 snprintf(key, sizeof(key), "mode%d.%s", mi, kKn[w]);
@@ -262,7 +357,7 @@ namespace Menu
                 else Chart4K::ModeSettingSet(mi, w, v);
             }
         }
-        for (int w = 0; w < 14; w++)
+        for (int w = 0; w < 15; w++)
         {
             char key[16];
             snprintf(key, sizeof(key), "kv.s%d", w);
@@ -282,20 +377,31 @@ namespace Menu
             }
         }
         // 模式互斥开关最后应用，避免中途互相覆盖
-        for (int mi = 0; mi < 4; mi++)
+        for (int mi = 0; mi < Chart4K::kModeN; mi++)
             if (enMode[mi]) Chart4K::ModeSettingSet(mi, 0, 1);
-        // 宏 / 录制
+        // 全量全局设置（辅助读谱 / 录制 / 小窗 / 特效 / 宏）
         {
-            int v;
-            v = gi("macro.acc", -1);     if (v >= 0) Chart4K::MacroAccSet(v);
-            v = gi("macro.human", -1);   if (v >= 0) Chart4K::MacroHumanSet(v);
-            v = gi("rec.auto", -1);      if (v >= 0) Chart4K::RecAutoSet(v);
-            v = gi("rec.fps", -1);       if (v >= 0) Chart4K::RecFpsSet(v);
-            v = gi("rec.mbps", -1);      if (v >= 0) Chart4K::RecMbpsSet(v);
-            v = gi("rec.on", -1);        if (v >= 0) Chart4K::RecOnSet(v);
+            char key[64];
+            for (int gid = 0; gid < Chart4K::GlobalSettingCount(); gid++)
+            {
+                snprintf(key, sizeof(key), "g.%s", Chart4K::GlobalSettingKey(gid));
+                int v = gi(key, -1000000);
+                if (v != -1000000) Chart4K::GlobalSettingSet(gid, v);
+            }
             std::string dir = gs("rec.dir");
             if (!dir.empty()) Chart4K::RecDirSet(dir.c_str());
+            // 直播模式（防采集）
+            static const char* kStreamKeys[5] = { "stream.on", "stream.menu", "stream.track",
+                                                  "stream.read", "stream.kv" };
+            for (int i = 0; i < 5; i++)
+            {
+                int v = gi(kStreamKeys[i], -1000000);
+                if (v != -1000000) StreamMode::SettingSet(i, v);
+            }
         }
+        // MOD 管理器：mod.dir / mod.state.<Id>
+        for (auto& p : kv) ModManager::ProfileReadKey(p.first, p.second);
+        ModManager::OnProfileApplied();   // 保存 prefs + 重扫 + 把开关同步进 Params.xml
         return true;
     }
 
@@ -319,19 +425,19 @@ namespace Menu
         for (int i = 0; i < Chart4K::SkinCount() && i < 6; i++)
             Log::Printf("[selftest] skin[%d]='%s'", i, Chart4K::SkinName(i));
 
-        int snapSet[4][8] = {};
-        int snapKey[4][10] = {};
-        int laneN[4] = {};
-        for (int mi = 0; mi < 4; mi++)
+        int snapSet[Chart4K::kModeN][13] = {};
+        int snapKey[Chart4K::kModeN][16] = {};
+        int laneN[Chart4K::kModeN] = {};
+        for (int mi = 0; mi < Chart4K::kModeN; mi++)
         {
             laneN[mi] = Chart4K::ModeLaneCount(mi);
-            for (int w = 0; w < 8; w++)  snapSet[mi][w] = Chart4K::ModeSettingGet(mi, w);
-            for (int s = 0; s < laneN[mi] && s < 10; s++) snapKey[mi][s] = Chart4K::ModeKeyGet(mi, s);
+            for (int w = 0; w < 13; w++) snapSet[mi][w] = Chart4K::ModeSettingGet(mi, w);
+            for (int s = 0; s < laneN[mi] && s < 16; s++) snapKey[mi][s] = Chart4K::ModeKeyGet(mi, s);
         }
         int kvN = Chart4K::KVKeyCount();
-        int kvSet[14] = {};
+        int kvSet[15] = {};
         int kvKey[32] = {};
-        for (int w = 0; w < 14; w++) kvSet[w] = Chart4K::KVSettingGet(w);
+        for (int w = 0; w < 15; w++) kvSet[w] = Chart4K::KVSettingGet(w);
         for (int i = 0; i < kvN && i < 32; i++) kvKey[i] = Chart4K::KVKeyGet(i);
 
         std::string file = ProfileDir() + "\\__selftest.cfg";
@@ -339,9 +445,11 @@ namespace Menu
         Log::Printf("[selftest] profile write=%d file='%s'", writeOk ? 1 : 0, file.c_str());
 
         int mutated = 0;
-        for (int mi = 0; mi < 4; mi++)
+        for (int mi = 0; mi < Chart4K::kModeN; mi++)
         {
             Chart4K::ModeSettingSet(mi, 2, snapSet[mi][2] + 9); mutated++;
+            Chart4K::ModeSettingSet(mi, 11, snapSet[mi][11] == 900 ? 800 : 900); mutated++;   // 硬抗 BPM
+            Chart4K::ModeSettingSet(mi, 12, snapSet[mi][12] ? 0 : 1); mutated++;               // 轮指方向
             if (snapSet[mi][1] >= 1 && snapSet[mi][1] <= 12)
             {
                 Chart4K::ModeSettingSet(mi, 1, snapSet[mi][1] == 1 ? 2 : 1); mutated++;
@@ -361,16 +469,16 @@ namespace Menu
         Log::Printf("[selftest] profile mutate=%d read=%d", mutated, readOk ? 1 : 0);
 
         int bad = 0;
-        for (int mi = 0; mi < 4; mi++)
+        for (int mi = 0; mi < Chart4K::kModeN; mi++)
         {
-            for (int w = 0; w < 8; w++)
+            for (int w = 0; w < 13; w++)
                 if (Chart4K::ModeSettingGet(mi, w) != snapSet[mi][w])
                 {
                     bad++;
                     Log::Printf("[selftest] MISMATCH mode%d.set%d = %d want %d",
                                 mi, w, Chart4K::ModeSettingGet(mi, w), snapSet[mi][w]);
                 }
-            for (int s = 0; s < laneN[mi] && s < 10; s++)
+            for (int s = 0; s < laneN[mi] && s < 16; s++)
                 if (Chart4K::ModeKeyGet(mi, s) != snapKey[mi][s])
                 {
                     bad++;
@@ -378,7 +486,7 @@ namespace Menu
                                 mi, s, Chart4K::ModeKeyGet(mi, s), snapKey[mi][s]);
                 }
         }
-        for (int w = 0; w < 14; w++)
+        for (int w = 0; w < 15; w++)
             if (Chart4K::KVSettingGet(w) != kvSet[w])
             {
                 bad++;
@@ -403,195 +511,441 @@ namespace Menu
                     (writeOk && readOk && bad == 0) ? 1 : 0, bad);
     }
 
-    // ---------- 皮肤页 ----------
-    static void DrawSkinPage()
+    // ============================================================
+    //  通用小部件
+    // ============================================================
+    // 内容区页头：副标题 + 右上角「返回」
+    //   （大标题统一画在顶栏，标题与内容读同一份状态，永不脱节）
+    // ============================================================
+    static bool PageHeader(const char* title, const char* sub, bool showBack)
     {
-        Chart4K::BeginCard4K("##skin_head", 92.f);
-        {
-            ImGui::PushFont(nullptr, 19.f);
-            ImGui::TextUnformatted(I18N::Tr(I18N::ST_SKIN_TITLE));
-            ImGui::PopFont();
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(160, 166, 182, 255));
-            ImGui::TextWrapped("%s", I18N::Tr(I18N::ST_SKIN_DESC));
-            ImGui::TextWrapped("%s", I18N::Tr(I18N::ST_SKIN_BUILTIN_DESC));
-            ImGui::PopStyleColor();
-        }
-        Chart4K::EndCard4K();
-        ImGui::Spacing();
+        (void)title;
+        bool back = false;
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float avail = ImGui::GetContentRegionAvail().x;
+        const float h = 26.f;
 
-        float listH = 300.f;
-        Chart4K::BeginCard4K("##skin_list", listH);
-        {
-            const char* active = Chart4K::SkinActive();
-            int n = Chart4K::SkinCount();
-            if (n <= 0)
-                ImGui::TextColored(ImVec4(1.f, 0.72f, 0.35f, 1.f), "%s", I18N::Tr(I18N::ST_SKIN_NONE));
-            {
-                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.f, 5.f));
-                // ---- 内置皮肤（固定版式，推荐）——与外部 MSP 皮肤互斥 ----
-                {
-                    const bool builtinOn = Chart4K::SkinBuiltinMode();
-                    ImGui::PushID(-1);
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, builtinOn ? ImVec4(0.24f, 0.85f, 0.72f, 0.13f)
-                                                                      : ImVec4(1.f, 1.f, 1.f, 0.035f));
-                    ImGui::BeginChild("##rowb", ImVec2(-1, 46.f), ImGuiChildFlags_None,
-                                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-                    ImGui::SetCursorPos(ImVec2(10.f, 7.f));
-                    ImGui::PushFont(nullptr, 15.f);
-                    ImGui::TextUnformatted(I18N::Tr(I18N::ST_SKIN_BUILTIN));
-                    ImGui::PopFont();
-                    ImGui::SetCursorPos(ImVec2(10.f, 25.f));
-                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 148, 164, 255));
-                    {
-                        char sub[128];
-                        snprintf(sub, sizeof(sub), "%s: %s", I18N::Tr(I18N::ST_SKIN_MODE),
-                                 Chart4K::SkinName(0));
-                        ImGui::TextUnformatted(sub);
-                    }
-                    ImGui::PopStyleColor();
-                    ImGui::SameLine();
-                    float bx = ImGui::GetWindowWidth() - 84.f;
-                    if (bx < 120.f) bx = 120.f;
-                    ImGui::SetCursorPosX(bx);
-                    ImGui::SetCursorPosY(10.f);
-                    if (builtinOn)
-                    {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.36f, 0.95f, 0.80f, 1.f));
-                        ImGui::TextUnformatted(I18N::Tr(I18N::ST_SKIN_INUSE));
-                        ImGui::PopStyleColor();
-                    }
-                    else if (ImGui::Button(I18N::Tr(I18N::ST_SKIN_APPLY), ImVec2(74.f, 26.f)))
-                    {
-                        Chart4K::SkinSetBuiltinMode(true);
-                        ProfileMsg = I18N::Tr(I18N::ST_SKIN_APPLIED);
-                    }
-                    ImGui::EndChild();
-                    ImGui::PopStyleColor();
-                    ImGui::PopID();
-                }
-                for (int i = 0; i < n; i++)
-                {
-                    const char* path = Chart4K::SkinPathAt(i);
-                    bool inUse = !Chart4K::SkinBuiltinMode() && active && path &&
-                                 _stricmp(active, path) == 0;
-                    ImGui::PushID(i);
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, inUse ? ImVec4(0.24f, 0.85f, 0.72f, 0.13f)
-                                                                  : ImVec4(1.f, 1.f, 1.f, 0.035f));
-                    ImGui::BeginChild("##row", ImVec2(-1, 46.f), ImGuiChildFlags_None,
-                                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-                    ImGui::SetCursorPos(ImVec2(10.f, 7.f));
-                    ImGui::PushFont(nullptr, 15.f);
-                    {
-                        const char* st = Chart4K::SkinTitle(i);
-                        ImGui::TextUnformatted((st && st[0]) ? st : Chart4K::SkinName(i));
-                    }
-                    ImGui::PopFont();
-                    ImGui::SetCursorPos(ImVec2(10.f, 25.f));
-                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 148, 164, 255));
-                    {
-                        const char* cr = Chart4K::SkinCreator(i);
-                        if (cr && cr[0])
-                        {
-                            char sub[MAX_PATH * 2 + 96];
-                            snprintf(sub, sizeof(sub), "%s  Â·  %s", Chart4K::SkinName(i), cr);
-                            ImGui::TextUnformatted(sub);
-                        }
-                        else
-                            ImGui::TextUnformatted(path);
-                    }
-                    ImGui::PopStyleColor();
-                    ImGui::SameLine();
-                    float bx = ImGui::GetWindowWidth() - 84.f;
-                    if (bx < 120.f) bx = 120.f;
-                    ImGui::SetCursorPosX(bx);
-                    ImGui::SetCursorPosY(10.f);
-                    if (inUse)
-                    {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.36f, 0.95f, 0.80f, 1.f));
-                        ImGui::TextUnformatted(I18N::Tr(I18N::ST_SKIN_INUSE));
-                        ImGui::PopStyleColor();
-                    }
-                    else if (ImGui::Button(I18N::Tr(I18N::ST_SKIN_APPLY), ImVec2(74.f, 26.f)))
-                    {
-                        if (Chart4K::SkinSetActiveFull(path))
-                            ProfileMsg = I18N::Tr(I18N::ST_SKIN_APPLIED);
-                    }
-                    ImGui::EndChild();
-                    ImGui::PopStyleColor();
-                    ImGui::PopID();
-                }
-                ImGui::PopStyleVar();
-            }
-        }
-        Chart4K::EndCard4K();
-        ImGui::Spacing();
+        if (sub && sub[0])
+            ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 2.f, p.y + 6.f), Th().textFaint, sub);
 
-        Chart4K::BeginCard4K("##skin_act", 118.f);
+        if (showBack)
         {
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(160, 166, 182, 255));
-            ImGui::TextUnformatted(I18N::Tr(I18N::ST_SKIN_CURRENT));
-            ImGui::PopStyleColor();
-            ImGui::TextWrapped("%s", Chart4K::SkinActive()[0] ? Chart4K::SkinActive() : "-");
-
-            const float sp = ImGui::GetStyle().ItemSpacing.x;
-            float w = (ImGui::GetContentRegionAvail().x - sp) * 0.5f;
-            if (ImGui::Button(I18N::Tr(I18N::ST_SKIN_IMPORT), ImVec2(-1.f, 28.f)))
-            {
-                char msg[320] = { 0 };
-                if (Chart4K::SkinImportMspDialog(msg, sizeof(msg)))
-                    SkinMsg = std::string(I18N::Tr(I18N::ST_SKIN_IMPORTED)) + msg;
-                else if (msg[0])
-                    SkinMsg = std::string(I18N::Tr(I18N::ST_SKIN_IMPORT_FAIL)) + ": " + msg;
-            }
-            if (ImGui::Button(I18N::Tr(I18N::ST_SKIN_OPEN), ImVec2(w, 28.f)))
-                Chart4K::SkinOpenFolder();
-            ImGui::SameLine();
-            if (ImGui::Button(I18N::Tr(I18N::ST_SKIN_RESCAN), ImVec2(w, 28.f)))
-                Chart4K::SkinRescan();
-            if (!SkinMsg.empty())
-            {
-                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(150, 210, 170, 255));
-                ImGui::TextWrapped("%s", SkinMsg.c_str());
-                ImGui::PopStyleColor();
-            }
+            ImGui::SetCursorScreenPos(ImVec2(p.x + avail - 74.f, p.y));
+            back = SubTab("##hdr_back", TT(NS_BACK), false, ImVec2(74.f, h));
         }
-        Chart4K::EndCard4K();
+        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h + 4.f));
+        return back;
+    }
+    // 一行「标签 + 控件」：标签固定在 colX，控件占满剩余宽度
+    static bool LabeledToggle(const char* id, const char* label, bool* v, float colX,
+                              float rightX = -1.f, bool rightHalf = false)
+    {
+        LabelRow(label, colX);
+        if (rightHalf && rightX < 0.f)
+        {
+            float avail = ImGui::GetContentRegionAvail().x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail * 0.5f);
+        }
+        else if (rightX > 0.f)
+        {
+            ImGui::SetCursorPosX(rightX);
+        }
+        return Toggle(id, v, 46.f, 23.f);
     }
 
-    // ---------- 设置页（游戏目录 / i18n / 配置档案 / 关于） ----------
-    static char s_gameDirBuf[MAX_PATH * 2] = { 0 };
-    static bool s_gameDirInit = false;
-
-    static void DrawShellSettingsPage()
+    // ============================================================
+    //  基础功能
+    // ============================================================
+    static void DrawBasicPage()
     {
-        if (!s_gameDirInit)
+        PageHeader(TT(NS_BASIC), nullptr, false);
+
+        // ---- 不死模式 ----
         {
-            s_gameDirInit = true;
-            snprintf(s_gameDirBuf, sizeof(s_gameDirBuf), "%s", GameDir::Get());
+            bool v = CheatState::NoDeath.load(std::memory_order_relaxed);
+            if (CardActionToggle("##ca_nodeath", I18N::Tr(I18N::FEAT_NODEATH),
+                                 TT(NS_NODEATH_DESC), &v, 66.f))
+            {
+                CheatState::NoDeath.store(v, std::memory_order_relaxed);
+                Log::Printf("[UI] no-death -> %d", (int)v);
+            }
+        }
+        Space(9.f);
+        // ---- 自动连打 ----
+        {
+            bool v = CheatState::AutoCombo.load(std::memory_order_relaxed);
+            if (CardActionToggle("##ca_autocombo", I18N::Tr(I18N::FEAT_AUTOCOMBO),
+                                 TT(NS_AUTOCOMBO_DESC), &v, 66.f))
+            {
+                CheatState::AutoCombo.store(v, std::memory_order_relaxed);
+                Log::Printf("[UI] auto-combo -> %d", (int)v);
+            }
         }
 
-        // ---- 卡片 1：游戏目录 ----
-        Chart4K::BeginCard4K("##cardSet_gamedir", 168.f);
+        Space(14.f);
+        BeginCard("##basic_hint");
+        CardHint(TT(NS_CORE_DESC));
+        EndCard();
+
+        // ---- 卸载 ----
+        Space(14.f);
+        if (Button("##btn_unload", I18N::Tr(I18N::FEAT_UNLOAD), ImVec2(-1.f, 34.f), BTN_DANGER))
+            CheatState::ExitRequested.store(true, std::memory_order_relaxed);
+        Space(4.f);
+        TextFaint("%s", TT(NS_UNLOAD_HINT));
+    }
+
+    // ============================================================
+    //  实时状态
+    // ============================================================
+    static void StatTile(const char* id, const char* label, const char* value, ImU32 col, float w)
+    {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float h = 58.f;
+        ImGui::Dummy(ImVec2(w, h));
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), Th().cardBg, 9.f);
+        dl->AddRect(p, ImVec2(p.x + w, p.y + h), Th().line, 9.f);
+        dl->AddText(ImVec2(p.x + 11.f, p.y + 8.f), Th().textFaint, label);
+        ImFont* f = ImGui::GetFont();
+        dl->AddText(f, 21.f, ImVec2(p.x + 11.f, p.y + 25.f), col, value);
+    }
+
+    static void DrawStatusPage()
+    {
+        CheatState::Status st;
+        GameBridge::GetStatusSnapshot(&st);
+
+        PageHeader(TT(NS_STATUS), TT(NS_LIVE_DESC), false);
+
+        if (!st.bridgeReady || !st.controllerAlive)
         {
-            ImGui::PushFont(nullptr, 19.f);
-            ImGui::TextUnformatted(I18N::Tr(I18N::ST_GAMEDIR));
-            ImGui::PopFont();
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(150, 158, 174, 255));
-            ImGui::TextWrapped("%s", I18N::Tr(I18N::ST_GAMEDIR_DESC));
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 96.f);
-            ImGui::InputText("##gamedir", s_gameDirBuf, sizeof(s_gameDirBuf));
+            BeginCard("##st_wait");
+            TextBig(16.f, Th().warn, TT(NS_NOTREADY));
+            Space(4.f);
+            CardHint(I18N::Tr(I18N::ST_HINT_BG));
+            EndCard();
+            return;
+        }
+
+        // ---- Hero：关卡名 + 状态 ----
+        BeginCard("##st_hero");
+        {
+            const char* nm = st.levelName[0] ? st.levelName : I18N::Tr(I18N::ST_UNKNOWN);
+            TextBig(20.f, Th().text, nm);
+            Space(2.f);
+            bool playing = st.gameworld && !st.paused;
+            const char* stn = playing ? TT(NS_PLAYING) : (st.paused ? TT(NS_PAUSED) : TT(NS_IDLE));
+            ImU32 col = playing ? Th().good : (st.paused ? Th().warn : Th().textDim);
+            Bullet(col);
             ImGui::SameLine();
-            if (ImGui::Button(I18N::Tr(I18N::ST_BROWSE), ImVec2(88.f, 0.f)))
+            TextCol(col, "%s", stn);
+            if (st.stateName[0])
+            {
+                ImGui::SameLine();
+                TextFaint("  -  %s", st.stateName);
+            }
+        }
+        EndCard();
+        Space(9.f);
+
+        // ---- 进度 ----
+        BeginCard("##st_prog");
+        {
+            char pct[32];
+            snprintf(pct, sizeof(pct), "%.1f%%", st.percentComplete * 100.f);
+            TextDim("%s: %d    %s", I18N::Tr(I18N::ST_PROGRESS), st.floorIndex, pct);
+            ProgressBar(ImVec2(-1.f, 10.f), st.percentComplete, Th().accent);
+        }
+        EndCard();
+        Space(9.f);
+
+        // ---- 数值磁贴：Combo / Acc / BPM / Notes ----
+        {
+            float gap = 8.f;
+            float w = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+            char b[64];
+
+            snprintf(b, sizeof(b), "%d", st.combo);
+            StatTile("##t1", TT(NS_COMBO), b, Th().accent, w);
+            ImGui::SameLine(0.f, gap);
+            snprintf(b, sizeof(b), "%.2f%%", st.percentAcc * 100.f);
+            StatTile("##t2", TT(NS_ACC), b, Th().good, w);
+            Space(8.f);
+
+            float bpm = (float)Chart4K::ApiBpm();
+            if (bpm > 1.f) snprintf(b, sizeof(b), "%.1f", bpm); else snprintf(b, sizeof(b), "--");
+            StatTile("##t3", TT(NS_BPM), b, Th().text, w);
+            ImGui::SameLine(0.f, gap);
+            snprintf(b, sizeof(b), "%d", st.hitTotal);
+            StatTile("##t4", TT(NS_NOTES), b, Th().text, w);
+        }
+        Space(9.f);
+
+        // ---- 判定统计 ----
+        BeginCard("##st_judge");
+        {
+            Section(TT(NS_ACC));
+            struct Row { const char* nm; int v; ImU32 c; };
+            // HitMargin: 3=Perfect 4=LatePerfect → 计为「优秀」
+            const int marv = st.hitCounts[3] + st.hitCounts[4];
+            const int perf = st.hitCounts[2] + st.hitCounts[5];
+            const int good = st.hitCounts[1] + st.hitCounts[6];
+            const int miss = st.hitCounts[0] + st.hitCounts[8] + st.hitCounts[9];
+            Row rows[4] = {
+                { TT(NS_MARV), marv, Th().accent },
+                { TT(NS_PERF), perf, Th().good },
+                { TT(NS_GOOD), good, Th().warn },
+                { TT(NS_MISS), miss, Th().bad },
+            };
+            int tot = marv + perf + good + miss;
+            if (tot < 1) tot = 1;
+            for (int i = 0; i < 4; i++)
+            {
+                float avail = ImGui::GetContentRegionAvail().x;
+                TextDim("%s", rows[i].nm);
+                char vb[48];
+                snprintf(vb, sizeof(vb), "%d", rows[i].v);
+                float vw = ImGui::CalcTextSize(vb).x;
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - vw - 60.f);
+                TextCol(rows[i].c, "%s", vb);
+                ImGui::SameLine();
+                ProgressBar(ImVec2(56.f, 8.f), (float)rows[i].v / (float)tot, rows[i].c);
+                ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 9.f);
+            }
+            Space(4.f);
+            TextFaint("XAcc %.2f%%   -   %s %d   -   %s %d",
+                      st.percentXAcc * 100.f, TT(NS_MAXCOMBO), st.maxCombo, TT(NS_DEATHS), st.deaths);
+            TextFaint("%s %d   -   %s %d", TT(NS_CP), st.checkpoints, TT(NS_LV),
+                      st.difficulty + 0);
+        }
+        EndCard();
+        Space(9.f);
+
+        BeginCard("##st_foot");
+        CardHint(I18N::Tr(I18N::ST_FOOTER));
+        EndCard();
+    }
+
+    // ============================================================
+    //  一般轨道（入口页 = 6 个 CardAction）
+    // ============================================================
+    struct TrackItem { int sub; const char* title; const char* keys; };
+
+    static void DrawTrackHub()
+    {
+        PageHeader(TT(NS_TRACK), TT(NS_HUB_TRACK), false);
+        BeginCard("##hub_track_hint");
+        CardHint(TT(NS_TRACK_DESC));
+        EndCard();
+        Space(9.f);
+
+        static const TrackItem kItems[TR_N] = {
+            { TR_4K,    "4K",       "D  F  J  K" },
+            { TR_5K,    "5K",       "S  D  F  J  K" },
+            { TR_6K,    "6K",       "S  D  F  J  K  L" },
+            { TR_10K,   "10K",      "A S D F G  /  H J K L ;" },
+            { TR_16K,   "16K PAD",  "4 x 4 grid pad" },
+            { TR_CATCH, "CATCH",    "rain - no lanes" },
+            { TR_8K,    "8K",       "A S D F  /  J K L ;" },
+            { TR_OSU,   "OSU",      "osu! standard - click the circles" },
+        };
+        for (int i = 0; i < TR_N; i++)
+        {
+            char id[32];
+            snprintf(id, sizeof(id), "##hub_tr%d", i);
+            if (CardAction(id, kItems[i].title, kItems[i].keys, 54.f, false, true))
+                GoPage(PG_TRACK, kItems[i].sub);
+            Space(7.f);
+        }
+    }
+
+    static void DrawTrackSub()
+    {
+        switch (s_subTR)
+        {
+        case TR_4K:    Chart4K::DrawSettingsPage();      break;
+        case TR_5K:    Chart4K::DrawSettings5KPage();    break;
+        case TR_6K:    Chart4K::DrawSettings6KPage();    break;
+        case TR_10K:   Chart4K::DrawSettings10KPage();   break;
+        case TR_16K:   Chart4K::DrawModePage(4);         break;
+        case TR_CATCH: Chart4K::DrawCatchSettingsPage(); break;
+        case TR_8K:    Chart4K::DrawSettings8KPage();    break;
+        case TR_OSU:   Chart4K::DrawOsuSettingsPage();   break;
+        default: break;
+        }
+    }
+
+    // ============================================================
+    //  直播模式（防采集覆盖层）—— 独立 Card，放在「其他」页
+    //   勾选的元素：本机屏幕照常显示，直播推送软件（OBS / 直播姬 / 录像机）看不到。
+    // ============================================================
+    static void DrawLiveCard()
+    {
+        bool on = StreamMode::Enabled();
+        BeginCard("##live_card");
+        if (CardTitle(I18N::Tr(I18N::LIVE_TITLE), &on))
+            StreamMode::SetEnabled(on);
+        Space(2.f);
+        CardHint(I18N::Tr(I18N::LIVE_DESC));
+        Space(6.f);
+
+        {
+            const struct { const char* id; int sid; int e; } kRows[4] = {
+                { "##live_e0", I18N::LIVE_HIDE_MENU,  StreamMode::EL_MENU  },
+                { "##live_e1", I18N::LIVE_HIDE_TRACK, StreamMode::EL_TRACK },
+                { "##live_e2", I18N::LIVE_HIDE_READ,  StreamMode::EL_READ  },
+                { "##live_e3", I18N::LIVE_HIDE_KV,    StreamMode::EL_KV    },
+            };
+            for (int i = 0; i < 4; i++)
+            {
+                const StreamMode::Elem e = (StreamMode::Elem)kRows[i].e;
+                bool hv = StreamMode::Hide(e);
+                if (CheckRow(kRows[i].id, I18N::Tr(kRows[i].sid), &hv))
+                    StreamMode::SetHide(e, hv);
+            }
+        }
+        Space(5.f);
+        {
+            const bool ok = StreamMode::OverlayReady();
+            char sb[160];
+            snprintf(sb, sizeof(sb), "%s: %s", I18N::Tr(I18N::LIVE_STATUS), StreamMode::StatusText());
+            TextWrapCol(StreamMode::Enabled() && !ok ? Th().warn : Th().textFaint, "%s", sb);
+        }
+        if (StreamMode::Enabled() && !StreamMode::OverlayReady())
+            CardHint(I18N::Tr(I18N::LIVE_UNAVAIL));
+        else
+            CardHint(I18N::Tr(I18N::LIVE_HINT));
+        EndCard();
+    }
+
+    // 直播模式独立页：一张自带总开关 + 隐藏项 + 覆盖层状态的 Card
+    static void DrawLivePage()
+    {
+        PageHeader(TT(NS_MISC), I18N::Tr(I18N::TAB_LIVE), false);
+        BeginCard("##live_hint");
+        CardHint(I18N::Tr(I18N::LIVE_DESC));
+        EndCard();
+        Space(9.f);
+        DrawLiveCard();
+    }
+
+    // ============================================================
+    //  其他（入口页 = 5 个 CardAction：宏模式 / 录制 / 皮肤 / 按键反馈 / 直播模式）
+    // ============================================================
+    static void DrawMiscHub()
+    {
+        PageHeader(TT(NS_MISC), TT(NS_HUB_MISC), false);
+        BeginCard("##hub_misc_hint");
+        CardHint(TT(NS_MISC_DESC));
+        EndCard();
+        Space(9.f);
+
+        if (CardAction("##hub_mi0", I18N::Tr(I18N::TAB_MACRO), "auto-play macro", 54.f))
+            GoPage(PG_MISC, -1, MI_MACRO);
+        Space(7.f);
+        if (CardAction("##hub_mi1", I18N::Tr(I18N::TAB_RECORD), "screen recorder", 54.f))
+            GoPage(PG_MISC, -1, MI_RECORD);
+        Space(7.f);
+        if (CardAction("##hub_mi2", I18N::Tr(I18N::TAB_SKIN), "skin / .msp", 54.f))
+            GoPage(PG_MISC, -1, MI_SKIN);
+        Space(7.f);
+        if (CardAction("##hub_mi3", TT(NS_KV_TITLE), "KeyViewer overlay", 54.f))
+            GoPage(PG_MISC, -1, MI_KV);
+        Space(7.f);
+        if (CardAction("##hub_mi4", I18N::Tr(I18N::TAB_LIVE), "capture-proof overlay", 54.f))
+            GoPage(PG_MISC, -1, MI_LIVE);
+    }
+
+    static void DrawMiscSub()
+    {
+        switch (s_subMI)
+        {
+        case MI_MACRO:  Chart4K::DrawMacroPage();             break;
+        case MI_RECORD: Chart4K::DrawRecordPage();            break;
+        case MI_SKIN:   DrawSkinPage();                       break;
+        case MI_KV:     Chart4K::DrawKeyViewerSettingsPage(); break;
+        case MI_LIVE:   DrawLivePage();                       break;
+        default: break;
+        }
+    }
+
+    // ============================================================
+    //  设置（全局配置）
+    // ============================================================
+    static char s_gameDirBuf[MAX_PATH * 2] = { 0 };
+    static bool s_gameDirInit = false;
+    static void s_gameDirInitOnce()
+    {
+        if (s_gameDirInit) return;
+        s_gameDirInit = true;
+        snprintf(s_gameDirBuf, sizeof(s_gameDirBuf), "%s", GameDir::Get());
+    }
+
+    static void DrawSettingsPage()
+    {
+        s_gameDirInitOnce();
+        PageHeader(TT(NS_SET), nullptr, false);
+
+        // ---- 界面风格 ----
+        BeginCard("##set_style");
+        CardTitle(TT(NS_UI_STYLE), nullptr);
+        {
+            const char* names[16];
+            int n = PaletteCount();
+            if (n > 16) n = 16;
+            for (int i = 0; i < n; i++) names[i] = PaletteName(i);
+            int cur = Palette();
+            if (Combo("##set_palette", &cur, names, n))
+            {
+                SetPalette(cur, true);
+                Log::Printf("[UI] palette -> %d", cur);
+            }
+            Space(2.f);
+            CardHint(TT(NS_UI_STYLE_DESC));
+        }
+        EndCard();
+        Space(9.f);
+
+        // ---- 语言 ----
+        BeginCard("##set_lang");
+        CardTitle(I18N::Tr(I18N::ST_LANG), nullptr);
+        {
+            const char* names[8];
+            for (int i = 0; i < I18N::LANG_N; i++) names[i] = I18N::LangName((I18N::Lang)i);
+            int cur = (int)I18N::GetLang();
+            if (Combo("##set_langc", &cur, names, I18N::LANG_N))
+            {
+                I18N::SetLang((I18N::Lang)cur);
+                Log::Printf("[UI] language -> %d", cur);
+            }
+            Space(2.f);
+            CardHint(I18N::Tr(I18N::ST_LANGHINT));
+        }
+        EndCard();
+        Space(9.f);
+
+        // ---- 游戏目录 ----
+        BeginCard("##set_gamedir");
+        CardTitle(I18N::Tr(I18N::ST_GAMEDIR), nullptr);
+        {
+            CardHint(I18N::Tr(I18N::ST_GAMEDIR_DESC));
+            Space(4.f);
+            InputText("##gamedir", s_gameDirBuf, sizeof(s_gameDirBuf));
             {
                 char pick[MAX_PATH * 2] = { 0 };
-                if (BrowseFolderDlg(I18N::Tr(I18N::ST_GAMEDIR), pick, sizeof(pick)))
+                if (ShellAsync::TakeFolder(pick, sizeof(pick)))
                     snprintf(s_gameDirBuf, sizeof(s_gameDirBuf), "%s", pick);
             }
+            Space(5.f);
             const float sp = ImGui::GetStyle().ItemSpacing.x;
             float w = (ImGui::GetContentRegionAvail().x - sp * 2.f) / 3.f;
-            if (ImGui::Button(I18N::Tr(I18N::ST_APPLY), ImVec2(w, 26.f)))
+            if (Button("##gamedir_browse", I18N::Tr(I18N::ST_BROWSE), ImVec2(w, 27.f)))
+                ShellAsync::PickFolder(I18N::Tr(I18N::ST_GAMEDIR));
+            ImGui::SameLine();
+            if (Button("##gamedir_apply", I18N::Tr(I18N::ST_APPLY), ImVec2(w, 27.f), BTN_PRIMARY))
             {
                 if (GameDir::Valid(s_gameDirBuf))
                 {
@@ -604,161 +958,272 @@ namespace Menu
                 }
             }
             ImGui::SameLine();
-            if (ImGui::Button(I18N::Tr(I18N::ST_OPEN), ImVec2(w, 26.f)))
+            if (Button("##gamedir_open", I18N::Tr(I18N::ST_OPEN), ImVec2(w, 27.f)))
                 GameDir::OpenFolder();
         }
-        Chart4K::EndCard4K();
-        ImGui::Spacing();
+        EndCard();
+        Space(9.f);
 
-        // ---- 卡片 2：语言 ----
-        Chart4K::BeginCard4K("##cardSet_lang", 92.f);
+        // ---- 配置档案 ----
+        BeginCard("##set_profile");
+        CardTitle(TT(NS_PROFILE), nullptr);
         {
-            ImGui::PushFont(nullptr, 19.f);
-            ImGui::TextUnformatted(I18N::Tr(I18N::ST_LANG));
-            ImGui::PopFont();
-            int lang = (int)I18N::GetLang();
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(150.f);
-            ImGui::SetNextItemWidth(-14.f);
-            if (ImGui::BeginCombo("##set_lang", I18N::LangName((I18N::Lang)lang)))
-            {
-                for (int i = 0; i < I18N::LANG_N; i++)
-                {
-                    bool sel = (i == lang);
-                    if (ImGui::Selectable(I18N::LangName((I18N::Lang)i), sel) && !sel)
-                    {
-                        I18N::SetLang((I18N::Lang)i);
-                        Log::Printf("[UI] language -> %d", i);
-                    }
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(150, 158, 174, 255));
-            ImGui::TextWrapped("%s", I18N::Tr(I18N::ST_LANGHINT));
-            ImGui::PopStyleColor();
-        }
-        Chart4K::EndCard4K();
-        ImGui::Spacing();
-
-        // ---- 卡片 3：配置档案 ----
-        Chart4K::BeginCard4K("##cardSet_profile", 322.f);
-        {
-            ImGui::PushFont(nullptr, 19.f);
-            ImGui::TextUnformatted(I18N::Tr(I18N::ST_CFG_TITLE));
-            ImGui::PopFont();
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(150, 158, 174, 255));
-            ImGui::TextWrapped("%s", I18N::Tr(I18N::ST_CFG_DESC));
-            ImGui::PopStyleColor();
-
+            CardHint(TT(NS_PROFILE_DESC));
+            Space(4.f);
             static char s_profileName[64] = "default";
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 8.f);
-            ImGui::InputTextWithHint("##confname", I18N::Tr(I18N::ST_CFG_NAME), s_profileName, sizeof(s_profileName));
-
+            InputText("##confname", s_profileName, sizeof(s_profileName), TT(NS_NAME_HINT));
+            Space(5.f);
+            std::string dir  = ProfileDir();
+            std::string path = dir + "\\" + (s_profileName[0] ? s_profileName : "default") + ".cfg";
             const float sp = ImGui::GetStyle().ItemSpacing.x;
             float bw = (ImGui::GetContentRegionAvail().x - sp) * 0.5f;
-            std::string dir = ProfileDir();
-            std::string path = dir + "\\" + (s_profileName[0] ? s_profileName : "default") + ".cfg";
-            if (ImGui::Button(I18N::Tr(I18N::ST_CFG_SAVE), ImVec2(bw, 27.f)))
+            if (Button("##cfg_save", TT(NS_SAVE), ImVec2(bw, 27.f), BTN_PRIMARY))
                 ProfileMsg = ProfileWrite(path) ? I18N::Tr(I18N::ST_CFG_SAVED) : I18N::Tr(I18N::ST_CFG_FAIL);
             ImGui::SameLine();
-            if (ImGui::Button(I18N::Tr(I18N::ST_CFG_LOAD), ImVec2(bw, 27.f)))
+            if (Button("##cfg_load", TT(NS_LOAD), ImVec2(bw, 27.f)))
                 ProfileMsg = ProfileRead(path) ? I18N::Tr(I18N::ST_CFG_LOADED) : I18N::Tr(I18N::ST_CFG_FAIL);
-            if (ImGui::Button(I18N::Tr(I18N::ST_CFG_DEL), ImVec2(bw, 27.f)))
+            Space(5.f);
+            if (Button("##cfg_del", TT(NS_DELETE), ImVec2(bw, 27.f)))
             {
                 DeleteFileA(path.c_str());
                 ProfileMsg = I18N::Tr(I18N::ST_CFG_FAIL);
             }
             ImGui::SameLine();
-            if (ImGui::Button(I18N::Tr(I18N::ST_CFG_OPEN), ImVec2(bw, 27.f)))
-                ShellExecuteA(nullptr, "open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            if (Button("##cfg_open", TT(NS_OPEN_DIR), ImVec2(bw, 27.f)))
+                ShellAsync::Open(dir.c_str());
 
-            // 已有档案列表（点击即选中文件名）
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.16f));
-            ImGui::BeginChild("##proflist", ImVec2(0.f, 0.f), ImGuiChildFlags_AutoResizeY);
+            // 已有档案（点击即选中）
+            Space(7.f);
+            std::string pat = dir + "\\*.cfg";
+            WIN32_FIND_DATAA fd{};
+            HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+            int cnt = 0;
+            if (h != INVALID_HANDLE_VALUE)
             {
-                std::string pat = dir + "\\*.cfg";
-                WIN32_FIND_DATAA fd{};
-                HANDLE h = FindFirstFileA(pat.c_str(), &fd);
-                int cnt = 0;
-                if (h != INVALID_HANDLE_VALUE)
+                do
                 {
-                    do
-                    {
-                        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                        std::string nm = fd.cFileName;
-                        size_t dot = nm.find_last_of('.');
-                        if (dot != std::string::npos) nm = nm.substr(0, dot);
-                        bool sel = (nm == s_profileName);
-                        if (ImGui::Selectable(nm.c_str(), sel))
-                            snprintf(s_profileName, sizeof(s_profileName), "%s", nm.c_str());
-                        cnt++;
-                    } while (FindNextFileA(h, &fd));
-                    FindClose(h);
-                }
-                if (cnt == 0)
-                {
-                    ImGui::Dummy(ImVec2(0.f, 56.f));
-                    ImGui::TextDisabled("%s", I18N::Tr(I18N::ST_CFG_SELECT));
-                }
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    std::string nm = fd.cFileName;
+                    size_t dot = nm.find_last_of('.');
+                    if (dot != std::string::npos) nm = nm.substr(0, dot);
+                    char idb[300];
+                    snprintf(idb, sizeof(idb), "##pf_%s", nm.c_str());
+                    bool sel = (nm == s_profileName);
+                    if (Button(idb, nm.c_str(), ImVec2(-1.f, 24.f), sel ? BTN_PRIMARY : BTN_GHOST))
+                        snprintf(s_profileName, sizeof(s_profileName), "%s", nm.c_str());
+                    Space(4.f);
+                    cnt++;
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
             }
-            ImGui::EndChild();
-            ImGui::PopStyleColor();
+            if (cnt == 0)
+                TextFaint("%s", I18N::Tr(I18N::ST_CFG_SELECT));
 
             if (!ProfileMsg.empty())
             {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.36f, 0.95f, 0.80f, 1.f));
-                ImGui::TextUnformatted(ProfileMsg.c_str());
-                ImGui::PopStyleColor();
+                Space(4.f);
+                TextCol(Th().good, "%s", ProfileMsg.c_str());
             }
         }
-        Chart4K::EndCard4K();
-        ImGui::Spacing();
+        EndCard();
+        Space(9.f);
 
-        // ---- 卡片 4：API（关于 / 版本信息已移到独立的「关于」页）----
-        Chart4K::BeginCard4K("##cardSet_api", 120.f);
+        // ---- 键位说明 ----
+        BeginCard("##set_keys");
+        CardTitle(TT(NS_KEYBIND), nullptr);
+        CardHint(TT(NS_KEYBIND_DESC));
+        EndCard();
+
+    }
+// ============================================================
+    //  皮肤列表行（自绘；点击 = 应用）
+    // ============================================================
+    template <typename F>
+    static void RowSkin(const char* label, const char* sub, bool inUse, const char* id, F onClick)
+    {
+        const float h = 48.f;
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float w = ImGui::GetContentRegionAvail().x;
+        if (w < 80.f) w = 80.f;
+
+        ImGui::PushID(id);
+        bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, h));
+        bool hov     = ImGui::IsItemHovered();
+        ImGui::PopID();
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        if (inUse)     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), A(Th().accent, 0.15f), 8.f);
+        else if (hov)  dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(255, 255, 255, 14), 8.f);
+        if (inUse)
+            dl->AddRectFilled(ImVec2(p.x + 1.f, p.y + 8.f), ImVec2(p.x + 4.f, p.y + h - 8.f),
+                              Th().accent, 1.5f);
+
+        dl->PushClipRect(ImVec2(p.x + 12.f, p.y), ImVec2(p.x + w - 80.f, p.y + h), true);
+        dl->AddText(ImVec2(p.x + 12.f, p.y + 8.f), inUse ? Th().accent : Th().text,
+                    label ? label : "");
+        if (sub && sub[0])
+            dl->AddText(ImVec2(p.x + 12.f, p.y + 26.f), Th().textFaint, sub);
+        dl->PopClipRect();
+
         {
-            ImGui::TextDisabled("I18N::Register(zhCN, zhTW, en, ja, ru) -> id");
-            ImGui::TextDisabled("I18N::Tr(id)  |  I18N::SetLang(lang)");
-            ImGui::TextDisabled("Prefs::SetStr(\"skin_dir\" | \"game_dir\", value)");
-            ImGui::TextDisabled("Builtin strings: %d", (int)I18N::BUILTIN_N);
+            const char* tag = inUse ? I18N::Tr(I18N::ST_SKIN_INUSE) : I18N::Tr(I18N::ST_SKIN_APPLY);
+            ImVec2 ts = ImGui::CalcTextSize(tag);
+            ImU32  tc = inUse ? Th().accent : (hov ? Th().text : Th().textDim);
+            dl->AddText(ImVec2(p.x + w - ts.x - 16.f, p.y + (h - ts.y) * 0.5f), tc, tag);
         }
-        Chart4K::EndCard4K();
+        if (clicked && !inUse) onClick();
     }
 
-    // ---------- 关于页（LOGO / 名称 / 版本 / 演示视频） ----------
-    static void AboutOpenVideo()
+    // ============================================================
+
+
+    // ============================================================
+    //  皮肤页（按模式独立）
+    // ============================================================
+    static void DrawSkinPage()
     {
-        ShellExecuteA(nullptr, "open", kAppVideoUrl, nullptr, nullptr, SW_SHOWNORMAL);
+        static int s_skinSelMode = 0;
+
+        PageHeader(I18N::Tr(I18N::ST_SKIN_TITLE), nullptr, false);
+
+        // ---- 模式选择 ----
+        BeginCard("##skin_modesel");
+        {
+            CardHint(I18N::Tr(I18N::ST_SKIN_CURRENT));
+            Space(4.f);
+            const float sp = ImGui::GetStyle().ItemSpacing.x;
+            float bw = (ImGui::GetContentRegionAvail().x - sp * (Chart4K::kModeN - 1)) / (float)Chart4K::kModeN;
+            if (bw < 40.f) bw = 40.f;
+            for (int mi = 0; mi < Chart4K::kModeN; mi++)
+            {
+                if (mi) ImGui::SameLine();
+                char id[32];
+                snprintf(id, sizeof(id), "##skm%d", mi);
+                if (Button(id, Chart4K::ApiModeName(mi), ImVec2(bw, 26.f),
+                           s_skinSelMode == mi ? BTN_PRIMARY : BTN_NORMAL))
+                    s_skinSelMode = mi;
+            }
+            Space(4.f);
+            if (s_skinSelMode == Chart4K::kModeCatch)
+                TextWrapCol(Th().textDim, "%s", I18N::Tr(I18N::LBL_CATCH_HINT));
+            else if (s_skinSelMode == Chart4K::kModePad)
+                TextWrapCol(Th().warn, "%s", I18N::Tr(I18N::LBL_16K_BUILTIN_ONLY));
+            else
+                CardHint(I18N::Tr(I18N::ST_SKIN_DESC));
+        }
+        EndCard();
+        Space(9.f);
+
+        // ---- 列表 ----
+        const int selMode = s_skinSelMode;
+        const int n = Chart4K::SkinCount();
+        const char* active = Chart4K::SkinActiveForMode(selMode);
+
+        BeginCard("##skin_list");
+        {
+            CardTitle(I18N::Tr(I18N::ST_SKIN_MODE), nullptr);
+            if (selMode == Chart4K::kModeCatch)
+            {
+                TextCol(Th().good, "Malody Dylamo  (built-in)");
+            }
+            else if (selMode == Chart4K::kModePad)
+            {
+                const bool on = Chart4K::SkinBuiltinModeForMode(selMode);
+                RowSkin(I18N::Tr(I18N::ST_SKIN_BUILTIN), Chart4K::SkinName(0), on, "##skrow_pad",
+                        [&] { Chart4K::SkinSetBuiltinModeForMode(selMode, true);
+                              ProfileMsg = I18N::Tr(I18N::ST_SKIN_APPLIED); });
+            }
+            else
+            {
+                // 内置皮肤（固定版式）
+                {
+                    const bool on = Chart4K::SkinBuiltinModeForMode(selMode);
+                    RowSkin(I18N::Tr(I18N::ST_SKIN_BUILTIN), Chart4K::SkinName(0), on, "##skrow_bi",
+                            [&] { Chart4K::SkinSetBuiltinModeForMode(selMode, true);
+                                  ProfileMsg = I18N::Tr(I18N::ST_SKIN_APPLIED); });
+                }
+                if (n <= 0)
+                    TextCol(Th().warn, "%s", I18N::Tr(I18N::ST_SKIN_NONE));
+                for (int i = 0; i < n; i++)
+                {
+                    const char* path = Chart4K::SkinPathAt(i);
+                    const char* title = Chart4K::SkinTitle(i);
+                    const char* cr = Chart4K::SkinCreator(i);
+                    bool inUse = !Chart4K::SkinBuiltinModeForMode(selMode) && active && path &&
+                                 _stricmp(active, path) == 0;
+                    char sub[512];
+                    if (cr && cr[0]) snprintf(sub, sizeof(sub), "%s  -  %s", Chart4K::SkinName(i), cr);
+                    else             snprintf(sub, sizeof(sub), "%s", path ? path : "");
+                    char id[32];
+                    snprintf(id, sizeof(id), "##skrow%d", i);
+                    RowSkin((title && title[0]) ? title : Chart4K::SkinName(i), sub, inUse, id, [&] {
+                        if (Chart4K::SkinSetActiveFullForMode(selMode, path))
+                            ProfileMsg = I18N::Tr(I18N::ST_SKIN_APPLIED);
+                    });
+                }
+            }
+        }
+        EndCard();
+        Space(9.f);
+
+        // ---- 当前 / 操作 ----
+        BeginCard("##skin_act");
+        {
+            CardTitle(I18N::Tr(I18N::ST_SKIN_CURRENT), nullptr);
+            const char* act = Chart4K::SkinActiveForMode(selMode);
+            TextWrap("%s", (act && act[0]) ? act : "-");
+            Space(5.f);
+            if (Button("##skin_import", I18N::Tr(I18N::ST_SKIN_IMPORT), ImVec2(-1.f, 28.f)))
+                ShellAsync::PickFile(L"Malody Skin (*.msp)\0*.msp\0All files\0*.*\0",
+                                     L"Import Malody skin (.msp)");
+            {
+                char msp[MAX_PATH * 2] = { 0 };
+                if (ShellAsync::TakeFile(msp, sizeof(msp)))
+                {
+                    char msg[320] = { 0 };
+                    wchar_t wmsp[MAX_PATH * 2] = { 0 };
+                    MultiByteToWideChar(CP_UTF8, 0, msp, -1, wmsp, MAX_PATH * 2);
+                    if (Chart4K::SkinImportMsp(wmsp, msg, sizeof(msg)))
+                        SkinMsg = std::string(I18N::Tr(I18N::ST_SKIN_IMPORTED)) + msg;
+                    else
+                        SkinMsg = std::string(I18N::Tr(I18N::ST_SKIN_IMPORT_FAIL)) + ": " +
+                                  (msg[0] ? msg : "failed");
+                }
+            }
+            Space(5.f);
+            const float sp = ImGui::GetStyle().ItemSpacing.x;
+            float w = (ImGui::GetContentRegionAvail().x - sp) * 0.5f;
+            if (Button("##skin_open", I18N::Tr(I18N::ST_SKIN_OPEN), ImVec2(w, 27.f)))
+                Chart4K::SkinOpenFolder();
+            ImGui::SameLine();
+            if (Button("##skin_rescan", I18N::Tr(I18N::ST_SKIN_RESCAN), ImVec2(w, 27.f)))
+                Chart4K::SkinRescan();
+            if (!SkinMsg.empty())
+            {
+                Space(4.f);
+                TextWrapCol(Th().good, "%s", SkinMsg.c_str());
+            }
+        }
+        EndCard();
     }
 
-    // 进入关于页时自动跳转演示视频；3 秒冷却，来回切页不会刷屏
-    static void AboutAutoOpenVideo()
-    {
-        static double s_last = -1e9;
-        const double now = ImGui::GetTime();
-        if (now - s_last < 3.0)
-            return;
-        s_last = now;
-        Log::Printf("[UI] about: auto open %s", kAppVideoUrl);
-        AboutOpenVideo();
-    }
-
+    // ============================================================
+    //  关于
+    // ============================================================
     static void DrawAboutPage()
     {
-        // 内嵌 LOGO：贴图失败（设备/解码未就绪）时每 30 帧重试一次
         static void* s_logo = nullptr;
         static int   s_logoFrame = 0;
         if (!s_logo && (s_logoFrame++ % 30) == 0)
             s_logo = RenderHook_LoadEmbeddedPng(kLogoResId, "adofaiperfect-logo");
 
-        // ---- 卡片 1：LOGO + 名称 + 版本 ----
-        Chart4K::BeginCard4K("##cardAboutHead", 0.f);
+        PageHeader(TT(NS_ABOUT), nullptr, false);
+
+        BeginCard("##about_head");
         {
             const float avail = ImGui::GetContentRegionAvail().x;
             const float logo = 104.f;
             const float x0 = ImGui::GetCursorPosX();
-
             ImGui::SetCursorPosX(x0 + (avail - logo) * 0.5f);
             if (s_logo)
             {
@@ -766,537 +1231,438 @@ namespace Menu
             }
             else
             {
-                // 占位：圆角方块 + 圆环（渲染依赖未就绪时）
                 ImVec2 p0 = ImGui::GetCursorScreenPos();
                 ImGui::Dummy(ImVec2(logo, logo));
                 ImDrawList* dl = ImGui::GetWindowDrawList();
-                dl->AddRect(p0, ImVec2(p0.x + logo, p0.y + logo),
-                            IM_COL32(255, 255, 255, 70), 16.f, 0, 3.f);
-                dl->AddCircle(ImVec2(p0.x + logo * 0.5f, p0.y + logo * 0.5f),
-                              logo * 0.30f, IM_COL32(255, 255, 255, 80), 48, 3.f);
+                dl->AddRect(p0, ImVec2(p0.x + logo, p0.y + logo), Th().line, 18.f, 0, 2.f);
+                dl->AddCircle(ImVec2(p0.x + logo * 0.5f, p0.y + logo * 0.5f), logo * 0.30f,
+                              A(Th().accent, 0.75f), 48, 3.f);
             }
-
-            // 名称（居中大字）
+            Space(6.f);
             {
                 const char* name = "ADOFAI-PERFECT";
-                ImGui::PushFont(nullptr, 26.f);
-                const float tw = ImGui::CalcTextSize(name).x;
+                float tw = ImGui::CalcTextSize(name).x;
                 ImGui::SetCursorPosX(x0 + (avail - tw) * 0.5f);
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.95f, 0.98f, 1.f));
-                ImGui::TextUnformatted(name);
-                ImGui::PopStyleColor();
-                ImGui::PopFont();
+                TextBig(26.f, Th().text, name);
             }
-
-            // 版本（居中，强调色）
+            Space(2.f);
             {
-                char ver[64];
-                snprintf(ver, sizeof(ver), "%s %s", I18N::Tr(I18N::ABOUT_VER), kAppVersion);
-                const float tw = ImGui::CalcTextSize(ver).x;
+                char ver[96];
+                snprintf(ver, sizeof(ver), "%s %s", TT(NS_VERSION), kAppVersion);
+                float tw = ImGui::CalcTextSize(ver).x;
                 ImGui::SetCursorPosX(x0 + (avail - tw) * 0.5f);
-                ImGui::PushStyleColor(ImGuiCol_Text, Col(kAccent));
-                ImGui::TextUnformatted(ver);
-                ImGui::PopStyleColor();
+                TextCol(Th().accent, "%s", ver);
             }
-
-            // 副标题（居中；过长则换行）
+            Space(4.f);
             {
                 const char* tag = I18N::Tr(I18N::ST_ABOUTTXT);
-                const float tw = ImGui::CalcTextSize(tag).x;
-                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(150, 158, 174, 255));
+                float tw = ImGui::CalcTextSize(tag).x;
                 if (tw <= avail)
                 {
                     ImGui::SetCursorPosX(x0 + (avail - tw) * 0.5f);
-                    ImGui::TextUnformatted(tag);
+                    TextDim("%s", tag);
                 }
                 else
                 {
-                    ImGui::TextWrapped("%s", tag);
+                    TextWrap("%s", tag);
                 }
-                ImGui::PopStyleColor();
             }
         }
-        Chart4K::EndCard4K();
-        ImGui::Spacing();
+        EndCard();
+        Space(9.f);
 
-        // ---- 卡片 2：演示视频 / 仓库 / 配置目录 ----
-        Chart4K::BeginCard4K("##cardAboutLink", 0.f);
+        BeginCard("##about_link");
         {
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(150, 158, 174, 255));
-            ImGui::TextWrapped("%s", I18N::Tr(I18N::ABOUT_HINT));
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-
+            CardHint(I18N::Tr(I18N::ABOUT_HINT));
+            Space(5.f);
             const float sp = ImGui::GetStyle().ItemSpacing.x;
-            const float bw = (ImGui::GetContentRegionAvail().x - sp) * 0.5f;
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.59f, 0.98f, 0.32f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.59f, 0.98f, 0.50f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.26f, 0.59f, 0.98f, 0.62f));
-            if (ImGui::Button(I18N::Tr(I18N::ABOUT_OPEN), ImVec2(bw, 28.f)))
-                AboutOpenVideo();
-            ImGui::PopStyleColor(3);
+            float bw = (ImGui::GetContentRegionAvail().x - sp) * 0.5f;
+            if (Button("##about_video", I18N::Tr(I18N::ABOUT_OPEN), ImVec2(bw, 28.f), BTN_PRIMARY))
+                ShellAsync::Open(kAppVideoUrl);
             ImGui::SameLine();
-            if (ImGui::Button(I18N::Tr(I18N::ABOUT_GITHUB), ImVec2(bw, 28.f)))
-                ShellExecuteA(nullptr, "open", kAppRepoUrl, nullptr, nullptr, SW_SHOWNORMAL);
-
-            if (ImGui::Button(I18N::Tr(I18N::ST_OPENCFG), ImVec2(-1.f, 26.f)))
-            {
-                std::string dir = I18N::Prefs::Dir();
-                ShellExecuteA(nullptr, "open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            }
-
-            ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 128, 144, 255));
-            ImGui::TextUnformatted(I18N::Tr(I18N::ABOUT_MADE));
-            ImGui::PopStyleColor();
+            if (Button("##about_gh", I18N::Tr(I18N::ABOUT_GITHUB), ImVec2(bw, 28.f)))
+                ShellAsync::Open(kAppRepoUrl);
+            Space(5.f);
+            if (Button("##about_cfg", I18N::Tr(I18N::ST_OPENCFG), ImVec2(-1.f, 27.f)))
+                ShellAsync::Open(I18N::Prefs::Dir());
+            Space(6.f);
+            TextFaint("%s", I18N::Tr(I18N::ABOUT_MADE));
         }
-        Chart4K::EndCard4K();
+        EndCard();
+    }
+    // ============================================================
+    //  辅助读谱
+    // ============================================================
+    static void DrawReadPage()
+    {
+        PageHeader(TT(NS_READ), TT(NS_LIVE_DESC), false);
+        Chart4K::DrawReadSettingsPage();
     }
 
-    // ---------- 主窗口 ----------
+    // ============================================================
+    //  侧边栏（Etherium Tab：图标 + 文字，选中 34,33,34 圆角底）
+    // ============================================================
+    struct NavDef { int pg; int icon; int ns; };
+    static const NavDef kNav[PG_N] = {
+        { PG_BASIC,  IC_HOME,  NS_BASIC  },
+        { PG_STATUS, IC_LIVE,  NS_STATUS },
+        { PG_READ,   IC_EYE,   NS_READ   },
+        { PG_TRACK,  IC_TRACK, NS_TRACK  },
+        { PG_MISC,   IC_MORE,  NS_MISC   },
+        { PG_MODMGR, IC_MOD,   NS_MODMGR },
+        { PG_SET,    IC_GEAR,  NS_SET    },
+        { PG_ABOUT,  IC_INFO,  NS_ABOUT  },
+    };
+
+    static void SidebarGo(int pg)
+    {
+        if (pg == PG_TRACK) s_subTR = -1;
+        if (pg == PG_MISC)  s_subMI = -1;
+        s_page = pg;
+    }
+
+    // 鼠标数据是否可信：ImGui 在 Unity 主线程调用 NewFrame 时，光标偶尔会脱离窗口，
+    // MousePos/MouseDelta 会出现 -FLT_MAX 之类的野值；此时绝不能用于拖动 / 缩放。
+    static bool MouseSane()
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        const ImVec2 mp = io.MousePos, md = io.MouseDelta;
+        const float lim = 3000.f;
+        if (!(mp.x > -lim && mp.x < lim && mp.y > -lim && mp.y < lim)) return false;
+        if (!(md.x > -900.f && md.x < 900.f && md.y > -900.f && md.y < 900.f)) return false;
+        if (io.DisplaySize.x < 100.f || io.DisplaySize.y < 100.f) return false;
+        return true;
+    }
+
+    // 把窗口钳制在可视区域内（至少留 90x40 在屏内），避免拖出屏幕后「界面消失」
+    static void ClampMainPos()
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.DisplaySize.x < 100.f || io.DisplaySize.y < 100.f) return;
+        const float minX = -s_mainSize.x + 90.f;
+        const float maxX = io.DisplaySize.x - 90.f;
+        const float minY = 0.f;
+        const float maxY = io.DisplaySize.y - 40.f;
+        if (s_mainPos.x < minX) s_mainPos.x = minX;
+        if (s_mainPos.x > maxX) s_mainPos.x = maxX;
+        if (s_mainPos.y < minY) s_mainPos.y = minY;
+        if (s_mainPos.y > maxY) s_mainPos.y = maxY;
+    }
+
+    static void DrawSidebar()
+    {
+        // 拖动把手：仅覆盖侧栏顶部品牌区（不与 Tab 重叠）
+        ImGui::SetCursorPos(ImVec2(0.f, 0.f));
+        ImGui::InvisibleButton("##sidedrag", ImVec2(kSideW, kTopH));
+        if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left) && MouseSane())
+        {
+            s_mainPos = ImVec2(s_mainPos.x + ImGui::GetIO().MouseDelta.x,
+                               s_mainPos.y + ImGui::GetIO().MouseDelta.y);
+            ClampMainPos();
+        }
+
+        for (int i = 0; i < PG_N; i++)
+        {
+            ImGui::SetCursorPos(ImVec2(kTabX, kTabY + (float)i * (kTabH + kTabGap)));
+            char id[24];
+            snprintf(id, sizeof(id), "##nav%d", i);
+            if (Tab(id, kNav[i].icon, TT(kNav[i].ns), s_page == kNav[i].pg,
+                    ImVec2(kTabW, kTabH)))
+                SidebarGo(kNav[i].pg);
+        }
+    }
+    // ============================================================
+    //  内容区分发
+    // ============================================================
+    static const char* TrackTitle(int sub)
+    {
+        switch (sub)
+        {
+        case TR_4K:    return I18N::Tr(I18N::TAB_4K);
+        case TR_5K:    return I18N::Tr(I18N::TAB_5K);
+        case TR_6K:    return I18N::Tr(I18N::TAB_6K);
+        case TR_10K:   return I18N::Tr(I18N::TAB_10K);
+        case TR_16K:   return I18N::Tr(I18N::TAB_16K);
+        case TR_CATCH: return I18N::Tr(I18N::TAB_CATCH);
+        case TR_8K:    return I18N::Tr(I18N::TAB_8K);
+        case TR_OSU:   return I18N::Tr(I18N::TAB_OSU);
+        default:       return "";
+        }
+    }
+    static const char* MiscTitle(int sub)
+    {
+        switch (sub)
+        {
+        case MI_MACRO:  return I18N::Tr(I18N::TAB_MACRO);
+        case MI_RECORD: return I18N::Tr(I18N::TAB_RECORD);
+        case MI_SKIN:   return I18N::Tr(I18N::TAB_SKIN);
+        case MI_KV:     return TT(NS_KV_TITLE);
+        case MI_LIVE:   return I18N::Tr(I18N::TAB_LIVE);
+        default:        return "";
+        }
+    }
+
+    // 当前页面标题（顶栏用）——与页面体读同一份状态，永不脱节
+    static const char* PageTitleText()
+    {
+        if (s_page >= 0 && s_page < PG_N) return TT(kNav[s_page].ns);
+        return "";
+    }
+    static float s_subX = 0.f;   // 子标签起始 x（由顶栏标题宽度决定）
+    static int   s_trScrolled = -999;   // 轨道子标签：上次已滚动的选中项
+    static int   s_miScrolled = -999;   // 其它子标签：上次已滚动的选中项
+
+    // ----------------------------------------------
+    // 子导航（Etherium SubTab 行：位于内容面板上方的 y=12 处）
+    // ----------------------------------------------
+    static void DrawTrackTabs()
+    {
+        const char* kL[TR_N + 1] = {
+            TT(NS_SELECT), I18N::Tr(I18N::TAB_4K), I18N::Tr(I18N::TAB_5K),
+            I18N::Tr(I18N::TAB_6K), I18N::Tr(I18N::TAB_10K),
+            I18N::Tr(I18N::TAB_16K), I18N::Tr(I18N::TAB_CATCH),
+            I18N::Tr(I18N::TAB_8K), I18N::Tr(I18N::TAB_OSU)
+        };
+        const float avail = ImGui::GetWindowSize().x - s_subX - 8.f;
+        if (avail < 70.f) return;
+        ImGui::SetCursorPos(ImVec2(s_subX, 8.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 7.f);
+        ImGui::BeginChild("##trtabs", ImVec2(avail, kTabH + 9.f), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_HorizontalScrollbar |
+                          ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
+        for (int i = 0; i < TR_N + 1; i++)
+        {
+            if (i) ImGui::SameLine(0.f, 9.f);
+            char id[24];
+            snprintf(id, sizeof(id), "##trtab%d", i);
+            float bw = ImGui::CalcTextSize(kL[i]).x + 24.f;
+            if (bw < 74.f) bw = 74.f;
+            if (SubTab(id, kL[i], s_subTR == (i - 1), ImVec2(bw, kTabH)))
+                s_subTR = i - 1;
+            if (i == s_subTR + 1 && s_trScrolled != s_subTR)
+            {
+                ImGui::SetScrollHereX(0.5f);
+                s_trScrolled = s_subTR;
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+    }
+
+    static void DrawMiscTabs()
+    {
+        const char* kL[MI_N + 1] = {
+            TT(NS_SELECT), I18N::Tr(I18N::TAB_MACRO), I18N::Tr(I18N::TAB_RECORD),
+            I18N::Tr(I18N::TAB_SKIN), TT(NS_KV_TITLE), I18N::Tr(I18N::TAB_LIVE)
+        };
+        const float avail = ImGui::GetWindowSize().x - s_subX - 8.f;
+        if (avail < 70.f) return;
+        ImGui::SetCursorPos(ImVec2(s_subX, 8.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 7.f);
+        ImGui::BeginChild("##mitabs", ImVec2(avail, kTabH + 9.f), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_HorizontalScrollbar |
+                          ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
+        for (int i = 0; i < MI_N + 1; i++)
+        {
+            if (i) ImGui::SameLine(0.f, 10.f);
+            char id[24];
+            snprintf(id, sizeof(id), "##mitab%d", i);
+            float bw = ImGui::CalcTextSize(kL[i]).x + 24.f;
+            if (bw < 100.f) bw = 100.f;
+            if (SubTab(id, kL[i], s_subMI == (i - 1), ImVec2(bw, kTabH)))
+                s_subMI = i - 1;
+            if (i == s_subMI + 1 && s_miScrolled != s_subMI)
+            {
+                ImGui::SetScrollHereX(0.5f);
+                s_miScrolled = s_subMI;
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+    }
+
+    // 页面体（在内容面板子窗口内绘制）
+    static void DrawPageBody()
+    {
+        switch (s_page)
+        {
+        case PG_BASIC:
+            DrawBasicPage();
+            break;
+        case PG_STATUS:
+            DrawStatusPage();
+            break;
+        case PG_READ:
+            DrawReadPage();
+            break;
+        case PG_TRACK:
+            if (s_subTR < 0) DrawTrackHub();
+            else             DrawTrackSub();
+            break;
+        case PG_MISC:
+            if (s_subMI < 0) DrawMiscHub();
+            else             DrawMiscSub();
+            break;
+        case PG_MODMGR:
+            ModManager::DrawPage();
+            break;
+        case PG_SET:
+            DrawSettingsPage();
+            break;
+        case PG_ABOUT:
+            DrawAboutPage();
+            break;
+        default:
+            break;
+        }
+    }
+
+    // ============================================================
+    //  主窗口（Etherium：左 175px 导航 + 60px 顶栏 + 圆角内容面板）
+    // ============================================================
     static void DrawMain()
     {
-        const CheatState::Status st = [] {
-            CheatState::Status s;
-            GameBridge::GetStatusSnapshot(&s);
-            return s;
-        }();
-
-        // 页内容自适应：卡片高度随内容，滚动范围由 ImGui 按实际内容自动计算，无需内层滚动条。
         ImGui::SetNextWindowPos(s_mainPos, ImGuiCond_Always);
         ImGui::SetNextWindowSize(s_mainSize, ImGuiCond_Always);
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
-                                 ImGuiWindowFlags_NoBringToFrontOnFocus;
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
+                                 ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar |
+                                 ImGuiWindowFlags_NoScrollWithMouse |
+                                 ImGuiWindowFlags_NoSavedSettings;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.f);
         ImGui::Begin("##adofai_main", nullptr, flags);
-        {
-        }
+        StreamMode::MarkWindow("##adofai_main", StreamMode::EL_MENU);   // 直播模式：整块菜单（含卡片子窗口）
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 wpos = ImGui::GetWindowPos();
+        ImVec2 wpos  = ImGui::GetWindowPos();
         ImVec2 wsize = ImGui::GetWindowSize();
+        ImVec2 wmax(wpos.x + wsize.x, wpos.y + wsize.y);
+        const float W = wsize.x, H = wsize.y;
 
-        // ============ 标题栏（自绘，可拖动窗口） ============
+
+        // ---- 侧栏 / 顶栏底（Etherium 同款双层色块）----
+        dl->AddRectFilled(wpos, ImVec2(wpos.x + kSideW, wmax.y), Th().sideBg, 12.f,
+                          ImDrawFlags_RoundCornersLeft);
+        dl->AddRectFilled(ImVec2(wpos.x + kSideW, wpos.y), ImVec2(wmax.x, wpos.y + kTopH),
+                          Th().topBg, 12.f, ImDrawFlags_RoundCornersTopRight);
+
+        // ---- 品牌（Bold 22px）----
         {
-            const float hdrH = 38.f;
-            dl->AddRectFilled(ImVec2(wpos.x + 1, wpos.y + 1),
-                              ImVec2(wpos.x + wsize.x - 1, wpos.y + hdrH),
-                              IM_COL32(21, 22, 26, 255), 11.f, ImDrawFlags_RoundCornersTop);
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 8.f, wpos.y + 8.f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-            ImGui::InvisibleButton("##hdrdrag", ImVec2(wsize.x - 76.f, hdrH - 12.f));
-            ImGui::PopStyleVar();
-            if (ImGui::IsItemActive())
-                s_mainPos = ImVec2(s_mainPos.x + ImGui::GetIO().MouseDelta.x,
-                                   s_mainPos.y + ImGui::GetIO().MouseDelta.y);
+            ImFont* f = ImGui::GetFont();
+            dl->AddText(f, 21.f, ImVec2(wpos.x + 24.f, wpos.y + 15.f), Th().text, "ADOFAI");
+            dl->AddText(f, 21.f, ImVec2(wpos.x + 24.f, wpos.y + 35.f), Th().accent, "PERFECT");
+            ImVec2 c(wpos.x + kSideW - 26.f, wpos.y + 30.f);
+            dl->AddQuadFilled(ImVec2(c.x, c.y - 9.f), ImVec2(c.x + 9.f, c.y),
+                              ImVec2(c.x, c.y + 9.f), ImVec2(c.x - 9.f, c.y), A(Th().accent, 0.28f));
+            dl->AddQuad(ImVec2(c.x, c.y - 9.f), ImVec2(c.x + 9.f, c.y),
+                        ImVec2(c.x, c.y + 9.f), ImVec2(c.x - 9.f, c.y), Th().accent, 1.6f);
+        }
 
-            // 标题：ADOFAI-PERFECT
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 14, wpos.y + 11));
-            ImGui::PushStyleColor(ImGuiCol_Text, Col(kAccent));
-            ImGui::TextUnformatted("\xe2\x97\x88"); // ◈
-            ImGui::PopStyleColor();
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 30, wpos.y + 12));
-            ImGui::PushFont(nullptr, 14.f);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.95f, 0.98f, 1.f));
-            ImGui::TextUnformatted("ADOFAI-PERFECT");
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim, 0.9f));
-            ImGui::TextUnformatted("  \xc2\xb7  4K/5K/6K/10K + \xe6\x97\xa0\xe8\xbd\xa8\xe8\xaf\xbb\xe8\xb0\xb1");
-            ImGui::PopStyleColor();
-            ImGui::PopFont();
-
-            // 折叠按钮（–）
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + wsize.x - 34, wpos.y + 8));
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.08f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1, 1, 1, 0.14f));
-            if (ImGui::Button("##min", ImVec2(26, 22)))
+        // ---- 顶栏：当前页标题 + 面包屑 + 折叠 ----
+        {
+            ImFont* f = ImGui::GetFont();
+            const char* pt = PageTitleText();
+            const float tw = f->CalcTextSizeA(17.f, FLT_MAX, 0.f, pt).x;
+            dl->AddText(f, 17.f, ImVec2(wpos.x + kSideW + 18.f, wpos.y + 21.f), Th().text, pt);
+            s_subX = kSideW + 18.f + tw + 22.f;
+            ImGui::SetCursorPos(ImVec2(W - 38.f, 20.f));
+            if (IconButton("##collapse", IC_MINUS, ImVec2(22.f, 22.f), BTN_GHOST))
                 s_collapsed = true;
-            ImGui::PopStyleColor(3);
-            {
-                ImVec2 bp = ImGui::GetItemRectMin();
-                dl->AddLine(ImVec2(bp.x + 6, bp.y + 11), ImVec2(bp.x + 20, bp.y + 11),
-                            IM_COL32(200, 205, 215, 220), 2.f);
-            }
-
-            dl->AddLine(ImVec2(wpos.x + 1, wpos.y + hdrH),
-                        ImVec2(wpos.x + wsize.x - 1, wpos.y + hdrH),
-                        IM_COL32(255, 255, 255, 22));
         }
 
-        // ============ 模式 TAB（深色标签栏） ============
+        // ---- 侧栏导航 ----
+        DrawSidebar();
+
+
+        // ---- 子导航行（内容面板之上）----
+        if (s_page == PG_TRACK)      DrawTrackTabs();
+        else if (s_page == PG_MISC)  DrawMiscTabs();
+
+        // ---- 内容面板 ----
         {
-            // 页 id → 标题（索引与 DrawMain 的渲染分支一致）
-            static const int kPageTitle[13] = {
-                I18N::TAB_FEATURES, I18N::TAB_STATUS, I18N::TAB_READ,
-                I18N::TAB_4K, I18N::TAB_5K, I18N::TAB_6K, I18N::TAB_10K,
-                I18N::TAB_KEYVIEWER, I18N::TAB_SKIN, I18N::TAB_SETTINGS,
-                I18N::TAB_MACRO, I18N::ST_ABOUT, I18N::TAB_RECORD
-            };
-            // 页签顺序（索引 = 页签位置，值 = 页 id）：… 皮肤 → 录制 → 宏 → 设置 → 关于
-            static const int kTabOrder[13] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 10, 9, 11 };
-            const char* names[13];
-            for (int i = 0; i < 13; i++)
-                names[i] = I18N::Tr(kPageTitle[kTabOrder[i]]);
-            // 首次绘制：按页签实际宽度自动加宽窗口（保证全部可见，不再出现滚动箭头）
-            static bool s_fitTabs = false;
-            if (!s_fitTabs)
-            {
-                s_fitTabs = true;
-                float need = 10.f + 42.f;
-                for (int i = 0; i < 13; i++)
-                    need += ImGui::CalcTextSize(names[i]).x + 14.f + 4.f + 6.f;   // FramePadding.x*2 + ItemSpacing.x + 余量
-                const float maxW = ImGui::GetIO().DisplaySize.x - 40.f;
-                if (need > maxW) need = maxW;
-                if (need > s_mainSize.x) s_mainSize.x = need;
-            }
-            // 页签条底：整幅深色（随窗口宽度自适应），让 TAB 看起来像设计好的分段控件
-            dl->AddRectFilled(ImVec2(wpos.x + 1.f, wpos.y + 38.f),
-                              ImVec2(wpos.x + wsize.x - 1.f, wpos.y + 86.f),
-                              IM_COL32(16, 17, 20, 255));
-            dl->AddLine(ImVec2(wpos.x + 1.f, wpos.y + 86.f),
-                        ImVec2(wpos.x + wsize.x - 1.f, wpos.y + 86.f),
-                        IM_COL32(255, 255, 255, 18));
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + 10.f, wpos.y + 46.f));
-            ImGui::PushStyleColor(ImGuiCol_Tab,                 ImVec4(0.11f, 0.11f, 0.13f, 1.f));
-            ImGui::PushStyleColor(ImGuiCol_TabHovered,          ImVec4(0.26f, 0.59f, 0.98f, 0.45f));
-            ImGui::PushStyleColor(ImGuiCol_TabSelected,         ImVec4(0.16f, 0.29f, 0.48f, 1.f));
-            ImGui::PushStyleColor(ImGuiCol_TabSelectedOverline, ImVec4(0.26f, 0.59f, 0.98f, 1.f));
-            ImGui::PushStyleColor(ImGuiCol_TabDimmed,           ImVec4(0.11f, 0.11f, 0.13f, 0.75f));
-            ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected,   ImVec4(0.14f, 0.22f, 0.36f, 1.f));
-            ImGui::PushStyleVar(ImGuiStyleVar_TabRounding, 6.f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.f, 6.f));
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f, 4.f));
-            if (ImGui::BeginTabBar("##modetabs", ImGuiTabBarFlags_None))
-            {
-                static int s_pendingTab = S_PageFromEnv();   // 初始页（首帧一次性选中）
-                for (int i = 0; i < 13; i++)
-                {
-                    if (ImGui::BeginTabItem(names[i], nullptr,
-                                            (s_pendingTab == kTabOrder[i]) ? ImGuiTabItemFlags_SetSelected : 0))
-                    {
-                        s_page = kTabOrder[i];
-                        ImGui::EndTabItem();
-                    }
-                }
-                s_pendingTab = -1;
-                ImGui::EndTabBar();
-            }
-            {
-                static int s_loggedPage = -1;
-                if (s_page != s_loggedPage)
-                {
-                    s_loggedPage = s_page;
-                    Log::Printf("[UI] page -> %d (env=%d)", s_page, S_PageFromEnv());
-                }
-            }
-            ImGui::PopStyleVar(3);
-            ImGui::PopStyleColor(6);
+            ImGui::SetCursorPos(ImVec2(kSideW, kPanelY));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(kPadX, kPadY));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 9.f));
+            ImGui::BeginChild("##content", ImVec2(W - kSideW - 12.f, H - kPanelY - 12.f),
+                              ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding, 0);
+            DrawPageBody();
+            ImGui::EndChild();
+            ImGui::PopStyleVar(2);
         }
 
-        // 切页/首次进入：回到顶部（放在页签之后，保证不会被页签自身的滚动请求覆盖）
-        {
-            static int s_lastPage = -1;
-            if (s_page != s_lastPage)
-            {
-                s_lastPage = s_page;
-                ImGui::SetScrollY(0.f);
-                if (s_page == kPageAbout)
-                    AboutAutoOpenVideo();     // 打开「关于」页 → 自动跳转演示视频
-            }
-        }
-
-        // 页面几何（全部绝对坐标，杜绝光标残留导致的错位）
-        // 滚动：页内容整体上移 -scrollY；标题栏 / 页签 / 底部按钮固定不动
-        const float scrollY = ImGui::GetScrollY();
-        const float pageX = wpos.x + 12.f;
-        const float pageY = wpos.y + 88.f - scrollY;             // 标题栏34 + 边距 + 页签32 + 间隙
-        const float pageW = wsize.x - 24.f;
-        const float contentH = wsize.y - 88.f - 52.f;            // 底部留按钮/提示区
-
-        // 可滚动内容区裁剪（内容滚出可视区时不覆盖标题栏 / 页签 / 底部按钮）
-        ImGui::PushClipRect(ImVec2(wpos.x + 1.f, wpos.y + 88.f),
-                            ImVec2(wpos.x + wsize.x - 1.f,
-                                   wpos.y + wsize.y - (s_page >= 2 ? 8.f : 46.f)), true);
-
-        // ============ 页：功能 ============
-        if (s_page == 0)
-        {
-            float cardH = (contentH - 10.f) * 0.5f;
-            if (cardH > 96.f) cardH = 96.f;               // 紧凑：卡片不随窗口高度无限拉伸
-
-            auto FeatureCard = [&](int idx, const char* id, const char* title,
-                                   std::atomic<bool>* value, float* anim,
-                                   const ImVec4& accent, const char* swId) {
-                const float cy = pageY + idx * (cardH + 10.f);
-
-                // 卡片背景（主窗口 drawlist 直绘，位置绝对可控）
-                dl->AddRectFilled(ImVec2(pageX, cy), ImVec2(pageX + pageW, cy + cardH),
-                                  Col(kCardBg), 12.f);
-                dl->AddRect(ImVec2(pageX, cy), ImVec2(pageX + pageW, cy + cardH),
-                            Col(kCardLine), 12.f);
-
-                ImFont* font = ImGui::GetFont();
-
-                // ---- 大号艺术字标题（阴影 + 渐变双层）----
-                {
-                    float ts = 22.f;
-                    ImVec2 tsize = font->CalcTextSizeA(ts, FLT_MAX, 0.f, title);
-                    ImVec2 tp(pageX + 22.f, cy + (cardH - tsize.y) * 0.5f);
-                    bool on = value->load(std::memory_order_relaxed);
-                    // 阴影
-                    dl->AddText(font, ts, ImVec2(tp.x + 2, tp.y + 2), IM_COL32(0, 0, 0, 170), title);
-                    // 主体（开启时亮色，关闭时灰）
-                    ImU32 mainCol = on ? Col(accent, 1.f) : IM_COL32(178, 182, 195, 235);
-                    dl->AddText(font, ts, tp, mainCol, title);
-                    // 顶部高光（艺术字效果：上半段再画一遍浅色）
-                    dl->PushClipRect(ImVec2(tp.x, tp.y), ImVec2(tp.x + tsize.x, tp.y + tsize.y * 0.55f), true);
-                    dl->AddText(font, ts, tp, IM_COL32(255, 255, 255, on ? 110 : 60), title);
-                    dl->PopClipRect();
-                }
-
-                // ---- 开关（右侧垂直居中）----
-                bool v = value->load(std::memory_order_relaxed);
-                const float swW = 64.f, swH = 34.f;
-                ImVec2 swPos(pageX + pageW - 22.f - swW, cy + (cardH - swH) * 0.5f);
-                ImGui::SetCursorScreenPos(swPos);
-                if (ToggleSwitch(swId, &v, anim, swW, swH))
-                {
-                    value->store(v, std::memory_order_relaxed);
-                    Log::Printf("[UI] toggle %s -> %d", swId, (int)v);
-                }
-            };
-
-            FeatureCard(0, "##card1", I18N::Tr(I18N::FEAT_NODEATH),
-                        &CheatState::NoDeath, &s_anim[0], kAccent, "##sw1");
-            FeatureCard(1, "##card2", I18N::Tr(I18N::FEAT_AUTOCOMBO),
-                        &CheatState::AutoCombo, &s_anim[1], kAccent2, "##sw2");
-
-            ImGui::PopClipRect();
-            ImGui::SetCursorScreenPos(ImVec2(pageX, wpos.y + wsize.y - 46.f));
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.20f, 0.55f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.20f, 0.25f, 0.75f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.45f, 0.13f, 0.16f, 0.85f));
-            if (ImGui::Button(I18N::Tr(I18N::FEAT_UNLOAD), ImVec2(pageW, 30)))
-                CheatState::ExitRequested.store(true, std::memory_order_relaxed);
-            ImGui::PopStyleColor(3);
-        }
-        // ============ 页：辅助读谱（无轨） ============
-        else if (s_page == 2)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            Chart4K::DrawReadSettingsPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：4K 辅助 ============
-        else if (s_page == 3)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            Chart4K::DrawSettingsPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：5K 模式 ============
-        else if (s_page == 4)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            Chart4K::DrawSettings5KPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：6K 模式 ============
-        else if (s_page == 5)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            Chart4K::DrawSettings6KPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：10K 模式 ============
-        else if (s_page == 6)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            Chart4K::DrawSettings10KPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：KeyViewer ============
-        else if (s_page == 7)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            Chart4K::DrawKeyViewerSettingsPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：皮肤 ============
-        else if (s_page == 8)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            DrawSkinPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：设置 ============
-        else if (s_page == 9)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            DrawShellSettingsPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：宏模式（宏打歌 + 自动录制） ============
-        else if (s_page == 10)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            Chart4K::DrawMacroPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：录制（小窗录制：开始/暂停/继续 + 输出目录） ============
-        else if (s_page == kPageRecord)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            Chart4K::DrawRecordPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：关于 ============
-        else if (s_page == kPageAbout)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            DrawAboutPage();
-            ImGui::PopClipRect();
-        }
-        // ============ 页：实时状态 ============
-        else if (s_page == 1)
-        {
-            ImGui::SetCursorScreenPos(ImVec2(pageX, pageY));
-            BeginCard("##cardS", contentH);
-            {
-                if (!st.bridgeReady)
-                {
-                    ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f),
-                                       "%s", I18N::Tr(I18N::ST_CONNECTING));
-                }
-                else if (!st.controllerAlive)
-                {
-                    ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f),
-                                       "%s", I18N::Tr(I18N::ST_NOCONTROLLER));
-                    ImGui::Spacing();
-                    ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim));
-                    ImGui::TextWrapped("%s", I18N::Tr(I18N::ST_HINT_BG));
-                    ImGui::PopStyleColor();
-                }
-                else
-                {
-                    ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim));
-                    ImGui::TextUnformatted(I18N::Tr(I18N::ST_LEVEL)); // 关卡
-                    ImGui::PopStyleColor();
-                    ImGui::TextWrapped("%s", st.levelName[0] ? st.levelName : I18N::Tr(I18N::ST_UNKNOWN));
-
-                    ImGui::Spacing();
-                    ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim));
-                    ImGui::TextUnformatted(I18N::Tr(I18N::ST_STATE)); // 状态
-                    ImGui::PopStyleColor();
-                    ImGui::TextUnformatted(st.stateName);
-                    ImGui::SameLine();
-                    if (st.gameworld)
-                        ImGui::TextColored(kAccent, "%s", I18N::Tr(I18N::ST_INGAME));
-
-                    ImGui::Spacing();
-                    ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim));
-                    ImGui::TextUnformatted(I18N::Tr(I18N::ST_PROGRESS)); // 进度
-                    ImGui::PopStyleColor();
-                    char pct[32];
-                    snprintf(pct, sizeof(pct), "%.1f%%", st.percentComplete * 100.f);
-                    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, Col(kAccent, 0.55f));
-                    ImGui::ProgressBar(st.percentComplete, ImVec2(-1, 8), "");
-                    ImGui::PopStyleColor();
-                    ImGui::Text("\xe7\xac\xac %d \xe5\x9d\x97  \xc2\xb7  %s", st.floorIndex, pct);
-
-                    ImGui::Separator();
-                    ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim));
-                    ImGui::TextUnformatted(I18N::Tr(I18N::ST_ACC)); // 精准度
-                    ImGui::PopStyleColor();
-                    ImGui::PushFont(nullptr, 26.f);
-                    ImGui::TextColored(ImVec4(kAccent.x, kAccent.y, kAccent.z, 1.f), "%.2f%%", st.percentAcc * 100.f);
-                    ImGui::PopFont();
-                    ImGui::Text("XAcc:  %.2f%%", st.percentXAcc * 100.f);
-                    ImGui::Text("%s: %d      %s: %d", I18N::Tr(I18N::ST_DEATHS_CK), st.deaths, I18N::Tr(I18N::ST_CHECKPOINT), st.checkpoints);
-                }
-            }
-            EndCard();
-
-            ImGui::PopClipRect();
-            ImGui::SetCursorPos(ImVec2(12.f, wsize.y - 34.f));
-            ImGui::PushStyleColor(ImGuiCol_Text, Col(kTextDim, 0.8f));
-            ImGui::TextDisabled("%s", I18N::Tr(I18N::ST_FOOTER));
-            ImGui::PopStyleColor();
-        }
-
-        // ============ 右下角缩放柄（拖动 = 改窗口尺寸，控件随宽度自适应） ============
+        // ---- 右下角缩放柄 ----
         {
             const float gs = 16.f;
-            ImVec2 gp(wpos.x + wsize.x - gs - 3.f, wpos.y + wsize.y - gs - 3.f);
-            ImGui::SetCursorScreenPos(gp);
+            ImGui::SetCursorPos(ImVec2(W - gs - 5.f, H - gs - 5.f));
             ImGui::InvisibleButton("##wndresize", ImVec2(gs, gs));
             bool hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
-            if (hov)
-                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
-            if (ImGui::IsItemActive())
+            if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
+            if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left) && MouseSane())
             {
                 s_mainSize.x += ImGui::GetIO().MouseDelta.x;
                 s_mainSize.y += ImGui::GetIO().MouseDelta.y;
-                if (s_mainSize.x < 380.f)  s_mainSize.x = 380.f;
-                if (s_mainSize.x > 1000.f) s_mainSize.x = 1000.f;
-                if (s_mainSize.y < 340.f)  s_mainSize.y = 340.f;
-                if (s_mainSize.y > 900.f)  s_mainSize.y = 900.f;
+                if (s_mainSize.x < 720.f) s_mainSize.x = 720.f;
+                if (s_mainSize.y < 460.f) s_mainSize.y = 460.f;
+                if (ImGui::GetIO().DisplaySize.x > 200.f && s_mainSize.x > ImGui::GetIO().DisplaySize.x)
+                    s_mainSize.x = ImGui::GetIO().DisplaySize.x;
+                if (ImGui::GetIO().DisplaySize.y > 200.f && s_mainSize.y > ImGui::GetIO().DisplaySize.y)
+                    s_mainSize.y = ImGui::GetIO().DisplaySize.y;
             }
+            ImVec2 gp(wmax.x - gs - 5.f, wmax.y - gs - 5.f);
             for (int i = 0; i < 3; i++)
             {
-                float o = 3.f + i * 4.5f;
-                dl->AddLine(ImVec2(gp.x + gs - o, gp.y + gs - 2.f),
-                            ImVec2(gp.x + gs - 2.f, gp.y + gs - o),
-                            IM_COL32(230, 235, 245, hov ? 170 : 80), 1.4f);
+                const float o = 4.f + i * 4.f;
+                dl->AddLine(ImVec2(gp.x + gs - o, gp.y + gs),
+                            ImVec2(gp.x + gs, gp.y + gs - o),
+                            IM_COL32(230, 235, 245, hov ? 170 : 70), 1.4f);
             }
         }
-        ImGui::End();
 
-        ImGui::PopStyleVar(); // WindowBorderSize
-    }
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+
+        // ---- MOD 管理器模态层（删除确认 / MOD 设置）----
+        //   必须在主窗口 End() 之后调用：它是独立的顶层窗口（自带标题栏 + X）。
+        ModManager::DrawModal();
+    }    // ============================================================
+    //  折叠后的小圆点
+    // ============================================================
     static void DrawDot()
     {
         ImGui::SetNextWindowPos(s_dotPos, ImGuiCond_Always);
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
-                                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav;
+                                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav |
+                                 ImGuiWindowFlags_NoSavedSettings;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::Begin("##adofai_dot", nullptr, flags);
+        StreamMode::MarkWindow("##adofai_dot", StreamMode::EL_MENU);    // 直播模式：收起态圆点
 
         ImVec2 wpos = ImGui::GetWindowPos();
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float t = (float)ImGui::GetTime();
 
-        // 可点击区域（略大于圆）
-        ImGui::InvisibleButton("##dotbtn", ImVec2(34, 34));
+        ImGui::InvisibleButton("##dotbtn", ImVec2(34.f, 34.f));
         bool hovered = ImGui::IsItemHovered();
-        bool active = ImGui::IsItemActive();
+        bool active  = ImGui::IsItemActive();
 
-        // 拖动
-        if (active && ImGui::IsMouseDragging(0))
+        if (active && ImGui::IsMouseDragging(0) && MouseSane())
             s_dotPos = ImVec2(s_dotPos.x + ImGui::GetIO().MouseDelta.x,
                               s_dotPos.y + ImGui::GetIO().MouseDelta.y);
 
-        // 中心
-        ImVec2 c(wpos.x + 17, wpos.y + 17);
+        ImVec2 c(wpos.x + 17.f, wpos.y + 17.f);
         float pulse = 0.5f + 0.5f * sinf(t * 2.6f);
+        dl->AddCircle(c, 15.f + pulse * 2.5f, A(Th().accent, hovered ? 0.85f : 0.45f), 0, 2.f);
+        dl->AddCircleFilled(c, 11.f, A(Th().accent, 0.92f));
+        dl->AddCircleFilled(c, 4.5f, IM_COL32(12, 10, 18, 235));
 
-        // 外圈呼吸
-        dl->AddCircle(c, 15.f + pulse * 2.5f, Col(kAccent, hovered ? 0.85f : 0.45f), 0, 2.f);
-        // 主体
-        dl->AddCircleFilled(c, 11.f, Col(kAccent, 0.92f));
-        dl->AddCircleFilled(c, 4.5f, IM_COL32(12, 14, 22, 235));
-
-        // 点击（未拖动）展开
-        static ImVec2 pressPos(0, 0);
+        static ImVec2 s_pressPos(0.f, 0.f);
         if (ImGui::IsItemActivated())
-            pressPos = ImGui::GetIO().MousePos;
+            s_pressPos = ImGui::GetIO().MousePos;
         if (ImGui::IsItemDeactivated())
         {
             ImVec2 mp = ImGui::GetIO().MousePos;
-            float d = fabsf(mp.x - pressPos.x) + fabsf(mp.y - pressPos.y);
-            if (d < 6.f)
+            if (fabsf(mp.x - s_pressPos.x) + fabsf(mp.y - s_pressPos.y) < 6.f)
             {
                 s_collapsed = false;
                 s_mainPos = ImVec2(s_dotPos.x - 30.f, s_dotPos.y - 17.f);
@@ -1307,6 +1673,9 @@ namespace Menu
         ImGui::PopStyleVar();
     }
 
+    // ============================================================
+    //  入口
+    // ============================================================
     void Draw()
     {
         static bool s_langLoaded = false;
@@ -1315,15 +1684,25 @@ namespace Menu
             I18N::Load();
             s_langLoaded = true;
         }
-        Chart4K::DrawPlayfield();      // 4K/5K/6K/10K 下坠谱面独立窗口（不受菜单显隐影响）
-        Chart4K::DrawReadOverlay();    // 辅助读谱（无轨）独立窗口
+        ApplyGlobalStyle();   // 每帧幂等：圆角 / 间距 / 半透明（UiKit 统一风格）
+        S_PageFromEnv();      // 调试钩子：只读一次环境变量
+
+        Chart4K::DrawPlayfield();        // 4K/5K/6K/10K/16K/CATCH 谱面（独立透明窗口）
+        Chart4K::DrawReadOverlay();      // 辅助读谱（无轨）独立窗口
         Chart4K::DrawKeyViewerOverlay(); // KeyViewer 按键反馈叠加层
+
+        // 自研 UMM 兼容加载器：每帧（节流）驱动一次。即使菜单隐藏也要跑，
+        // 这样“MOD 加载 / 状态轮询”始终在后台推进。
+        ModLoader::Tick();
+
+        // 直播模式水印：画在游戏画面上（观众可见），即使菜单隐藏也保留
+        StreamMode::DrawWatermark();
+
         if (!CheatState::MenuVisible.load(std::memory_order_relaxed))
             return;
+
         RunSelfTestOnce();
-        if (s_collapsed)
-            DrawDot();
-        else
-            DrawMain();
+        if (s_collapsed) DrawDot();
+        else             DrawMain();
     }
 }

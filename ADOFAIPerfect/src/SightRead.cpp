@@ -9,6 +9,7 @@
 #include "CheatState.h"
 #include "GameBridge.h"
 #include "RenderHook.h"
+#include "StreamMode.h"
 #include "imgui.h"
 #include <windows.h>
 #include <cmath>
@@ -113,7 +114,9 @@ namespace Chart4K
             t.fake     = r.fake;
             t.autoPlay = r.autoPlay;
             t.valid    = r.valid;
-            if (r.holdLen > 0 && i + 1 < n)
+            // holdLength >= 0 即长按块（与 scrLevelMaker.DrawHolds 一致）；
+            // holdLength == 0 是最短长条，同样要显示。
+            if (r.holdLen >= 0 && i + 1 < n)
             {
                 double t1 = g_clockSongUnits ? fl[i + 1].t : fl[i + 1].tp;
                 if (t1 > t.t)
@@ -599,6 +602,7 @@ namespace Chart4K
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::Begin("##readbar", nullptr, fl);
+        StreamMode::MarkWindow("##readbar", StreamMode::EL_READ);   // 直播模式：辅助读谱（横条）
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImFont* font = ImGui::GetFont();
         auto A = [op](ImU32 c, float mul) {
@@ -679,7 +683,7 @@ namespace Chart4K
             {
                 dl->AddCircle(ImVec2(x, cy), 6.f * u, A(IM_COL32(168, 178, 198, 255), 0.8f), 0, 1.8f * u);
                 if (r.midSpin)
-                    dl->AddCircleFilled(ImVec2(x, cy), 2.6f * u, A(IM_COL32(190, 150, 255, 255), 0.95f));
+                    dl->AddCircleFilled(ImVec2(x, cy), 2.6f * u, A(IM_COL32(88, 168, 255, 255), 0.95f));
             }
             if (r.hold > 0.001f)
             {
@@ -718,7 +722,9 @@ namespace Chart4K
                 {
                     const char* tag = (r.hold > 0.001f) ? "H" : r.midSpin ? "M" : r.autoPlay ? "A" : r.fake ? "F" : nullptr;
                     if (r.taps > 1) { snprintf(line, sizeof(line), "x%d", r.taps); Txt(x - 8.f * u, top + 2.f * u, A1(IM_COL32(255, 150, 90, 255)), line, 12.f * u); }
-                    else if (tag)   { Txt(x - 4.f * u, top + 2.f * u, A1(IM_COL32(255, 150, 90, 255)), tag, 12.f * u); }
+                    else if (tag)   { Txt(x - 4.f * u, top + 2.f * u,
+                                          A1(r.midSpin ? IM_COL32(88, 168, 255, 255)
+                                                       : IM_COL32(255, 150, 90, 255)), tag, 12.f * u); }
                 }
             }
         }
@@ -816,9 +822,18 @@ namespace Chart4K
         const float panelW = 348.f * u;
         const float panelH = headH + bodyH + dialH;
         int anchor = s_readAnchor.load(std::memory_order_relaxed);
-        if (anchor < 0 || anchor > 3) anchor = 0;
-        float px = (anchor & 1) ? (gw - panelW - 40.f * u) : (40.f * u);
-        float py = (anchor >= 2) ? (gh - panelH - 56.f * u) : (185.f * u);
+        if (anchor < 0 || anchor > 4) anchor = 0;
+        float px, py;
+        if (anchor == 4)                               // 居中：面板正对屏幕中央
+        {
+            px = (gw - panelW) * 0.5f;
+            py = (gh - panelH) * 0.5f;
+        }
+        else
+        {
+            px = (anchor & 1) ? (gw - panelW - 40.f * u) : (40.f * u);
+            py = (anchor >= 2) ? (gh - panelH - 56.f * u) : (185.f * u);
+        }
         px += (float)s_readPosX.load(std::memory_order_relaxed) * u;
         py += (float)s_readPosY.load(std::memory_order_relaxed) * u;
 
@@ -832,6 +847,7 @@ namespace Chart4K
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::Begin("##readoverlay", nullptr, fl);
+        StreamMode::MarkWindow("##readoverlay", StreamMode::EL_READ);  // 直播模式：辅助读谱（无轨条）
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImFont* font = ImGui::GetFont();
         auto Txt  = [&](float x, float y, ImU32 c, const char* t, float sz) {
@@ -998,7 +1014,7 @@ namespace Chart4K
                 {
                     dl->AddCircle(mp, 7.f * u, A(IM_COL32(168, 178, 198, 255), 0.85f), 0, 2.f * u);
                     if (r.midSpin)
-                        dl->AddCircleFilled(mp, 2.6f * u, A(IM_COL32(190, 150, 255, 255), 0.95f));
+                        dl->AddCircleFilled(mp, 2.6f * u, A(IM_COL32(88, 168, 255, 255), 0.95f));
                 }
 
                 if (gapNext > 21.f * u)
@@ -1029,7 +1045,9 @@ namespace Chart4K
                             Txt(mk + 16.f * u, y - 8.f * u, A1(IM_COL32(255, 150, 90, 255)), line, 14.f * u);
                         }
                         else if (tag)
-                            Txt(mk + 16.f * u, y - 8.f * u, A1(IM_COL32(255, 150, 90, 255)), tag, 14.f * u);
+                            Txt(mk + 16.f * u, y - 8.f * u,
+                                A1(r.midSpin ? IM_COL32(88, 168, 255, 255)
+                                             : IM_COL32(255, 150, 90, 255)), tag, 14.f * u);
                     }
 
                     if (s_readRhythm.load(std::memory_order_relaxed))
@@ -1114,7 +1132,7 @@ namespace Chart4K
                  A1(nr.dir < 0 ? IM_COL32(120, 190, 255, 255) : IM_COL32(255, 190, 120, 255)),
                  line, 17.f * u);
             if (nr.midSpin)
-                TxtC(dcx, dcy + R + 36.f * u, A1(IM_COL32(190, 150, 255, 255)), "中旋砖（自动）", 13.f * u);
+                TxtC(dcx, dcy + R + 36.f * u, A1(IM_COL32(88, 168, 255, 255)), "中旋砖（自动）", 13.f * u);
 
             // 后续形状预览：把之后 4 块连成折线（形状记忆 > 数字记忆）
             {
@@ -1221,12 +1239,13 @@ namespace Chart4K
             int anchor = s_readAnchor.load(std::memory_order_relaxed);
             ReadRowLabel(I18N::Tr(I18N::LBL_POS), colW);
             ImGui::SetNextItemWidth(-14.f);
-            const char* posNames[4] = { I18N::Tr(I18N::LBL_POS_LT), I18N::Tr(I18N::LBL_POS_RT),
-                                        I18N::Tr(I18N::LBL_POS_LB), I18N::Tr(I18N::LBL_POS_RB) };
-            if (anchor < 0 || anchor > 3) anchor = 0;
+            const char* posNames[5] = { I18N::Tr(I18N::LBL_POS_LT), I18N::Tr(I18N::LBL_POS_RT),
+                                        I18N::Tr(I18N::LBL_POS_LB), I18N::Tr(I18N::LBL_POS_RB),
+                                        I18N::Tr(I18N::LBL_POS_CT) };
+            if (anchor < 0 || anchor > 4) anchor = 0;
             if (ImGui::BeginCombo("##read_anchor", posNames[anchor]))
             {
-                for (int ai = 0; ai < 4; ai++)
+                for (int ai = 0; ai < 5; ai++)
                 {
                     bool sel = (ai == anchor);
                     if (ImGui::Selectable(posNames[ai], sel) && !sel)
@@ -1413,5 +1432,60 @@ namespace Chart4K
             }
         }
         EndCard4K();
+    }
+
+    // ---------------- 辅助读谱设置访问器（配置档案整包保存用） ----------------
+    //   which: 0=on 1=ahead 2=layout 3=anchor 4=posX 5=posY 6=scale 7=density
+    //          8=opacity 9=offsetMS 10=grid 11=dial 12=rhythm 13=marks 14=hint
+    //          15=angle 16=windows 17=adapt
+    int ReadSettingGet(int which)
+    {
+        switch (which)
+        {
+        case 0:  return s_readOn.load(std::memory_order_relaxed) ? 1 : 0;
+        case 1:  return s_readAhead.load(std::memory_order_relaxed);
+        case 2:  return s_readLayout.load(std::memory_order_relaxed);
+        case 3:  return s_readAnchor.load(std::memory_order_relaxed);
+        case 4:  return s_readPosX.load(std::memory_order_relaxed);
+        case 5:  return s_readPosY.load(std::memory_order_relaxed);
+        case 6:  return s_readScale.load(std::memory_order_relaxed);
+        case 7:  return s_readDensity.load(std::memory_order_relaxed);
+        case 8:  return s_readOpacity.load(std::memory_order_relaxed);
+        case 9:  return s_readOffsetMS.load(std::memory_order_relaxed);
+        case 10: return s_readGrid.load(std::memory_order_relaxed) ? 1 : 0;
+        case 11: return s_readDial.load(std::memory_order_relaxed) ? 1 : 0;
+        case 12: return s_readRhythm.load(std::memory_order_relaxed) ? 1 : 0;
+        case 13: return s_readMarks.load(std::memory_order_relaxed) ? 1 : 0;
+        case 14: return s_readHint.load(std::memory_order_relaxed) ? 1 : 0;
+        case 15: return s_readAngle.load(std::memory_order_relaxed) ? 1 : 0;
+        case 16: return s_readWindows.load(std::memory_order_relaxed) ? 1 : 0;
+        case 17: return s_readAdapt.load(std::memory_order_relaxed) ? 1 : 0;
+        default: return 0;
+        }
+    }
+    void ReadSettingSet(int which, int v)
+    {
+        switch (which)
+        {
+        case 0:  s_readOn.store(v != 0, std::memory_order_relaxed); break;
+        case 1:  s_readAhead.store(std::max(3, std::min(24, v)), std::memory_order_relaxed); break;
+        case 2:  s_readLayout.store(std::max(0, std::min(2, v)), std::memory_order_relaxed); break;
+        case 3:  s_readAnchor.store(std::max(0, std::min(4, v)), std::memory_order_relaxed); break;
+        case 4:  s_readPosX.store(std::max(-2000, std::min(2000, v)), std::memory_order_relaxed); break;
+        case 5:  s_readPosY.store(std::max(-2000, std::min(2000, v)), std::memory_order_relaxed); break;
+        case 6:  s_readScale.store(std::max(30, std::min(300, v)), std::memory_order_relaxed); break;
+        case 7:  s_readDensity.store(std::max(30, std::min(300, v)), std::memory_order_relaxed); break;
+        case 8:  s_readOpacity.store(std::max(0, std::min(255, v)), std::memory_order_relaxed); break;
+        case 9:  s_readOffsetMS.store(std::max(-500, std::min(500, v)), std::memory_order_relaxed); break;
+        case 10: s_readGrid.store(v != 0, std::memory_order_relaxed); break;
+        case 11: s_readDial.store(v != 0, std::memory_order_relaxed); break;
+        case 12: s_readRhythm.store(v != 0, std::memory_order_relaxed); break;
+        case 13: s_readMarks.store(v != 0, std::memory_order_relaxed); break;
+        case 14: s_readHint.store(v != 0, std::memory_order_relaxed); break;
+        case 15: s_readAngle.store(v != 0, std::memory_order_relaxed); break;
+        case 16: s_readWindows.store(v != 0, std::memory_order_relaxed); break;
+        case 17: s_readAdapt.store(v != 0, std::memory_order_relaxed); break;
+        default: break;
+        }
     }
 }

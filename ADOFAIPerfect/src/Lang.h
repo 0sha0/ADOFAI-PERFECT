@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // ============================================================
 // Lang.h — 多语言（i18n）
 //   支持：简体中文 / 繁體中文 / English / 日本語 / Русский
@@ -56,12 +56,33 @@ namespace I18N
         TAB_MACRO,
         LBL_AUTOPLAY, LBL_MACRO, LBL_RECORD,
         MACRO_TITLE, MACRO_DESC, MACRO_ACC, MACRO_HUMAN, MACRO_CALIB, MACRO_CALIBHINT, MACRO_MODES,
-        REC_TITLE, REC_DESC, REC_ON, REC_AUTO, REC_DIR, REC_OPEN, REC_FPS, REC_MBPS, REC_STATS, REC_HINT,
+        REC_TITLE, REC_DESC, REC_ON, REC_AUTO, REC_DIR, REC_OPEN, REC_PREVIEW, REC_FPS, REC_MBPS, REC_STATS, REC_HINT,
         // ---- 关于页 ----
         ABOUT_VER, ABOUT_OPEN, ABOUT_GITHUB, ABOUT_HINT, ABOUT_MADE,
         // ---- 录制页（独立 PAGE） / 冰与火宏模式 ----
         TAB_RECORD, MACRO_FIRE, MACRO_FIRE_HINT,
         REC_START, REC_PAUSE, REC_RESUME, REC_PAUSED_HINT, REC_PAGEDESC,
+        // ---- 本轮新增：16K(PAD) 页 / 辅助读谱居中 / 伪双押优化 ----
+        TAB_16K, LBL_POS_CT, LBL_PSEUDO2, LBL_PAD_HINT,
+        // ---- CATCH 模式页 / KeyViewer 拖尾 / PAD·CATCH 专用标签 ----
+        TAB_CATCH, KV_TRAIL, LBL_CATCH_HINT, LBL_PAD_KEYS, LBL_CATCH_KEYS,
+        // ---- 冰火手法（拆手序）旋钮 ----
+        LBL_HARDRESIST, LBL_INNERROLL,
+        // ---- 16K(PAD) 仅内置皮肤 ----
+        LBL_16K_BUILTIN_ONLY,
+        // ---- 宏模式：参与模式说明 / 冰与火原生钩子状态 ----
+        MACRO_MODES_HINT, MACRO_HOOK_ON, MACRO_HOOK_OFF,
+        // ---- 伪双押：自适应窗口读数（BPM→转角上限） ----
+        LBL_PSEUDO2_ADAPT,
+        // ---- CATCH v2：漏音即死 / 接盘宽度 / 失败提示 ----
+        LBL_CATCH_KILL, LBL_CATCH_PLATEW, LBL_CATCH_DEAD, LBL_CATCH_PLAYACC,
+        // ---- 直播模式（防采集覆盖层）----
+        TAB_LIVE, LIVE_TITLE, LIVE_DESC, LIVE_HIDE_MENU, LIVE_HIDE_TRACK,
+        LIVE_HIDE_READ, LIVE_HIDE_KV, LIVE_HINT, LIVE_UNAVAIL, LIVE_STATUS,
+        // ---- CATCH：宏代打 / 宏精准度 / 快慢显示 ----
+        LBL_CATCH_AUTO, LBL_CATCH_MACC, LBL_CATCH_FAST, LBL_CATCH_SLOW,
+        // ---- 8K / OSU（戳泡泡）模式页 ----
+        TAB_8K, TAB_OSU, LBL_OSU_CAL_HINT,
         BUILTIN_N
     };
 

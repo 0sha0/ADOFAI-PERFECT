@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -111,7 +111,10 @@
     <ClCompile Include="src\GameDetour.cpp" />
     <ClCompile Include="src\RenderHook.cpp" />
     <ClCompile Include="src\GameRecorder.cpp" />
+    <ClCompile Include="src\UiKit.cpp" />
     <ClCompile Include="src\Menu.cpp" />
+    <ClCompile Include="src\ModManager.cpp" />
+    <ClCompile Include="src\ModLoader.cpp" />
     <ClCompile Include="src\ChartCore.cpp" />
     <ClCompile Include="src\SkinMsp.cpp" />
     <ClCompile Include="src\SkinLua.cpp" />
@@ -119,7 +122,12 @@
     <ClCompile Include="src\Chart5K.cpp" />
     <ClCompile Include="src\Chart6K.cpp" />
     <ClCompile Include="src\Chart10K.cpp" />
+    <ClCompile Include="src\Chart16K.cpp" />
+    <ClCompile Include="src\ChartCatch.cpp" />
+    <ClCompile Include="src\Chart8K.cpp" />
+    <ClCompile Include="src\ChartOsu.cpp" />
     <ClCompile Include="src\SightRead.cpp" />
+    <ClCompile Include="src\StreamMode.cpp" />
     <ClCompile Include="src\Lang.cpp" />
     <ClCompile Include="src\KeyViewer.cpp" />
     <ClCompile Include="src\GameDir.cpp" />
@@ -172,13 +180,26 @@
     <ClInclude Include="src\GameBridge.h" />
     <ClInclude Include="src\GameDetour.h" />
     <ClInclude Include="src\RenderHook.h" />
+    <ClInclude Include="src\UiKit.h" />
     <ClInclude Include="src\Menu.h" />
+    <ClInclude Include="src\ModManager.h" />
+    <ClInclude Include="src\ModLoader.h" />
     <ClInclude Include="src\Chart4K.h" />
     <ClInclude Include="src\ChartCore.h" />
     <ClInclude Include="src\Lang.h" />
+    <ClInclude Include="src\StreamMode.h" />
     <ClInclude Include="src\GameDir.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <!-- 自研 UMM 兼容加载器：随 C++ 一起编译，产物落在 $(OutDir)umm\ -->
+  <Target Name="BuildUmmLoader" AfterTargets="Build">
+    <Exec Command="call &quot;$(RepoRoot)umm\host\build.cmd&quot;" ContinueOnError="WarnAndContinue" />
+    <MakeDir Directories="$(OutDir)umm" />
+    <Copy SourceFiles="$(RepoRoot)umm\host\UnityModManager.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\host\UnityModManager.dll')" />
+    <Copy SourceFiles="$(RepoRoot)umm\0Harmony.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\0Harmony.dll')" />
+    <Copy SourceFiles="$(RepoRoot)umm\dnlib.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\dnlib.dll')" />
+    <Copy SourceFiles="$(RepoRoot)umm\winhttp_x64.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\winhttp_x64.dll')" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

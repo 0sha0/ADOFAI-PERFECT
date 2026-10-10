@@ -11,6 +11,7 @@
 #include "CheatState.h"
 #include "GameBridge.h"
 #include "RenderHook.h"
+#include "StreamMode.h"
 #include "Lang.h"
 #include "imgui.h"
 #include <windows.h>
@@ -22,7 +23,7 @@
 namespace Chart4K
 {
     static const int kVKMax    = 24;
-    static const int kVKGhosts = 96;
+    static const int kVKGhosts = 192;
     static const int kVKDef[4] = { 'D', 'F', 'J', 'K' };
 
     // ---------------- 用户设置 ----------------
@@ -33,6 +34,7 @@ namespace Chart4K
     static std::atomic<int>  s_kvOpacity{ 228 };
     static std::atomic<bool> s_kvVert{ false };
     static std::atomic<bool> s_kvRain{ true };
+    static std::atomic<bool> s_kvTrail{ true };   // 长按拖尾：按住不放也持续生成拖尾雨
     static std::atomic<bool> s_kvWrap{ true };
     static std::atomic<int>  s_kvPerRow{ 8 };
     static std::atomic<bool> s_kvShowKps{ true }, s_kvShowCount{ true }, s_kvShowTotalKps{ true };
@@ -56,6 +58,7 @@ namespace Chart4K
     static float s_keyTimes[kVKMax][64];
     static int   s_keyHead[kVKMax]  = { 0 };
     static float s_rect[kVKMax][4]  = { {0,0,0,0} };  // 上一帧键帽位置（按键雨发射点）
+    static float s_trailAcc[kVKMax] = { 0.f };        // 长按拖尾生成累加器（每 ~45ms 一颗）
     static int   s_total  = 0;
     static float s_maxKps = 0.f, s_avgSum = 0.f;
     static int   s_avgN   = 0;
@@ -210,6 +213,8 @@ namespace Chart4K
         for (int i = 0; i < s_kvLiveN; i++)
         {
             const bool down = (GetAsyncKeyState(s_kvLive[i]) & 0x8000) != 0;
+            const bool rain  = s_kvRain.load(std::memory_order_relaxed);
+            const bool trail = s_kvTrail.load(std::memory_order_relaxed);
             if (down && !s_down[i])
             {
                 s_count[i]++;
@@ -217,9 +222,25 @@ namespace Chart4K
                 s_flash[i] = 0.30f;
                 s_keyTimes[i][s_keyHead[i]] = now;
                 s_keyHead[i] = (s_keyHead[i] + 1) % 64;
-                if (s_kvRain.load(std::memory_order_relaxed))
+                s_trailAcc[i] = 0.f;
+                if (rain)
                     KVSpawnGhost(i, KeyAccent(i));
             }
+            // 长按拖尾：即便只按住很短时间也持续向上拖出键帽雨（KeyViewer MOD 的 Tail Rain）。
+            // 键帽位置已知（s_rect 上一帧）时，每 ~45ms 补一颗虚影，形成连续拖尾；
+            // 松开立即停止。与"点一下"的单颗雨区分开，长按越长拖尾越长。
+            if (down && trail && s_rect[i][2] > 0.f)
+            {
+                s_trailAcc[i] += dt;
+                const float kTrailDt = 0.045f;
+                int guard = 0;
+                while (s_trailAcc[i] >= kTrailDt && guard++ < 8)
+                {
+                    s_trailAcc[i] -= kTrailDt;
+                    KVSpawnGhost(i, KeyAccent(i));
+                }
+            }
+            if (!down) s_trailAcc[i] = 0.f;
             s_down[i] = down;
             float target = down ? 1.f : 0.f;
             float rate = down ? 18.f : 11.f;
@@ -307,6 +328,7 @@ namespace Chart4K
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::Begin("##keyviewer_overlay", nullptr, fl);
+        StreamMode::MarkWindow("##keyviewer_overlay", StreamMode::EL_KV);  // 直播模式：按键反馈
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImFont* font = ImGui::GetFont();
         auto A = [op](ImU32 c, float mul) {
@@ -491,6 +513,7 @@ namespace Chart4K
         case 11: return s_kvShowCount.load(std::memory_order_relaxed) ? 1 : 0;
         case 12: return s_kvShowTotalKps.load(std::memory_order_relaxed) ? 1 : 0;
         case 13: return s_kvBg.load(std::memory_order_relaxed) ? 1 : 0;
+        case 14: return s_kvTrail.load(std::memory_order_relaxed) ? 1 : 0;
         default: return 0;
         }
     }
@@ -512,6 +535,7 @@ namespace Chart4K
         case 11: s_kvShowCount.store(v != 0, std::memory_order_relaxed); break;
         case 12: s_kvShowTotalKps.store(v != 0, std::memory_order_relaxed); break;
         case 13: s_kvBg.store(v != 0, std::memory_order_relaxed); break;
+        case 14: s_kvTrail.store(v != 0, std::memory_order_relaxed); break;
         default: break;
         }
     }
@@ -854,6 +878,11 @@ namespace Chart4K
             bool bgv = s_kvBg.load(std::memory_order_relaxed);
             if (MiniToggle("##kv_bg", &bgv)) s_kvBg.store(bgv, std::memory_order_relaxed);
             ImGui::SameLine(); ImGui::TextUnformatted(I18N::Tr(I18N::KV_BG));
+
+            // 长按拖尾：按住不放持续生成拖尾雨（KeyViewer MOD 的 Tail Rain）
+            bool tl = s_kvTrail.load(std::memory_order_relaxed);
+            if (MiniToggle("##kv_trail", &tl)) s_kvTrail.store(tl, std::memory_order_relaxed);
+            ImGui::SameLine(); ImGui::TextUnformatted(I18N::Tr(I18N::KV_TRAIL));
 
             bool sk = s_kvShowKps.load(std::memory_order_relaxed);
             if (MiniToggle("##kv_kps", &sk)) s_kvShowKps.store(sk, std::memory_order_relaxed);

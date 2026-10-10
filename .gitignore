@@ -32,3 +32,13 @@ dumps/
 
 # ---- imgui 示例自带的预编译库（构建不需要）----
 deps/imgui/examples/libs/
+
+# ---- 本地调试 / 打包临时产物 ----
+_b*.log
+_*.py
+_*.ps1
+_*.txt
+_testlog/
+_stage/
+_verify/
+_tmptest/

@@ -1,7 +1,8 @@
-﻿#include "RenderHook.h"
+#include "RenderHook.h"
 #include "CheatState.h"
 #include "GameBridge.h"
 #include "GameRecorder.h"
+#include "StreamMode.h"
 #include "Log.h"
 #include "Menu.h"
 
@@ -59,6 +60,9 @@ namespace RenderHook
     static WNDPROC g_origWndProc = nullptr;
     static IDXGISwapChain* g_sc = nullptr;       // 当前渲染的交换链（游戏主窗口）
     static IDXGISwapChain3* g_sc3 = nullptr;
+    // 每帧从交换链回读的窗口句柄：Unity 切换分辨率/全屏模式会重建窗口，
+    // 旧的 g_hwnd 客户区会变成 0x0（实测覆盖层连续几十秒判定为 0x0 而不绘制）。
+    static HWND g_scHwnd = nullptr;
 
     static ID3D12Device* g_dev12 = nullptr;
     static ID3D12CommandQueue* g_queue12 = nullptr;     // ECL 钩子捕获的 Unity 直队列
@@ -502,7 +506,9 @@ namespace RenderHook
             ImGui_ImplDX12_InitInfo info = {};
             info.Device = g_dev12;
             info.CommandQueue = g_queue12;   // Unity 直队列（ECL 钩子捕获）
-            info.NumFramesInFlight = (int)kNumFramesInFlight;
+            // 直播模式每帧会对 ImGui 后端额外调用一次 RenderDrawData（受保护部分画到覆盖窗口），
+            // 顶点/索引环要相应加大，否则会与 GPU 争用同一份上传缓冲。
+            info.NumFramesInFlight = (int)kNumFramesInFlight * 3;
             info.RTVFormat = desc.BufferDesc.Format;
             info.DSVFormat = DXGI_FORMAT_UNKNOWN;
             info.SrvDescriptorHeap = g_srvHeap12;
@@ -528,6 +534,9 @@ namespace RenderHook
         g_api.store(api, std::memory_order_release);
         g_imguiReady.store(true, std::memory_order_release);
 
+        StreamMode::Attach(g_dev11, g_ctx11, g_dev12, g_queue12, g_srvHeap12,
+                           (unsigned)desc.BufferDesc.Format);
+
         g_origWndProc = (WNDPROC)SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)HK_WndProc);
 
         // 桥接主线程初始化通道（PostMessage → 主线程 WndProc）
@@ -549,6 +558,14 @@ namespace RenderHook
 
         // 每帧打点：主线程侧凭它判断"游戏还在出帧"，退出/设备丢失时自动停手
         CheatState::LastPresentMs.store((unsigned long)GetTickCount(), std::memory_order_relaxed);
+
+        // 刷新交换链所属窗口：Unity 重建窗口（切换分辨率/全屏）后 g_hwnd 可能失效，
+        // 客户区读到 0x0 会让覆盖层整帧跳过（谱面不显示）。
+        {
+            DXGI_SWAP_CHAIN_DESC sd{};
+            if (SUCCEEDED(sc->GetDesc(&sd)) && sd.OutputWindow)
+                g_scHwnd = sd.OutputWindow;
+        }
 
         // 游戏已进入退出流程：不做任何绘制/捕获/录制（录制只收尾一次），
         // 避免在设备销毁过程中与 Unity 抢资源或阻塞退出。
@@ -754,9 +771,22 @@ namespace RenderHook
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+        StreamMode::BeginFrame();
         Menu::Draw();
         ImGui::Render();
-        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_cmdList12);
+        {
+            float gw = 0.f, gh = 0.f;
+            GetGameWindowSize(&gw, &gh);
+            bool windowed = true;
+            DXGI_SWAP_CHAIN_DESC sdd = {};
+            if (SUCCEEDED(sc3->GetDesc(&sdd))) windowed = (sdd.Windowed != FALSE);
+            StreamMode::SetGameWindow(g_hwnd, gw, gh, windowed);
+        }
+        // 直播模式：受保护元素从游戏后缓冲剔除，改画到"防采集覆盖窗口"
+        //（人眼在屏幕上照常可见；OBS / 直播姬 / 录像软件抓不到）。
+        ImDrawData* dd12 = StreamMode::FilterForGame(ImGui::GetDrawData());
+        ImGui_ImplDX12_RenderDrawData(dd12, g_cmdList12);
+        StreamMode::RenderOverlay(ImGui::GetDrawData(), g_cmdList12);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -766,6 +796,7 @@ namespace RenderHook
         t_inOurRender = true;
         g_queue12->ExecuteCommandLists(1, (ID3D12CommandList* const*)&g_cmdList12);
         t_inOurRender = false;
+        StreamMode::AfterExecute();
 
         g_queue12->Signal(g_fence12, ++g_fenceLast);
         fc.fenceValue = g_fenceLast;
@@ -890,13 +921,25 @@ namespace RenderHook
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+        StreamMode::BeginFrame();
         Menu::Draw();
         ImGui::Render();
+        {
+            float gw = 0.f, gh = 0.f;
+            GetGameWindowSize(&gw, &gh);
+            bool windowed = true;
+            DXGI_SWAP_CHAIN_DESC sdd = {};
+            if (SUCCEEDED(sc->GetDesc(&sdd))) windowed = (sdd.Windowed != FALSE);
+            StreamMode::SetGameWindow(g_hwnd, gw, gh, windowed);
+        }
 
+        ImDrawData* dd11 = StreamMode::FilterForGame(ImGui::GetDrawData());
         g_ctx11->OMSetRenderTargets(1, &g_rtv11[bb], nullptr);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        ImGui_ImplDX11_RenderDrawData(dd11);
         ID3D11RenderTargetView* nullRTV = nullptr;
         g_ctx11->OMSetRenderTargets(1, &nullRTV, nullptr);
+        StreamMode::RenderOverlay(ImGui::GetDrawData(), nullptr);
+        StreamMode::AfterExecute();
     }
 
     // ============ 钩子 ============
@@ -916,6 +959,9 @@ namespace RenderHook
 
     static HRESULT WINAPI HK_ResizeBuffers(IDXGISwapChain* sc, UINT bufCount, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags)
     {
+        // 注意：这里**不要**调用 StreamMode::Shutdown()！销毁覆盖窗口会让接下来几帧
+        // FilterForGame 无法隐藏 → 受保护元素画回游戏后缓冲 → 推流"一闪而过"。
+        // 尺寸变化由 StreamMode 内部 SyncGeometry() 原地重建 GPU 资源（窗口含 WDA 防采集属性保留）。
         ReleaseRT12();
         ReleaseRT11();
         ReleaseCapture();
@@ -1188,6 +1234,7 @@ namespace RenderHook
         }
 
         // 4) 释放 D3D 资源
+        StreamMode::Shutdown();
         ReleaseRT12();
         ReleaseRT11();
         ReleaseCapture();
@@ -1220,16 +1267,26 @@ namespace RenderHook
 
     void GetGameWindowSize(float* w, float* h)
     {
-        *w = 1280.f; *h = 720.f;
-        if (g_hwnd)
-        {
+        // 分辨率解析顺序：主窗口 → 交换链窗口 → 上一帧有效值 → 桌面。
+        // 最小化/窗口重建期间客户区会短暂为 0x0，此时必须沿用上一帧有效尺寸，
+        // 否则 DrawPlayfield 整帧跳过（症状：谱面忽然不显示）。
+        static float s_lastW = 1280.f, s_lastH = 720.f;
+        auto clientSize = [](HWND hwnd, float* cw, float* ch) -> bool {
+            if (!hwnd) return false;
             RECT rc;
-            if (GetClientRect(g_hwnd, &rc))
-            {
-                *w = (float)(rc.right - rc.left);
-                *h = (float)(rc.bottom - rc.top);
-            }
+            if (!GetClientRect(hwnd, &rc)) return false;
+            const float a = (float)(rc.right - rc.left), b = (float)(rc.bottom - rc.top);
+            if (a < 200.f || b < 200.f) return false;
+            *cw = a; *ch = b;
+            return true;
+        };
+        float cw = 0.f, ch = 0.f;
+        if (!clientSize(g_hwnd, &cw, &ch) && !clientSize(g_scHwnd, &cw, &ch))
+        {
+            cw = s_lastW; ch = s_lastH;
         }
+        s_lastW = cw; s_lastH = ch;
+        *w = cw; *h = ch;
     }
 
     // ============ 皮肤贴图加载（WIC 解码，DX11 / DX12 各一条上传路径） ============

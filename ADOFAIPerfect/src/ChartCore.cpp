@@ -5,13 +5,17 @@
 #include "CheatState.h"
 #include "MonoApi.h"
 #include "GameBridge.h"
+#include "GameDetour.h"
 #include "Lang.h"
 #include "Log.h"
 #include "RenderHook.h"
 #include "SkinMsp.h"
 #include "SkinLua.h"
+#include "StreamMode.h"
+#include "UiKit.h"
 
 #include "imgui.h"
+#include "GameDir.h"
 #include "imgui_internal.h"
 #include <windows.h>
 #include <shellapi.h>
@@ -44,7 +48,8 @@ void* RenderHook_LoadTexture(const char* path);
 //   scrFloor.angleLength    该块旋转的绝对角度（弧度 0..2π，长按块额外含
 //                           holdLength*2π）—— 见 CalculateSingleFloorAngleLength
 //   scrFloor.isCCW          该块方向（true = 逆时针）
-//   scrFloor.tapsNeeded     多次点击块；holdLength>0 = 长按块
+//   scrFloor.tapsNeeded     多次点击块；holdLength>=0 = 长按块（-1 = 普通块，
+//                           0 = 最短长条，见 scrLevelMaker.DrawHolds 的 `>= 0`）
 //   scrConductor._songposition_minusi  当前歌曲位置（与 entryTime 同单位）
 //     = (dspTime - dspTimeSong - calibration_i) * song.pitch - addoffset
 //   scrConductor.bpm        当前 BPM
@@ -58,12 +63,54 @@ namespace Chart4K
     using namespace MonoApi;
 
     // ---------------- 用户设置（按键位模式分组：0=4K 1=5K 2=6K 3=10K） ----------------
-    const int kLanesOf[kModeN] = { 4, 5, 6, 10 };   // 定义（声明见 ChartCore.h）
+    //   0=4K 1=5K 2=6K 3=10K 4=16K(PAD) 5=CATCH(8 吸附区) 6=8K(ASDF|JKL;) 7=OSU(2 个点击键 Z/X)
+    const int kLanesOf[kModeN] = { 4, 5, 6, 10, 16, 8, 8, 2 };
     // 转换风格：经典 = 原每模式引擎；叠/技/乱/切 = 四套独立算法
     enum ConvStyle { kStyleClassic = 0, kStyleJack = 1, kStyleTech = 2, kStyleRandom = 3, kStyleTrill = 4,
                      kStyleAdo = 5 };   // 冰火手法（ADOFAI）：轮指(混F/插J/插DF) / 交互 / 押轮拆手
     static const char* kStyleNames[6] = { "\u7ecf\u5178", "\u53e0", "\u6280", "\u4e71", "\u5207",
-                                          "\u51b0\u706b\u624b\u6cd5" };
+                                          "\u51b0\u706b\u624b\u6cd5\u00b7\u62c6\u624b\u5e8f" };   // 冰火手法·拆手序
+    // CATCH 专用手法（osu!catch 的移动语汇：walk / dash / hyperdash / edge dash / stair）——
+    // 无轨雨用不上 4K 的"叠/技/乱/切"（那些是键位手法），所以单独一套名字。
+    static const char* kCatchStyleNames[6] = {
+        "\u7ecf\u5178",                 // 经典  Classic：跟随冰火旋转角（长阶梯 + 折返大跳）
+        "\u8d70",                       // 走    Walk：相邻区之间的小步走位
+        "\u51b2",                       // 冲    Dash：保持冲刺距离，来回跨区
+        "\u8d85\u51b2",                 // 超冲  Hyper：大跨度滑行（hyperdash）
+        "\u8fb9\u51b2",                 // 边冲  Edge：贴左右边缘来回（edge dash / pixel dash）
+        "\u9636\u68af",                 // 阶梯  Stair：单调同向步进，只在边界折返
+    };
+    // OSU（戳泡泡）专用手法：取自 osu! standard 的移动语汇（osu! wiki: Gameplay/Jump, Stream）
+    //   Jump   = 1/2 拍大间距（快速甩动、单点）；
+    //   Stream = 1/4 拍密集小间距（同向连打、指交替）。
+    static const char* kOsuStyleNames[6] = {
+        "\u7ecf\u5178",                 // 经典  Classic：跟随冰火旋转角（大回转大跳、同向长流）
+        "\u8df3",                       // 跳    Jump：1/2 拍式大间距单点
+        "\u4e32",                       // 串    Stream：1/4 拍式密集同向小间距
+        "\u4ea4\u4e92",                 // 交互  Alt：跳 / 串交替
+        "\u53cc\u62bc",                 // 双押  Doubles：成对叠放
+        "\u6280\u672f",                 // 技术  Tech：间距抖动 + 角度跟随
+    };
+    // 16K（PAD）专用手法：经典 16K 写谱语汇（jubeat / Malody Pad 惯例）——
+    // 与轨道模式的"叠/技/乱/切"完全不同：面板谱是空间谱，手法 = 邻接移动 /
+    // 绕环 / 阶梯 / 十字图形 / 双板交互 / 冰火拆手序（火左冰右 + 押按拆手）。
+    static const char* kPadStyleNames[6] = {
+        "\u7ecf\u5178",                 // 经典 Classic：邻接移动 + 双手分区平衡
+        "\u7ed5\u73af",                 // 绕环 Ring：沿外圈 12 板回旋（方向跟星球）
+        "\u9636\u68af",                 // 阶梯 Stair：行 / 列 / 对角线单调阶梯，端点折返
+        "\u5341\u5b57",                 // 十字 Cross：沿十字臂行走的图形谱
+        "\u4ea4\u4e92",                 // 交互 Trill：双板交替（音押 trill）
+        "\u51b0\u706b\u62c6\u624b\u5e8f",   // 冰火拆手序：火左冰右严格交替 + 押按拆手分配
+    };
+    // 该模式下一套"转换风格 / 手法"的名字（16K / CATCH / OSU 用各自的无轨手法名）
+    static inline const char* StyleNameOf(int mi, int style)
+    {
+        if (style < 0 || style > 5) style = 0;
+        if (mi == kModeCatch) return kCatchStyleNames[style];
+        if (mi == kModeOsu)   return kOsuStyleNames[style];
+        if (mi == kModePad)   return kPadStyleNames[style];
+        return kStyleNames[style];
+    }
     const char* ModeDesc(int mi)
     {
         switch (mi)
@@ -71,26 +118,40 @@ namespace Chart4K
         case 0:  return ModeDesc4K();
         case 1:  return ModeDesc5K();
         case 2:  return ModeDesc6K();
-        default: return ModeDesc10K();
+        case 3:  return ModeDesc10K();
+        case 4:  return ModeDesc16K();
+        case 5:  return ModeDescCatch();
+        case 6:  return ModeDesc8K();
+        case 7:  return ModeDescOsu();
+        default: return ModeDesc4K();
         }
     }
     // 默认键位：4K=DFJK ／ 5K=SDFJK ／ 6K=SDFJKL ／ 10K=ASDFG + HJKL;（菜单可改，确认才生效）
-    static const int kVKDefs[kModeN][10] = {
-        { 'D', 'F', 'J', 'K', 0, 0, 0, 0, 0, 0 },
-        { 'S', 'D', 'F', 'J', 'K', 0, 0, 0, 0, 0 },
-        { 'S', 'D', 'F', 'J', 'K', 'L', 0, 0, 0, 0 },
-        { 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 0xBA },   // 0xBA = ';'
+    static const int kVKDefs[kModeN][kMaxLanes] = {
+        { 'D', 'F', 'J', 'K', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 'S', 'D', 'F', 'J', 'K', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 'S', 'D', 'F', 'J', 'K', 'L', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 0xBA, 0, 0, 0, 0, 0, 0 },  // 0xBA = ';'
+        // 16K(PAD) 4x4，index=row*4+col：1 2 3 4 / Q W E R / A S D F / Z X C V
+        { 0x31, 0x32, 0x33, 0x34, 0x51, 0x57, 0x45, 0x52,
+          0x41, 0x53, 0x44, 0x46, 0x5A, 0x58, 0x43, 0x56 },
+        // CATCH：8 个吸附位置的键（默认 A S D F J K L ;）
+        { 0x41, 0x53, 0x44, 0x46, 0x4A, 0x4B, 0x4C, 0xBA, 0, 0, 0, 0, 0, 0, 0, 0 },
+        // 8K：ASDF | JKL;（左右手各 4 键）
+        { 'A', 'S', 'D', 'F', 'J', 'K', 'L', 0xBA, 0, 0, 0, 0, 0, 0, 0, 0 },
+        // OSU：两个点击键（osu! 默认 Z / X）；鼠标左/右键同时可用
+        { 'Z', 'X', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     };
-    static std::atomic<bool> s_en[kModeN] = { { false }, { false }, { false }, { false } };  // 四模式互斥
-    static std::atomic<int>  s_speed[kModeN]    = { { 4 }, { 5 }, { 6 }, { 7 } };   // Malody 式流速
-    static std::atomic<int>  s_offsetMS[kModeN] = { { 0 }, { 0 }, { 0 }, { 0 } };   // 额外延迟补偿
-    static std::atomic<int>  s_style[kModeN]    = { { 0 }, { 0 }, { 0 }, { 0 } };   // 转换风格（ConvStyle）   // 转换风格（ConvStyle）
-    static std::atomic<bool> s_upHide[kModeN]   = { { false }, { false }, { false }, { false } };  // 上隐
-    static std::atomic<bool> s_dnHide[kModeN]   = { { false }, { false }, { false }, { false } };  // 下隐
-    static std::atomic<bool> s_autoOff[kModeN]  = { { false }, { false }, { false }, { false } };  // 自动调整延迟
+    static std::atomic<bool> s_en[kModeN] = { { false }, { false }, { false }, { false }, { false }, { false }, { false }, { false } };  // 八模式互斥
+    static std::atomic<int>  s_speed[kModeN]    = { { 4 }, { 5 }, { 6 }, { 7 }, { 6 }, { 5 }, { 6 }, { 6 } };   // Malody 式流速
+    static std::atomic<int>  s_offsetMS[kModeN] = { { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 } };   // 额外延迟补偿
+    static std::atomic<int>  s_style[kModeN]    = { { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 } };   // 转换风格（ConvStyle）
+    static std::atomic<bool> s_upHide[kModeN]   = { { false }, { false }, { false }, { false }, { false }, { false }, { false }, { false } };  // 上隐
+    static std::atomic<bool> s_dnHide[kModeN]   = { { false }, { false }, { false }, { false }, { false }, { false }, { false }, { false } };  // 下隐
+    static std::atomic<bool> s_autoOff[kModeN]  = { { false }, { false }, { false }, { false }, { false }, { false }, { false }, { false } };  // 自动调整延迟
     // 自动打歌 / 宏打歌 / 录制（内部虚拟按键与 GPU 回读；绝不注入系统键鼠、绝不改游戏内存）
-    static std::atomic<bool> s_autoPlay[kModeN] = { { false }, { false }, { false }, { false } };  // 自动打歌（100% 精准）
-    static std::atomic<bool> s_macroPlay[kModeN]= { { false }, { false }, { false }, { false } };  // 宏打歌（拟人化）
+    static std::atomic<bool> s_autoPlay[kModeN] = { { false }, { false }, { false }, { false }, { false }, { false }, { false }, { false } };  // 自动打歌（100% 精准）
+    static std::atomic<bool> s_macroPlay[kModeN]= { { false }, { false }, { false }, { false }, { false }, { false }, { false }, { false } };  // 宏打歌（拟人化）
     static std::atomic<int>  s_macroAcc{ 98 };     // 宏打歌目标精准度（90..100）
     static std::atomic<int>  s_macroHuman{ 60 };   // 拟人抖动强度（0..100）
     static std::atomic<bool> s_recOn{ false };     // 录制开关
@@ -118,26 +179,62 @@ namespace Chart4K
     static std::atomic<bool>  s_miniOn{ true };
     static std::atomic<int>   s_miniX{ 16 }, s_miniY{ 848 };
     static std::atomic<int>   s_miniW{ 384 }, s_miniH{ 216 };
+    // 伪双押优化（每模式独立）：0=关，>0=开。冰与火里大量"两砖间隔极小（角度 1° 级）"
+    // 的伪双押，实际打法就是双手同刻 —— 开启后合并成真正的双押（详见 BuildChart）。
+    static std::atomic<int>   s_pseudo2[kModeN] = { { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 } };
+    // 伪双押判定的"绝对时间窗口"（毫秒）。冰火里 转角→时间 取决于 BPM×speed
+    //   Δt = 转角/180° × 30/(BPM×speed)  秒   （反编译 scrMisc.GetTimeBetweenAngles 已核对）
+    // 所以固定一个毫秒窗口就等价于"角度上限随 BPM 自动伸缩"——这就是自动 BPM 自调配：
+    //   30° @ 80BPM = 125ms（普通音）· @120BPM = 83ms · @250BPM = 40ms（伪双押）。
+    // 45ms ≈ >22 音/秒，人手无法分成两下（与本文件多押展开阈值一致）。
+    static const double kPDSharpDeg = 30.1;   // 游戏 GetMultipressPenalty 的"短砖"分界（30°）
+    static double PseudoDoubleWindowMs()
+    {
+        double ms = 45.0;
+        char env[16] = { 0 };
+        if (GetEnvironmentVariableA("ADOFAI_PERFECT_PD_MS", env, sizeof(env)) > 0)
+        {
+            const int v = atoi(env);
+            if (v >= 5 && v <= 200) ms = (double)v;   // 回归测试可覆盖窗口
+        }
+        return ms;
+    }
+    // 冰火手法（拆手序）旋钮：最大硬抗 BPM（越低越偏轮指）/ 轮指方向（0 外轮 K J·D F，1 内轮 J K·F D）
+    static std::atomic<int>   s_hardResist[kModeN] = { { 840 }, { 840 }, { 840 }, { 840 }, { 840 }, { 840 }, { 840 }, { 840 } };
+    static std::atomic<int>   s_innerRoll[kModeN]  = { { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 } };
+    // CATCH v2：漏音即死 / 接盘宽度（千分比，160 = 屏宽 16%）
+    static std::atomic<bool>  s_catchKill[kModeN]   = { { true }, { true }, { true }, { true }, { true }, { true }, { true }, { true } };
+    static std::atomic<int>   s_catchPlateW[kModeN] = { { 160 }, { 160 }, { 160 }, { 160 }, { 160 }, { 160 }, { 160 }, { 160 } };
 
     // 多押砖（tapsNeeded>1）固定按"自动"处理：平均间隔 >= 75ms 完整展开，
     // 更密的（>13 NPS，人手按不出来）合并为 1 个。
 
     // 键位（每模式独立，菜单里可改，确认后才生效）
-    static std::atomic<int> s_vk[kModeN][10] = {
+    static std::atomic<int> s_vk[kModeN][kMaxLanes] = {
         { { 'D' }, { 'F' }, { 'J' }, { 'K' } },
         { { 'S' }, { 'D' }, { 'F' }, { 'J' }, { 'K' } },
         { { 'S' }, { 'D' }, { 'F' }, { 'J' }, { 'K' }, { 'L' } },
         { { 'A' }, { 'S' }, { 'D' }, { 'F' }, { 'G' }, { 'H' }, { 'J' }, { 'K' }, { 'L' }, { 0xBA } },
+        { { 0x31 }, { 0x32 }, { 0x33 }, { 0x34 }, { 0x51 }, { 0x57 }, { 0x45 }, { 0x52 },
+          { 0x41 }, { 0x53 }, { 0x44 }, { 0x46 }, { 0x5A }, { 0x58 }, { 0x43 }, { 0x56 } },
+        { { 0x41 }, { 0x53 }, { 0x44 }, { 0x46 }, { 0x4A }, { 0x4B }, { 0x4C }, { 0xBA } },
+        { { 'A' }, { 'S' }, { 'D' }, { 'F' }, { 'J' }, { 'K' }, { 'L' }, { 0xBA } },
+        { { 'Z' }, { 'X' } },
     };
-    static int  s_draft[kModeN][10] = {
-        { 'D', 'F', 'J', 'K', 0, 0, 0, 0, 0, 0 },
-        { 'S', 'D', 'F', 'J', 'K', 0, 0, 0, 0, 0 },
-        { 'S', 'D', 'F', 'J', 'K', 'L', 0, 0, 0, 0 },
-        { 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 0xBA },
+    static int  s_draft[kModeN][kMaxLanes] = {
+        { 'D', 'F', 'J', 'K', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 'S', 'D', 'F', 'J', 'K', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 'S', 'D', 'F', 'J', 'K', 'L', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 0xBA, 0, 0, 0, 0, 0, 0 },
+        { 0x31, 0x32, 0x33, 0x34, 0x51, 0x57, 0x45, 0x52,
+          0x41, 0x53, 0x44, 0x46, 0x5A, 0x58, 0x43, 0x56 },
+        { 0x41, 0x53, 0x44, 0x46, 0x4A, 0x4B, 0x4C, 0xBA, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 'A', 'S', 'D', 'F', 'J', 'K', 'L', 0xBA, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 'Z', 'X', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     };
-    static bool s_keyEdit[kModeN] = { false, false, false, false };  // 是否处于编辑（未确认）状态
-    static int  s_keyCap[kModeN]  = { -1, -1, -1, -1 };              // 正在等待新键的槽位
-    static bool s_keyInit[kModeN] = { false, false, false, false };
+    static bool s_keyEdit[kModeN] = { false, false, false, false, false, false, false, false };  // 是否处于编辑（未确认）状态
+    static int  s_keyCap[kModeN]  = { -1, -1, -1, -1, -1, -1, -1, -1 };              // 正在等待新键的槽位
+    static bool s_keyInit[kModeN] = { false, false, false, false, false, false, false, false };
     static void KeyName(int vk, char* out, size_t n);   // 定义在下方（键位编辑）
 
     // 当前启用的键位模式（-1 = 全部关闭）
@@ -217,9 +314,38 @@ namespace Chart4K
     static std::vector<Note> s_notes;
     static void* s_chartKey = nullptr;   // 谱面识别键（List._items 指针）
     static int   s_chartFloorN = 0;      // 谱面识别键（地砖数：防止指针地址复用误判为同谱）
+    static std::atomic<bool> s_forceChartRebuild{ false };   // 强制重建（进入新关卡/内容指纹变化）
+    static std::atomic<bool> s_chartRewind{ false };         // 歌曲时刻大回卷（重开 / 连续进入下一关）
     static int   s_chartSize = 0;
     static std::atomic<double> s_chartEndT{ 0.0 };   // last note time + slack (fallback gate)
     static double s_lastSongT = -1e9;
+
+    // ---- 谱面提取 / 重建的运行状态（提升到文件作用域，交给 InvalidateChart 统一作废）----
+    //   为什么要统一作废：任何一条残留（提取计时器 / 内容指纹基线 / 构建签名）都可能让
+    //   "换歌之后读不出新谱面"，或者把上一首的谱面当成本曲继续显示。
+    static DWORD    g_lastExtract   = 0;      // 上次提取时刻（ms）
+    static bool     g_lastExtractOK = false;  // 上次是否取到谱面
+    static int      g_lastModeSig   = -1000;  // 模式/风格签名
+    static unsigned g_lastFp        = 0u;     // 上一个谱面内容指纹
+    // BuildChart 的"原始地砖指纹"（内容未变 → 不重跑转换算法）
+    static bool     g_rawValid      = false;
+    static unsigned g_rawFp         = 0u;
+    static int      g_rawN          = -1;
+    static int      g_rawModeSig    = -1;
+
+    static bool     g_sigValid      = false;  // 构建签名是否有效（作废后绝不复用）
+    static int      g_sigSize       = -1;
+    static double   g_sigFirst = 0.0, g_sigLast = 0.0, g_sigLaneSum = 0.0;
+    static int      g_sigMode = -1, g_sigStyle = -1, g_sigCols = -1;
+    static int      g_lastBuilt = -1;
+    // ---- 关卡存在性锁存（抗瞬时误判）----
+    //   scrController.get_instance() 在切场景瞬间可能返回 null，gameworld 也可能闪断一帧。
+    //   旧逻辑"一帧 null / gameworld=false 就清空谱面"→ 进关卡时覆盖层整段消失（
+    //   正是"有时候进关卡不显示转谱谱面"的直接原因）。改为进入后锁存，
+    //   只有连续 900ms 都判定为"不在关卡"才真正退出并清空。
+    static bool     s_levelLatch = false;
+    static DWORD    s_levelGoneSince = 0;
+    static std::atomic<void*> s_ctrlLastGood{ nullptr };   // 最近一次有效的 scrController
     static char  s_diag[192] = { 0 };
 
     // ---------------- 4K 自算成绩（玩家 DFJK 判定） ----------------
@@ -272,7 +398,7 @@ namespace Chart4K
         { 30.0,  75.0, 150.0 },
         { 45.0, 100.0, 200.0 },
     };
-    static std::atomic<int> s_judgeSet[kModeN] = { { 1 }, { 1 }, { 1 }, { 1 } };
+    static std::atomic<int> s_judgeSet[kModeN] = { { 1 }, { 1 }, { 1 }, { 1 }, { 1 }, { 1 }, { 1 }, { 1 } };
     static inline int JudgeSet()
     {
         int mi = ActiveModeIndex();
@@ -297,6 +423,8 @@ namespace Chart4K
     static std::vector<uint8_t> s_consumed;         // 音符是否已被击中（与 s_notes 同尺寸）
     static std::vector<uint8_t> s_missed;           // 音符是否已判定漏掉
     static std::vector<uint8_t> s_tailDone;         // 长按尾端：0=未判 1=已判 2=提前松手(断)
+    static std::vector<float>   s_catchX;           // CATCH：与 s_notes 同尺寸的连续横向坐标 [0,1]
+    static std::vector<float>   s_osuX, s_osuY;     // OSU：与 s_notes 同尺寸的判定场落点 [0,1]x[0,1]
     static float                s_laneFlash[kMaxLanes] = {};  // 判定闪条强度
     static float                s_laneHitBg[kMaxLanes] = {};  // 判定底光强度
 
@@ -357,6 +485,7 @@ namespace Chart4K
     }
 
     static const char* BuiltinSkinDir();
+    static const char* SkinDir();
     // 皮肤模式只读一次：true=内置皮肤（固定版式，ChartCore 自绘）；false=外部 .msp 皮肤（数据驱动）
     static void SkinModeLoadOnce()
     {
@@ -374,6 +503,72 @@ namespace Chart4K
         char mode[32] = { 0 };
         I18N::Prefs::GetStr("skin_mode", mode, sizeof(mode), "builtin");
         s_skinBuiltin.store(!(mode[0] && _stricmp(mode, "msp") == 0), std::memory_order_relaxed);
+    }
+
+    // ---- 每模式皮肤覆盖（PAD / CATCH / 4K / 5K / 6K / 10K 皮肤互不通用）----
+    //   · 未设置过覆盖的模式 → 沿用全局皮肤（内置或外部 MSP）
+    //   · 设置过覆盖的模式 → 该模式单独用指定皮肤 / 内置皮肤
+    //   持久化在 adofai_perfect.cfg：skin_mode_m<mi> / skin_dir_m<mi>
+    static char s_skinDirMode[kModeN][MAX_PATH * 2] = {};
+    static bool s_skinBuiltinModeOv[kModeN] = {};
+    static bool s_skinModeOvSet[kModeN] = {};
+    static bool s_skinOvLoaded = false;
+    static int  s_loadSkinMode = -1;      // LoadSkin() 当前加载的模式（-1=全局）
+
+    static void SkinModeOverrideLoadOnce()
+    {
+        if (s_skinOvLoaded) return;
+        s_skinOvLoaded = true;
+        // 迁移：16K（PAD）历史上可能存过外部皮肤 → 统一改回内置（该模式只支持内置皮肤）
+        {
+            char k[32], v[16] = { 0 };
+            snprintf(k, sizeof(k), "skin_mode_m%d", kModePad);
+            I18N::Prefs::GetStr(k, v, sizeof(v), "");
+            if (v[0] && _stricmp(v, "builtin") != 0)
+            {
+                I18N::Prefs::SetStr(k, "builtin");
+                I18N::Prefs::Save();
+                Log::Printf("[skin] migrate mode%d -> builtin (PAD is built-in only)", kModePad);
+            }
+        }
+        for (int mi = 0; mi < kModeN; mi++)
+        {
+            char k[32], v[16] = { 0 };
+            snprintf(k, sizeof(k), "skin_mode_m%d", mi);
+            I18N::Prefs::GetStr(k, v, sizeof(v), "");
+            if (!v[0]) continue;
+            s_skinModeOvSet[mi] = true;
+            s_skinBuiltinModeOv[mi] = (_stricmp(v, "builtin") == 0);
+            if (!s_skinBuiltinModeOv[mi])
+            {
+                char d[MAX_PATH * 2] = { 0 };
+                snprintf(k, sizeof(k), "skin_dir_m%d", mi);
+                I18N::Prefs::GetStr(k, d, sizeof(d), "");
+                if (d[0]) snprintf(s_skinDirMode[mi], sizeof(s_skinDirMode[mi]), "%s", d);
+            }
+        }
+    }
+    static bool SkinBuiltinEff()
+    {
+        // 16K（PAD）是 Malody Pad 式 4x4 面板：外部 MSP 皮肤是为"轨道"写的，
+        // 套到面板上必然错位 → 该模式永远只用内置皮肤（需求，非降级）。
+        if (s_loadSkinMode == kModePad || s_loadSkinMode == kModeOsu) return true;
+        SkinModeOverrideLoadOnce();
+        if (s_loadSkinMode >= 0 && s_loadSkinMode < kModeN && s_skinModeOvSet[s_loadSkinMode])
+            return s_skinBuiltinModeOv[s_loadSkinMode];
+        return s_skinBuiltin.load(std::memory_order_relaxed);
+    }
+    static const char* SkinDirEff()
+    {
+        if (s_loadSkinMode == kModePad || s_loadSkinMode == kModeOsu) return BuiltinSkinDir();
+        SkinModeOverrideLoadOnce();
+        if (s_loadSkinMode >= 0 && s_loadSkinMode < kModeN && s_skinModeOvSet[s_loadSkinMode])
+        {
+            if (s_skinBuiltinModeOv[s_loadSkinMode]) return BuiltinSkinDir();
+            if (s_skinDirMode[s_loadSkinMode][0])    return s_skinDirMode[s_loadSkinMode];
+            return BuiltinSkinDir();
+        }
+        return SkinDir();
     }
 
     static bool TrySkinRoot(const char* steamRoot, char* out, size_t n)
@@ -454,15 +649,14 @@ namespace Chart4K
         if (s_skinDir[0])
             return s_skinDir;
 
-        // 1a) 内置皮肤模式：固定使用发布包自带皮肤（<DLL目录>\skin 根 = Rurudo 4K VI），
-        //     完全忽略外部 skin_dir；外部 .msp 模式才使用下方 skin_dir 解析链。
+        // 1a) 内置皮肤模式：只用 DLL 近邻的 KSkin / skin（不硬编码路径）。
+        //     找不到内置皮肤文件就返回空 → 调用方不绘制（用户要求，绝不用错乱兜底图）。
         if (s_skinBuiltin.load(std::memory_order_relaxed))
         {
             const char* b = BuiltinSkinDir();
             if (b && b[0] && DirHasSkin(b))
                 snprintf(s_skinDir, sizeof(s_skinDir), "%s", b);
-            if (s_skinDir[0])
-                return s_skinDir;
+            return s_skinDir;
         }
 
         // 1b) 设置页 / 皮肤页保存的 skin_dir（Prefs）
@@ -575,12 +769,89 @@ namespace Chart4K
         return s_skinDir;
     }
     // ---------------- 皮肤贴图（Malody MSP 角色表 + 内置回退） ----------------
-    static const char* BuiltinSkinDir()
+    const char* ModuleDirPath()
     {
         static char s_dir[MAX_PATH * 2] = { 0 };
         if (!s_dir[0])
-            SkinMsp::DefaultRoot(s_dir, sizeof(s_dir));
+        {
+            HMODULE hm = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)&ModuleDirPath, &hm) && hm)
+                GetModuleFileNameA(hm, s_dir, sizeof(s_dir));
+            if (!s_dir[0])
+                GetModuleFileNameA(nullptr, s_dir, sizeof(s_dir));
+            char* slash = strrchr(s_dir, '\\');
+            if (slash) *slash = 0;
+        }
         return s_dir;
+    }
+    static bool SidecarDirOk(const char* d, const char* probeFile, char* out, int n)
+    {
+        if (!d || !d[0] || !out || n < 2) return false;
+        DWORD a = GetFileAttributesA(d);
+        if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return false;
+        if (probeFile && probeFile[0])
+        {
+            char f[MAX_PATH * 2 + 128];
+            snprintf(f, sizeof(f), "%s\\%s", d, probeFile);
+            DWORD fa = GetFileAttributesA(f);
+            if (fa == INVALID_FILE_ATTRIBUTES || (fa & FILE_ATTRIBUTE_DIRECTORY)) return false;
+        }
+        snprintf(out, (size_t)n, "%s", d);
+        return true;
+    }
+    // 内置资源目录解析（KSkin / CatchSkin / skin）：绝不硬编码盘符或用户名。
+    // 顺序：<DLL目录>\<leaf> → 上溯 1/2/3 级 → <当前工作目录>\<leaf>
+    bool ResolveSidecarDir(const char* leaf, const char* probeFile, char* out, int n)
+    {
+        if (!out || n < 2) return false;
+        out[0] = 0;
+        if (!leaf || !leaf[0]) return false;
+        const char* mod = ModuleDirPath();
+        static const char* kUps[] = { "", "\\..", "\\..\\..", "\\..\\..\\.." };
+        for (int i = 0; i < 4; i++)
+        {
+            char d[MAX_PATH * 2];
+            snprintf(d, sizeof(d), "%s%s\\%s", mod, kUps[i], leaf);
+            if (SidecarDirOk(d, probeFile, out, n)) return true;
+        }
+        char cwd[MAX_PATH * 2] = { 0 };
+        DWORD cn = GetCurrentDirectoryA(sizeof(cwd), cwd);
+        if (cn > 0 && cn < sizeof(cwd))
+        {
+            char d[MAX_PATH * 2];
+            snprintf(d, sizeof(d), "%s\\%s", cwd, leaf);
+            if (SidecarDirOk(d, probeFile, out, n)) return true;
+        }
+        return false;
+    }
+    // 内置皮肤（4K/5K/6K/10K）：DLL 近邻的 KSkin（新布局）/ skin（旧发布包）文件夹。
+    // 找不到皮肤文件就返回空串 —— 调用方据此不绘制（绝不用错乱兜底图糊弄）。
+    static const char* BuiltinSkinDir()
+    {
+        static char s_builtin[MAX_PATH * 2] = { 0 };
+        static bool s_logged = false;
+        // 找不到时不缓存空值 → 皮肤文件夹晚到（用户中途放入 KSkin / 换歌后）可自动恢复。
+        if (!s_builtin[0])
+        {
+            static const char* kLeaf[] = { "KSkin", "skin" };
+            for (int i = 0; i < 2 && !s_builtin[0]; i++)
+            {
+                char d[MAX_PATH * 2] = { 0 };
+                if (!ResolveSidecarDir(kLeaf[i], nullptr, d, (int)sizeof(d))) continue;
+                if (DirHasSkin(d)) { snprintf(s_builtin, sizeof(s_builtin), "%s", d); break; }
+                char sub[MAX_PATH * 2] = { 0 };
+                if (PickSkinSubdir(d, sub, sizeof(sub)))
+                    snprintf(s_builtin, sizeof(s_builtin), "%s", sub);
+            }
+            if (s_builtin[0])
+                Log::Printf("[skin] builtin dir = '%s' (%s)", s_builtin, s_logged ? "ok, late" : "ok");
+            else if (!s_logged)
+                Log::Printf("[skin] builtin dir missing (looked for KSkin / skin next to the DLL)");
+            s_logged = true;
+        }
+        return s_builtin;
     }
     static void* LoadTexAbs(const char* dir, const char* file)
     {
@@ -756,8 +1027,8 @@ namespace Chart4K
     // 每轨音符贴图的可见区域（1080p 基准；notex-1.png 420x400 可见部分只有顶部 185px）
     static float s_noteNatW[kMaxLanes] = {}, s_noteNatH[kMaxLanes] = {};
     static float s_noteU0[kMaxLanes] = {}, s_noteV0[kMaxLanes] = {};
-    static float s_noteU1[kMaxLanes] = { 1,1,1,1,1,1,1,1,1,1 };
-    static float s_noteV1[kMaxLanes] = { 1,1,1,1,1,1,1,1,1,1 };
+    static float s_noteU1[kMaxLanes] = { 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1 };
+    static float s_noteV1[kMaxLanes] = { 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1 };
 
     // MSP 绘制顺序 rank（必须与场景画布一致，见加载处注释）：
     //   0 = layer0/2（世界空间：轨道之下，先画）
@@ -859,7 +1130,7 @@ namespace Chart4K
         }
         if (s_skinLoaded)
             return true;
-        const char* dir = SkinDir();
+        const char* dir = SkinDirEff();
         static SkinMsp::Roles roles{};        // ~180KB（含整屏模块表）→ 必须静态
         bool hasRoles = (dir && dir[0]) ? SkinMsp::Load(dir, &roles) : false;
         // 皮肤模式（持久化于 adofai_perfect.cfg 的 skin_mode=msp|builtin）。默认内置皮肤。
@@ -908,7 +1179,7 @@ namespace Chart4K
         s_digitAspectCombo = s_digitAspectAcc = 0.34f;
         // 内置皮肤隔离：切回内置（或非 MSP）时彻底卸载皮肤 Lua 与模块派生状态，
         // 不留上一个 MSP 皮肤的脚本实例/Clone/Shadow/贴图引用。
-        if ((s_skinBuiltin.load(std::memory_order_relaxed) || !hasRoles) && SkinLua::Active())
+        if ((SkinBuiltinEff() || !hasRoles) && SkinLua::Active())
             SkinLua::Unload();
         for (int i = 0; i < 4; i++)
         {
@@ -917,7 +1188,7 @@ namespace Chart4K
             s_judgeAnimW[i] = 0;
             s_judgeAnimH[i] = 0;
         }
-        if (!s_skinBuiltin.load(std::memory_order_relaxed) && hasRoles && roles.hasModules && roles.modCount > 0)
+        if (!SkinBuiltinEff() && hasRoles && roles.hasModules && roles.modCount > 0)
         {
             s_modN = roles.modCount > SkinMsp::Roles::kMaxMods ? SkinMsp::Roles::kMaxMods : roles.modCount;
             for (int i = 0; i < s_modN; i++) s_mods[i] = roles.mods[i];
@@ -1039,7 +1310,7 @@ namespace Chart4K
         // 内置皮肤严格隔离：内置模式下一律不采用 MSP 角色名（roles.*），全部回退
         // 旧版固定文件名 + 固定参数（数字字型走 DrawDigitsCenter、特效 9 帧 33fps、
         // 不加载 judge 动画、不画 bg.png），保证与旧版 (main) 的渲染一致。
-        if (!(!s_skinBuiltin.load(std::memory_order_relaxed) && hasRoles && dir && dir[0]))
+        if (!(!SkinBuiltinEff() && hasRoles && dir && dir[0]))
             roles = SkinMsp::Roles{};
 
         for (int i = 0; i < kMaxLanes; i++)
@@ -1069,7 +1340,7 @@ namespace Chart4K
                 s_texJudgePop[i] = LoadRoleTex(dir, roles.judgePop[i], jp[i]);
         }
         // 判定动画（Judge 模块 frames>1，如 Malody Gazer 的 AGbest-*）
-        const bool mspActive = !s_skinBuiltin.load(std::memory_order_relaxed) && hasRoles && dir && dir[0];
+        const bool mspActive = !SkinBuiltinEff() && hasRoles && dir && dir[0];
         for (int i = 0; i < 4; i++)
         {
             int cnt = roles.judgeAnimCount[i];
@@ -1649,7 +1920,7 @@ namespace Chart4K
             {
                 void* f = *(void**)((char*)items + 0x20 + (size_t)i * sizeof(void*));
                 RawFloor& r = out[i];
-                r.t = 0; r.tp = 0; r.ang = 0; r.holdLen = 0; r.taps = 1;
+                r.t = 0; r.tp = 0; r.ang = 0; r.holdLen = -1; r.taps = 1;
                 r.ccw = false; r.valid = false;
                 r.midSpin = false; r.fake = false; r.autoPlay = false;
                 if (!f || ((uintptr_t)f & 7) != 0 || (uintptr_t)f < 0x10000)
@@ -1657,7 +1928,7 @@ namespace Chart4K
                 r.t = *(double*)((char*)f + oF_entryTime);
                 r.tp = oF_entryTimePitch ? *(double*)((char*)f + oF_entryTimePitch) : r.t;
                 r.ang = *(double*)((char*)f + oF_angleLen);
-                r.holdLen = oF_hold ? *(int*)((char*)f + oF_hold) : 0;
+                r.holdLen = oF_hold ? *(int*)((char*)f + oF_hold) : -1;
                 r.taps = oF_taps ? *(int*)((char*)f + oF_taps) : 1;
                 r.ccw = *(bool*)((char*)f + oF_isCCW) != 0;
                 bool midSpin = *(bool*)((char*)f + oF_midSpin) != 0;
@@ -1676,6 +1947,62 @@ namespace Chart4K
     }
 
     // 退化路径：从 scrController.firstFloor 沿 prevfloor 回溯到链头再正向收集
+    // 原始地砖逐字段指纹（BuildChart 的"内容未变 → 跳过"快速判定；不依赖结构体填充字节，
+    // 保证同一份地砖每次都得到同一个值）。
+    static unsigned HashFloorRange(const RawFloor* fl, int n)
+    {
+        if (!fl || n <= 0) return 0u;
+        unsigned h = 2166136261u;
+        auto mix = [&h](unsigned v) { h ^= v; h *= 16777619u; };
+        auto mixd = [&](double d) {
+            unsigned long long u = 0; memcpy(&u, &d, sizeof(u));
+            mix((unsigned)(u & 0xFFFFFFFFu)); mix((unsigned)(u >> 32));
+        };
+        for (int i = 0; i < n; i++)
+        {
+            const RawFloor& r = fl[i];
+            mixd(r.t); mixd(r.tp); mixd(r.ang);
+            mix((unsigned)r.holdLen);
+            mix((unsigned)r.taps);
+            mix((r.ccw ? 1u : 0u) | (r.midSpin ? 2u : 0u) | (r.fake ? 4u : 0u) |
+                (r.autoPlay ? 8u : 0u) | (r.valid ? 16u : 0u));
+        }
+        return h ? h : 1u;
+    }
+
+    // 谱面内容指纹：首/中/尾三块砖的 entryTime + angleLength + 对象指针。
+    //   为什么需要：跨曲/切关时 Boehm GC 可能把"同样大小的地砖数组"分配在同一个
+    //   地址上（listFloors = source.OrderBy(..).ToList() 每次都新建数组），此时
+    //   仅比较 List._items 指针会误判为同一张谱 → 新谱面读不出来。内容指纹不同
+    //   就强制重建；同一关内重复提取指纹不变，不会误触发。
+    static unsigned ChartFingerprint(void* items, int count)
+    {
+        if (!items || count <= 0) return 0;
+        unsigned h = 2166136261u;
+        auto mix = [&](unsigned v) { h ^= v; h *= 16777619u; };
+        const int idx[3] = { 0, count / 2, count - 1 };
+        __try
+        {
+            for (int k = 0; k < 3; k++)
+            {
+                void* f = *(void**)((char*)items + 0x20 + (size_t)idx[k] * sizeof(void*));
+                mix((unsigned)(uintptr_t)f);
+                if (!f || ((uintptr_t)f & 7) != 0 || (uintptr_t)f < 0x10000) continue;
+                double et = *(double*)((char*)f + oF_entryTime);
+                double ang = oF_angleLen ? *(double*)((char*)f + oF_angleLen) : 0.0;
+                mix((unsigned)(long long)(et * 1000.0));
+                mix((unsigned)(long long)(ang * 1000.0));
+            }
+        }
+        __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                      ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+        {
+            return 0;
+        }
+        mix((unsigned)count);
+        return h ? h : 1u;
+    }
+
     static int ReadChainRaw(void* firstFloor, RawFloor* out, int cap)
     {
         if (!firstFloor || !out || cap <= 0)
@@ -1698,7 +2025,7 @@ namespace Chart4K
                 r.t = *(double*)((char*)f + oF_entryTime);
                 r.tp = oF_entryTimePitch ? *(double*)((char*)f + oF_entryTimePitch) : r.t;
                 r.ang = *(double*)((char*)f + oF_angleLen);
-                r.holdLen = oF_hold ? *(int*)((char*)f + oF_hold) : 0;
+                r.holdLen = oF_hold ? *(int*)((char*)f + oF_hold) : -1;
                 r.taps = oF_taps ? *(int*)((char*)f + oF_taps) : 1;
                 r.ccw = *(bool*)((char*)f + oF_isCCW) != 0;
                 r.midSpin  = *(bool*)((char*)f + oF_midSpin) != 0;
@@ -2124,8 +2451,14 @@ namespace Chart4K
             ae[(size_t)i].taps = ev[i].taps;
         }
         AdoGen::Cfg cfg;
-        cfg.cols = g.cols;
-        cfg.tier = g.plan.tier;
+        cfg.cols     = g.cols;
+        cfg.tier     = g.plan.tier;
+        cfg.levelBpm = g.plan.bpm;   // 关卡 BPM：拆手序用它做归一化（<=0 时引擎自兜底 100）
+        {
+            const int mr = ModeSettingGet(g.mode, 11);        // 最大硬抗 BPM（越低越偏轮指）
+            if (mr >= 300 && mr <= 1100) cfg.maxHardResistBpm = (double)mr;
+            cfg.outerRoll = (ModeSettingGet(g.mode, 12) != 1);   // 0/缺省 = 外轮 K J / D F
+        }
         std::vector<AdoGen::Lane> al;
         AdoGen::Stats ast;
         AdoGen::Generate(ae.data(), len, cfg, al, &ast);
@@ -2157,9 +2490,10 @@ namespace Chart4K
             g.lastT    = ae[(size_t)len - 1].t;
             g.Hist(le.primary);
         }
-        Log::Printf("[%dK] ado: roll=%d alt=%d chords=%d(%d keys, max %d) ins=%d sw=%d flip=%d",
-                    g.cols, ast.rollNotes, ast.altNotes, ast.chords, ast.chordKeys, ast.maxChord,
-                    ast.inserts, ast.switches, ast.pairFlips);
+        Log::Printf("[%dK] ado(hand-split): win=%d c1=%d c2=%d c3=%d c4+=%d switch=%d base=%.0f %s chords=%d(%d keys, max %d) swap=%d",
+                    g.cols, ast.windows, ast.count1, ast.count2, ast.count3, ast.count4plus,
+                    ast.handSwitches, ast.baseBpm, cfg.outerRoll ? "outer" : "inner",
+                    ast.chords, ast.chordKeys, ast.maxChord, ast.swaps);
     }
     // ---- 技（Tech）：乐句图案库（全键扫/折返/楼梯/之字/锚点/双手括弧） ----
     static void RunTech(Gen& g, const Ev* ev, int len, int* out)
@@ -2593,6 +2927,19 @@ namespace Chart4K
         const int  cols  = kLanesOf[midx];
         const int  style = s_style[midx].load(std::memory_order_relaxed);
 
+        // ---- 内容未变 → 直接返回（不重跑转换算法）----
+        //   周期复检（每 1.5s）会反复调用 BuildChart；若不在此拦下，8K/OSU/CATCH 的
+        //   生成算法会被反复重跑（日志刷屏 + 白白吃 CPU），虽然下面的签名检查能挡住
+        //   "清空连击"，但生成本身的开销挡不住。这里用原始地砖的逐字段指纹先挡一层。
+        const bool force = s_forceChartRebuild.exchange(false, std::memory_order_relaxed);
+        {
+            const unsigned rawFp = HashFloorRange(fl, n);
+            const int modeSig = midx * 8 + style;
+            if (!force && g_rawValid && rawFp == g_rawFp && n == g_rawN && modeSig == g_rawModeSig)
+                return;
+            g_rawValid = true; g_rawFp = rawFp; g_rawN = n; g_rawModeSig = modeSig;
+        }
+
         // ---- 第一遍：地砖 → 事件表（拆多押砖 / 长按 / 合并人类打不出的密押）----
         //   反编译依据（scrPlayer.UpdateHoldBehavior / scrPlanet.perc 的 holdCompletion）：
         //   ADOFAI 的长按块从 entryTime 一直按到"下一砖 entryTime"，**松手这一刻就是
@@ -2612,7 +2959,7 @@ namespace Chart4K
             if (i == holdCoverIdx)
             {
                 holdCoverIdx = -1;
-                if (r.valid && r.holdLen > 0 && lastHoldEv >= 0)
+                if (r.valid && r.holdLen >= 0 && lastHoldEv >= 0)
                 {
                     double tEnd = (i + 1 < n) ? (g_clockSongUnits ? fl[i + 1].t : fl[i + 1].tp) : 0.0;
                     if (tEnd > evs[lastHoldEv].t + 0.02)
@@ -2665,7 +3012,7 @@ namespace Chart4K
                 e.dt   = e.t - prevTe;
                 e.turn = turn / tapsOrig;
                 e.dir  = dir;
-                e.hold = (r.holdLen > 0 && hasNext) ? (float)(t1 - t0) : 0.f;
+                e.hold = (r.holdLen >= 0 && hasNext) ? (float)(t1 - t0) : 0.f;
                 e.taps = (uint8_t)std::min(tapsOrig, 5);
                 prevTe = e.t;
                 if (e.hold > 0.f) lastHoldEv = (int)evs.size();
@@ -2683,12 +3030,23 @@ namespace Chart4K
             if (taps != ((r.taps > 0) ? r.taps : 1))
                 statMashed++;
             // 终点块没有"下一格"，长按无意义，按普通单键处理
-            float hold = (r.holdLen > 0 && hasNext) ? (float)(t1 - t0) : 0.f;
-            const int kStart = covered ? 1 : 0;      // 被松手拍覆盖的砖：首拍不再出键
+            // 长按判定与游戏一致：holdLength > -1（即 >= 0）就是长按块。
+            //   scrLevelMaker.DrawHolds 用 holdLength >= 0 画长条，
+            //   scrPlayer.__nextTileIsHoldCached / UpdateHoldKeys 用 holdLength > -1 判定，
+            //   所以 holdLength == 0 是"最短长条"（只占本砖时长、无额外整圈），
+            //   旧代码用 >0 会把它当普通砖 → 短长条整条不生成、不显示。
+            float hold = (r.holdLen >= 0 && hasNext) ? (float)(t1 - t0) : 0.f;
+            // 长按后面紧跟的砖仍要出键：
+            //   逆向证据（scrPlanet.Update_RefreshAngles / scrPlayer.UpdateHoldBehavior）：
+            //     perc = (song - tile.entryTime) / (next.entryTime - tile.entryTime)
+            //     holdCompletion = perc；松手（holdCompletion ≈ 1）时若 nextTileIsHold
+            //     则什么都不做（继续按 → 链式长按），否则 currFloor.Hit()。
+            //   也就是说"松手时刻 == 下一砖的 entryTime"，下一砖依旧需要**再次按下**
+            //   （同刻松手 + 再按）。所以这里不能丢键，只把它的键位避开长按键即可
+            //   （见下方"长按后紧随短按换键"）。
+            const int kStart = 0;
             if (covered)
                 statHoldCover++;
-            if (kStart >= taps)
-                continue;
             if (hold > 0.f)
                 lastHoldEv = (int)evs.size();
             for (int k = kStart; k < taps; k++)
@@ -2709,12 +3067,73 @@ namespace Chart4K
         //   叠/技/乱/切：四套独立风格算法（同一谱面 + 模式 + 风格 → 稳定输出）
         std::vector<int> lanes(evs.size(), 0);
         std::vector<std::vector<int>> chordExtra;   // 押：每事件的追加键（同刻多键）
-        if (style == kStyleClassic)
+        std::vector<float> catchX;                  // CATCH：每事件的连续横向坐标（无轨道雨）
+        std::vector<float> osuX, osuY;              // OSU：每事件在 512x384 判定场上的落点（归一化 0..1）
+        if (midx == 5)
+        {
+            // CATCH：独立无轨引擎（ChartCatch.cpp）。zone(0..7) → lanes（键位/自动/宏用），
+            // 连续 x ∈ [0,1] → catchX（渲染"无轨道雨"；持续旋转渲染成长阶梯，不散落）。
+            catchX.assign(evs.size(), 0.5f);
+            std::vector<PadEv> cevs(evs.size());
+            for (size_t i = 0; i < evs.size(); i++)
+            {
+                cevs[i].t    = evs[i].t;
+                cevs[i].dt   = evs[i].dt;
+                cevs[i].turn = evs[i].turn * (180.0 / 3.14159265358979323846);
+                cevs[i].dir  = evs[i].dir;
+                cevs[i].hold = evs[i].hold;
+                cevs[i].taps = evs[i].taps;
+            }
+            std::vector<int> holdIdx(evs.size(), 0);
+            GenerateCatch(cevs.data(), (int)cevs.size(), style,
+                          (int)s_level.load(std::memory_order_relaxed),
+                          lanes.data(), catchX.data(), holdIdx.data());
+        }
+        else if (midx == 4)
+        {
+            // 16K(PAD)：独立 4x4 面板引擎（Chart16K.cpp），与四条下坠轨道引擎无关
+            std::vector<PadEv> pevs(evs.size());
+            for (size_t i = 0; i < evs.size(); i++)
+            {
+                pevs[i].t    = evs[i].t;
+                pevs[i].dt   = evs[i].dt;
+                pevs[i].turn = evs[i].turn * (180.0 / 3.14159265358979323846);   // 弧度 → 度
+                pevs[i].dir  = evs[i].dir;
+                pevs[i].hold = evs[i].hold;
+                pevs[i].taps = evs[i].taps;
+            }
+            GeneratePad16K(pevs.data(), (int)pevs.size(), style,
+                           (int)s_level.load(std::memory_order_relaxed),
+                           lanes.data(), &chordExtra);
+        }
+        else if (midx == 7)
+        {
+            // OSU（戳泡泡）：独立 2D 判定场引擎（ChartOsu.cpp）。
+            // 转向 / 幅度 → 512x384 判定场落点；lanes 只记"哪只手点"（0/1，供统计）。
+            osuX.assign(evs.size(), 0.5f);
+            osuY.assign(evs.size(), 0.5f);
+            std::vector<PadEv> oevs(evs.size());
+            for (size_t i = 0; i < evs.size(); i++)
+            {
+                oevs[i].t    = evs[i].t;
+                oevs[i].dt   = evs[i].dt;
+                oevs[i].turn = evs[i].turn * (180.0 / 3.14159265358979323846);
+                oevs[i].dir  = evs[i].dir;
+                oevs[i].hold = evs[i].hold;
+                oevs[i].taps = evs[i].taps;
+            }
+            std::vector<int> holdIdx(evs.size(), 0);
+            GenerateOsu(oevs.data(), (int)oevs.size(), style,
+                        (int)s_level.load(std::memory_order_relaxed),
+                        osuX.data(), osuY.data(), lanes.data(), holdIdx.data());
+        }
+        else if (style == kStyleClassic)
         {
             State4K  ls4;
             State5K  ls5;
             State6K  ls6;
             State10K ls10;
+            State8K  ls8;
             for (size_t i = 0; i < evs.size(); i++)
             {
                 const Ev& e = evs[i];
@@ -2723,6 +3142,7 @@ namespace Chart4K
                 case 0:  lanes[i] = NextLane4K(ls4, e.dir, e.turn, e.t, e.hold);    break;
                 case 1:  lanes[i] = NextLane5K(ls5, e.dir, e.turn, e.t, e.hold);    break;
                 case 2:  lanes[i] = NextLane6K(ls6, e.dir, e.turn, e.t, e.hold);    break;
+                case 6:  lanes[i] = NextLane8K(ls8, e.dir, e.turn, e.t, e.hold);    break;
                 default: lanes[i] = NextLane10K(ls10, e.dir, e.turn, e.t, e.hold);  break;
                 }
             }
@@ -2735,8 +3155,110 @@ namespace Chart4K
         }
 
         // ---- 组装音符 + 手感自检统计 ----
+        // ---- 长按后紧随的短按：换到"同刻空闲的另一键" ----
+        //   ADOFAI 里长按的松手时刻就是下一砖的 entryTime（见上，scrPlanet perc 证据），
+        //   玩家必须在同一瞬间"松手 + 再按"。若这两个动作落在同一个键上，人手根本
+        //   做不出来（这就是之前"长条后面的短按老是错位/按不到"的根因）。这里把紧随
+        //   长按尾端的那个音换到另一只手/另一键，保证物理可打。
+        for (size_t i = 0; i + 1 < evs.size(); i++)
+        {
+            if (evs[i].hold <= 0.f) continue;
+            const double tail = evs[i].t + (double)evs[i].hold;
+            if (fabs(evs[i + 1].t - tail) > 0.012) continue;    // 不是紧贴尾端
+            if (lanes[i + 1] != lanes[i]) continue;              // 已经不同键，OK
+            bool used[kMaxLanes] = {};
+            if (lanes[i] >= 0 && lanes[i] < kMaxLanes) used[lanes[i]] = true;
+            for (size_t j = 0; j < evs.size() && j < lanes.size(); j++)
+                if (j != i + 1 && fabs(evs[j].t - evs[i + 1].t) < 0.006 && lanes[j] >= 0 &&
+                    lanes[j] < kMaxLanes)
+                    used[lanes[j]] = true;
+            const int otherHand = (HandOf(lanes[i], cols) == 0) ? 1 : 0;
+            int alt = -1;
+            for (int l = 0; l < cols; l++)
+                if (HandOf(l, cols) == otherHand && !used[l]) { alt = l; break; }
+            if (alt < 0)
+                for (int l = 0; l < cols; l++)
+                    if (!used[l]) { alt = l; break; }
+            if (alt >= 0)
+            {
+                Log::Printf("[%dK] hold-tail tap moved %d -> %d (release must free the key)",
+                            cols, lanes[i + 1], alt);
+                lanes[i + 1] = alt;
+            }
+        }
+
+        // ---- 伪双押优化（可选）：把“孤立、极短”的两音合成【同刻真双押】 ----
+        //   定义（冰火社区 / biligame wiki「ADOFAI 指南 V2·主要术语」）：
+        //     双押/多押 (Pseudo) = ≥2 个「极为接近」的输入点，在游戏中通常表现为
+        //     非常尖锐的角度（押轮 Pseudo Rolling = 把 3 键以上的轮指拆成若干组，
+        //     在 4K 基础下打出双押/多押）。→ 判定必须【角度尖锐】且【时间极为接近】。
+        //   时间公式（反编译 scrMisc.GetTimeBetweenAngles + scrLevelMaker.
+        //   CalculateSingleFloorAngleLength / CalculateFloorEntryTimes 已核对）：
+        //     本砖到下一砖 Δt = (转角° / 180°) × 30 / (BPM × speed)  秒
+        //     （等价：转角 = Δt × BPM × speed × 6 度）
+        //   所以同一个角度在不同 BPM/变速下时间差好几倍：
+        //     30° @  80BPM = 125ms（普通音，不是双押）
+        //     30° @ 120BPM =  83ms（普通音，不是双押）
+        //     30° @ 250BPM =  40ms（人手分不开 → 伪双押）
+        //     30° @ 400BPM =  25ms（伪双押）
+        //   旧实现只看转角（<= 35°）加 140ms 的粗上限 → 慢歌里的 30° 装饰音会被
+        //   误合成双押（用户反馈的“不是伪双押也生成成双押”）。现在改成【两个条件
+        //   同时成立】，时间条件用绝对毫秒 → 角度上限随 BPM 自动伸缩（自动 BPM 自调配）：
+        //     ① 尖锐角：转角 <= kPDSharpDeg（游戏自身 GetMultipressPenalty 的“短砖”
+        //        分界 30.1°，覆盖经典 15°/30° 伪双押与 1° 级极小角；旧代码里那档
+        //        70~110° 已去掉 —— 那在高速谱里其实是拉链/轮指，不是“尖锐角”，
+        //        正是误判的主要来源）；
+        //     ② 极近：本对间隔 <= PseudoDoubleWindowMs()（默认 45ms，>22 音/秒，
+        //        人手无法分成两下；与本文件多押展开阈值一致）。
+        //   与快轮 / 轮指的区分（关键，保持不变）：快轮是一串【连续】的小角步；
+        //   伪双押是【单发】的小角步——只要本步的前一步或后一步本身也是“伪双押步”，
+        //   就说明处在小角连发里，一律保持原样（30°+30°+30°… 的轮指绝不会被拆成
+        //   双押）；此外再补一条时间孤立性：本对两侧的间隔都明显更大，也算单发。
+        //   注意：CATCH（无轨雨）用连续横向坐标、没有“轨”的概念，不做此项修正。
+        const double kRadToDeg = 180.0 / 3.14159265358979323846;
+        const double pdGap     = PseudoDoubleWindowMs() / 1000.0;   // ② 时间自适应上限
+        std::vector<int> absorb(evs.size(), 0);
+        if (midx != 5 && s_pseudo2[midx].load(std::memory_order_relaxed) > 0 && evs.size() >= 2)
+        {
+            if (chordExtra.size() < evs.size())
+                chordExtra.assign(evs.size(), std::vector<int>());
+            // 某一步（evs[idx] → evs[idx+1]，转角 = evs[idx].turn）是否本身就是伪双押步
+            auto isPDStep = [&](long long idx) -> bool {
+                if (idx < 0 || (size_t)(idx + 1) >= evs.size()) return false;
+                const double g = evs[(size_t)idx + 1].t - evs[(size_t)idx].t;
+                const double a = (double)evs[(size_t)idx].turn * kRadToDeg;
+                if (!(g > 0.0) || g > pdGap) return false;      // ② 极近（BPM×speed 自适应）
+                return a > 0.0 && a <= kPDSharpDeg;             // ① 尖锐角（15°/30°/极小角）
+            };
+            int nPseudo = 0;
+            for (size_t i = 0; i + 1 < evs.size(); i++)
+            {
+                if (absorb[i] || absorb[i + 1]) continue;
+                const double gap = evs[i + 1].t - evs[i].t;
+                if (!(gap > 0.0) || gap > pdGap) continue;       // ② 极近
+                if (!isPDStep((long long)i)) continue;           // ① 尖锐角
+                if (lanes[i + 1] == lanes[i]) continue;          // 同键无法构成双押
+                // 单发判定 —— 前后两步都不是伪双押步（不是小角连发/轮指），或时间上孤立
+                const bool singleStep = !isPDStep((long long)i - 1) && !isPDStep((long long)i + 1);
+                const double gPrev = (i > 0) ? (evs[i].t - evs[i - 1].t) : 1e9;
+                const double gNext = (i + 2 < evs.size()) ? (evs[i + 2].t - evs[i + 1].t) : 1e9;
+                const double need = std::max(gap * 2.0, 0.070);  // 两侧都明显更大 = 单发
+                const bool isolated = (gPrev >= need && gNext >= need);
+                if (!(singleStep || isolated)) continue;
+                // 生成式：把 i+1 并进 i 的同刻双押（两个不同的键、同一时刻）
+                chordExtra[i].push_back(lanes[i + 1]);
+                absorb[i + 1] = 1;
+                nPseudo++;
+            }
+            if (nPseudo > 0)
+                Log::Printf("[%dK] pseudo-double: merged %d near-simultaneous sharp pairs (window %.0f ms) into true chords",
+                            cols, nPseudo, pdGap * 1000.0);
+        }
+
         std::vector<Note> notes;
         notes.reserve(evs.size());
+        std::vector<float> noteXOut;                 // CATCH：与 notes 同尺寸的 x
+        std::vector<float> noteYOut;                 // OSU：与 notes 同尺寸的 y（x 复用 noteXOut）
         int statNotes = 0, statStream = 0, statStreamAlt = 0, statJack = 0;
         int statSameHand = 0, statHandRepeat = 0;
         int statPrevHandLane[2] = { -1, -1 };
@@ -2746,6 +3268,7 @@ namespace Chart4K
         double prevTn = -1e9;
         for (size_t i = 0; i < evs.size(); i++)
         {
+            if (i < absorb.size() && absorb[i]) continue;      // 已被前音吸收为双押
             const Ev& e = evs[i];
             int lane = lanes[i];
             if (lane < 0) lane = 0;
@@ -2757,6 +3280,13 @@ namespace Chart4K
             nt.dir  = e.dir;
             nt.turn = (float)e.turn;
             notes.push_back(nt);
+            if (midx == 5 && i < catchX.size())
+                noteXOut.push_back(catchX[i]);
+            if (midx == 7 && i < osuX.size())
+            {
+                noteXOut.push_back(osuX[i]);
+                noteYOut.push_back(osuY[i]);
+            }
             // 押：同刻追加键（双押/三押/四押/五押，来自冰火手法引擎）
             if (i < chordExtra.size() && !chordExtra[i].empty())
             {
@@ -2802,31 +3332,31 @@ namespace Chart4K
         int lv = EstimateLevel(notes, cols);
         s_level.store(lv, std::memory_order_relaxed);
 
-        // 与上一份完全一致就不重建（3 秒周期刷新不应清空连击/按键计数）；
-        // 模式或风格切换必须重建
-        static int    sigSize = -1;
-        static double sigFirst = 0.0, sigLast = 0.0, sigLaneSum = 0.0;
-        static int    sigMode = -1, sigStyle = -1, sigCols = -1;
+        // 与上一份完全一致就不重建（周期刷新不应清空连击/按键计数）；
+        // 模式或风格切换必须重建。
+        // g_sigValid=false（刚被 InvalidateChart 作废）时绝不复用旧签名——
+        // 否则换歌后若新谱"恰好"与上一首同样长、同样起止、同样 laneSum，就会继续显示旧谱面。
         int modeNow = midx;
         double laneSum = 0.0;
         for (size_t i = 0; i < notes.size(); i++)
             laneSum += notes[i].lane;
-        if (!notes.empty() && (int)notes.size() == sigSize &&
-            fabs(notes.front().time - sigFirst) < 1e-7 &&
-            fabs(notes.back().time - sigLast) < 1e-7 &&
-            fabs(laneSum - sigLaneSum) < 1e-9 &&
-            modeNow == sigMode && style == sigStyle && cols == sigCols)
+        if (!force && g_sigValid && !notes.empty() && (int)notes.size() == g_sigSize &&
+            fabs(notes.front().time - g_sigFirst) < 1e-7 &&
+            fabs(notes.back().time - g_sigLast) < 1e-7 &&
+            fabs(laneSum - g_sigLaneSum) < 1e-9 &&
+            modeNow == g_sigMode && style == g_sigStyle && cols == g_sigCols)
             return;
-        sigSize  = (int)notes.size();
-        sigFirst = notes.empty() ? 0.0 : notes.front().time;
-        sigLast  = notes.empty() ? 0.0 : notes.back().time;
-        sigLaneSum = laneSum;
-        sigMode = modeNow; sigStyle = style; sigCols = cols;
+        g_sigValid = true;
+        g_sigSize  = (int)notes.size();
+        g_sigFirst = notes.empty() ? 0.0 : notes.front().time;
+        g_sigLast  = notes.empty() ? 0.0 : notes.back().time;
+        g_sigLaneSum = laneSum;
+        g_sigMode = modeNow; g_sigStyle = style; g_sigCols = cols;
 
         if (statNotes > 0)
         {
             Log::Printf("[%dK] pattern(%s): notes=%d stream=%d handAlt=%.1f%% sameHand=%d handRepeat=%d jack=%d maxLaneRun=%d mashed=%d",
-                        cols, kStyleNames[style], statNotes, statStream,
+                        cols, StyleNameOf(modeNow, style), statNotes, statStream,
                         statStream > 0 ? 100.0 * statStreamAlt / statStream : 100.0,
                         statSameHand, statHandRepeat, statJack, statLaneRunMax, statMashed);
             char lb[192];
@@ -2836,29 +3366,44 @@ namespace Chart4K
             Log::Printf("[%dK] lane use: %s", cols, lb);
             if (style == kStyleAdo && statNotes > 2)
             {
-                // 冰火手法纯度自检：高速段里严格 2 键交替（轮指/交互）的占比
-                int pure = 0, fast = 0;
-                for (size_t i = 2; i < notes.size(); i++)
+                // 拆手序自检：只查"人手物理上做不到"的同键复按，必须为 0。
+                //   注意：同键连击本身是合法（而且是必须）的手法——
+                //     慢音窗口 → 同一根手指重复（叠键，甚至一整句都按同一个键）；
+                //     轮指回位 → K J 之后又回到 K。
+                //   所以判据不是"间隔小就算错"，而是：
+                //     ① 同键两次按下间隔 < 同键物理下限（kLaneFloor）；或
+                //     ② 前一个音还在长按（没松手）时，同键又出现新音。
+                //   任意一键违反其中之一才算错。
+                int bad = 0;
+                double lUse[kMaxLanes], lEnd[kMaxLanes];
+                for (int i = 0; i < kMaxLanes; i++) { lUse[i] = -1e9; lEnd[i] = -1e9; }
+                for (size_t i = 0; i < notes.size(); i++)
                 {
-                    const double dt = notes[i].time - notes[i - 1].time;
-                    if (!(dt > 0.0 && dt <= kFastDt)) continue;
-                    fast++;
-                    if (notes[i].lane != notes[i - 1].lane && notes[i].lane == notes[i - 2].lane)
-                        pure++;
+                    const int L = notes[i].lane;
+                    if (L < 0 || L >= kMaxLanes) continue;
+                    if ((notes[i].time - lUse[L]) < kLaneFloor || lEnd[L] > notes[i].time + 1e-6)
+                        bad++;
+                    lUse[L] = notes[i].time;
+                    lEnd[L] = notes[i].time + (double)notes[i].hold;
                 }
-                Log::Printf("[%dK] ado purity: %d/%d fast notes in strict 2-key alternation (%.1f%%)",
-                            cols, pure, fast, fast ? 100.0 * pure / fast : 0.0);
+                Log::Printf("[%dK] ado hand-split check: %d notes, impossible same-key repeats = %d (must be 0)",
+                            cols, statNotes, bad);
             }
         }
 
         {
             std::lock_guard<std::mutex> lk(s_notesMutex);
             s_notes.swap(notes);
+            s_catchX.swap(noteXOut);
+            s_osuX = s_catchX;    // 同一时刻只有一个模式激活：OSU 与 CATCH 共用这份"落点 x"
+            s_osuY.swap(noteYOut);
             s_chartSize = (int)s_notes.size();
             s_consumed.assign(s_notes.size(), 0);
             s_missed.assign(s_notes.size(), 0);
             s_tailDone.assign(s_notes.size(), 0);
         }
+        CatchReset();                                         // 新谱面：清空 CATCH 漏音计数 / 快慢方向
+        OsuReset();                                           // 新谱面：清空 OSU 连击 / 漏音计数
         s_anchored.store(false, std::memory_order_relaxed);   // new chart -> wait for the next real level start
         s_fx.clear();
         for (int i = 0; i < kMaxLanes; i++)
@@ -2884,12 +3429,11 @@ namespace Chart4K
             endT = s_notes.back().time;
         }
         s_chartEndT.store(endT + 3.0, std::memory_order_relaxed);
-        static int s_lastBuilt = -1;
-        if (s_chartSize != s_lastBuilt)
+        if (s_chartSize != g_lastBuilt)
         {
-            s_lastBuilt = s_chartSize;
+            g_lastBuilt = s_chartSize;
             Log::Printf("[%dK] chart built: %d notes, %.1fs, Lv.%d, style=%s (hold-cover=%d, mashed=%d)",
-                        cols, s_chartSize, dur, lv, kStyleNames[style], statHoldCover, statMashed);
+                        cols, s_chartSize, dur, lv, StyleNameOf(modeNow, style), statHoldCover, statMashed);
             DumpChartTxt();
         }
     }
@@ -2937,23 +3481,41 @@ namespace Chart4K
 
         static std::vector<RawFloor> raw;
         int got = 0;
+        void* srcKey = nullptr;
+        int   srcN = 0;
+        // ① 优先 scrLevelMaker.listFloors（游戏已按谱面顺序拍平）
         if (items && count > 2)
         {
             raw.assign((size_t)count, RawFloor{});
             got = ReadFloorsRaw(items, count, raw.data(), count);
-            s_chartKey = items;
-            s_chartFloorN = count;
+            srcKey = items;
+            srcN = count;
         }
-        else if (ctrl && oCtrl_firstFloor)
+        // ② 兜底 / 补充：scrController.firstFloor 沿 prevfloor 回溯到链头再正向收集。
+        //    DLC / 工作坊 / 编辑器关卡的地砖有时是异步构建的，listFloors 还没填好
+        //    （或只填了一部分），仅凭它就"读不到谱面 → 进关卡卡住"。两条来源都读，
+        //    谁的地砖更多就用谁，保证任何来源（官方 / DLC / 自定义 / 编辑器）都能识别。
+        if (ctrl && oCtrl_firstFloor)
         {
             void* first = ReadPtrField(ctrl, oCtrl_firstFloor);
             if (first)
             {
-                raw.assign(40000, RawFloor{});
-                got = ReadChainRaw(first, raw.data(), (int)raw.size());
-                s_chartKey = first;
-                s_chartFloorN = got > 0 ? got : 0;
+                static std::vector<RawFloor> chain;
+                chain.assign(40000, RawFloor{});
+                const int cgot = ReadChainRaw(first, chain.data(), (int)chain.size());
+                if (cgot > got)
+                {
+                    raw.swap(chain);
+                    got = cgot;
+                    srcKey = first;
+                    srcN = cgot > 0 ? cgot : 0;
+                }
             }
+        }
+        if (srcKey)
+        {
+            s_chartKey = srcKey;
+            s_chartFloorN = srcN;
         }
 
         if (got > 2)
@@ -3007,6 +3569,7 @@ namespace Chart4K
         s_jdLastKind.store(-1, std::memory_order_relaxed);
         s_chartGen.fetch_add(1, std::memory_order_relaxed);   // 渲染侧清特效/KPS
         Log::Printf("[4K] judge resync @ %.2fs", clock);
+        CatchReset();                                         // 时钟跳变（重开/切关）：同时清 CATCH 状态
     }
     // ---------------- 时钟（渲染线程插值） ----------------
     double WallNow()
@@ -3046,6 +3609,9 @@ namespace Chart4K
     static KeyPressEv            s_keyEv[kKeyEvN];
     static std::atomic<unsigned> s_keyEvWrite{ 0 };
     static unsigned              s_keyEvRead = 0;                 // 仅渲染线程访问
+    // CATCH（无轨）：任意键都算"接雨"。桥接线程轮询全键盘，这里发布"当前是否有键按住"
+    // 供长按尾端结算用（CATCH 不用轨道键位）。
+    static std::atomic<bool>     s_anyKeyHeld{ false };
     static int                   s_capPrevVK[kMaxLanes] = {};
     static bool                  s_capPrevDown[kMaxLanes] = {};
     static double                s_capLastWall = 0.0;      // 桥接线程上一轮采样时刻
@@ -3087,7 +3653,7 @@ namespace Chart4K
         snprintf(path, sizeof(path), "%s\\ADOFvec\\gentest.txt", base);
         FILE* fp = nullptr;
         if (fopen_s(&fp, path, "w") != 0 || !fp) return;
-        for (int mi = 0; mi < kModeN; mi++)
+        for (int mi = 0; mi < 4; mi++)   // 仅四条下坠键位轨（PAD/CATCH 各有独立引擎，不走 AdoGen）
         {
             const int cols = kLanesOf[mi];
             Gen g;
@@ -3115,6 +3681,44 @@ namespace Chart4K
         Log::Printf("[GENTEST] written %s (%d events)", path, (int)evs.size());
     }
 
+    // ---- 谱面失效：把"谱面身份"的每一条残留一次性清干净 ----
+    //   必须清的东西（少清任何一条都会造成"换歌后读不出新谱面 / 继续显示上一首"）：
+    //     · s_chartKey / s_chartFloorN —— 谱面识别键，否则新谱与旧键相同就不触发重提；
+    //     · g_lastExtract / g_lastExtractOK —— 否则会被 3 秒节流挡住，迟迟不重提；
+    //     · g_lastFp —— 内容指纹基线，否则"同一地址被复用"的新谱指纹相同 → 判定为没换歌；
+    //     · g_sigValid —— 构建签名，否则新谱恰好与旧谱同长同起止时会直接 return 不重建；
+    //     · s_notes / 判定标记 / 读谱快照 —— 否则旧谱面（或旧读谱）继续被绘制。
+    static void InvalidateChart(const char* why, bool clearNotes)
+    {
+        const bool wasLive = (s_chartKey != nullptr) || (s_chartFloorN != -1) ||
+                             (s_chartSize != 0) || (g_lastFp != 0u);
+        if (why && wasLive)
+            Log::Printf("[4K] chart invalidate: %s", why);
+
+        s_chartKey   = nullptr;
+        s_chartFloorN = -1;
+        g_lastExtract   = 0;
+        g_lastExtractOK = false;
+        g_lastFp        = 0u;
+        g_sigValid      = false;
+        g_lastBuilt     = -1;
+        g_rawValid      = false;
+
+        if (clearNotes)
+        {
+            std::lock_guard<std::mutex> lk(s_notesMutex);
+            s_notes.clear();
+            s_catchX.clear();
+            s_consumed.clear();
+            s_missed.clear();
+            s_tailDone.clear();
+            s_chartSize = 0;
+            s_noteCount.store(0, std::memory_order_relaxed);
+        }
+        ClearReadTiles();
+        s_forceChartRebuild.store(true, std::memory_order_relaxed);
+    }
+
     void Tick()
     {
         GenTestOnce();
@@ -3136,7 +3740,7 @@ namespace Chart4K
             // 周期性请主线程刷新实例（mono API 只能主线程；顺带扫描未发现的槽位）
             static DWORD s_lastReq = 0;
             DWORD nowReq = GetTickCount();
-            if (nowReq - s_lastReq > 1000)
+            if (nowReq - s_lastReq > 250)  // 250ms：让主线程高频重应用 noFail / RDC.auto
             {
                 s_lastReq = nowReq;
                 GameBridge::QueueMainThreadInit();
@@ -3192,6 +3796,14 @@ namespace Chart4K
             {
                 s_resetKeys.store(true, std::memory_order_relaxed);
                 ResyncJudge(cd.song);
+                // 大回卷（> 1 秒往回跳）：重开本关，或世界关"连续进入下一关"（此时 gameworld
+                // 可能一直为真，检测不到"进入关卡沿"）。这两种情况都必须重提谱面，否则会
+                // 一直显示上一首的谱面，或者因为节流迟迟读不出新谱 → 看起来"进关卡不显示谱面"。
+                if ((cd.song - prev) < -1.0)
+                {
+                    s_chartRewind.store(true, std::memory_order_relaxed);
+                    Log::Printf("[4K] song rewound %.2f -> %.2f -> chart re-extract", prev, cd.song);
+                }
             }
             s_lastSongT = cd.song;
         }
@@ -3210,6 +3822,13 @@ namespace Chart4K
                         s_capCadence += (dCap - s_capCadence) * 0.05;
                     s_capLastWall = wallCap;
                 }
+                if (miCap == kModeCatch)
+                {
+                    // CATCH v2：改成"一键自动接"——不再采集键盘。接盘由鼠标 X 控制，
+                    // 雨点落线瞬间只要接盘盖住就自动接住（判定走 CatchTick）。
+                    s_anyKeyHeld.store(false, std::memory_order_relaxed);
+                }
+                else
                 for (int i = 0; i < colsCap; i++)
                 {
                     const int vk = s_vk[miCap][i].load(std::memory_order_relaxed);
@@ -3250,22 +3869,59 @@ namespace Chart4K
             if (ctrlFresh && ctrlFresh != ctrl)
                 ctrl = ctrlFresh;   // 主线程 get_instance 已重新 Find（旧实例被销毁）
         }
+        if (ctrl) s_ctrlLastGood.store(ctrl, std::memory_order_release);
+        else      ctrl = s_ctrlLastGood.load(std::memory_order_acquire);   // 抗瞬时 null（切场景瞬间）
         CheatState::Status st;
         GameBridge::GetStatusSnapshot(&st);
 
-        s_inLevel.store(ctrl != nullptr && st.gameworld, std::memory_order_relaxed);
+        // ---- 关卡存在性锁存 ----
+        {
+            // gameworld 在个别自定义/DLC 关卡里可能迟到或闪断 → 叠加 FSM 状态
+            // （Start/Countdown/Checkpoint/PlayerControl）作为第二判据。
+            const bool fsmInLevel = (st.state >= 1 && st.state <= 4);
+            const bool liveNow = (ctrl != nullptr) && (st.gameworld || fsmInLevel);
+            const DWORD tn = GetTickCount();
+            if (liveNow)
+            {
+                s_levelGoneSince = 0;
+                if (!s_levelLatch)
+                {
+                    s_levelLatch = true;
+                    InvalidateChart("level entered", true);
+                }
+            }
+            else if (s_levelLatch)
+            {
+                if (s_levelGoneSince == 0) s_levelGoneSince = tn;
+                if (tn - s_levelGoneSince > 900)   // 连续 900ms 不在关卡：真的退出了
+                {
+                    s_levelLatch = false;
+                    s_levelGoneSince = 0;
+                }
+            }
+        }
+        s_inLevel.store(s_levelLatch, std::memory_order_relaxed);
         s_acc.store(st.percentAcc, std::memory_order_relaxed);
         s_combo.store(st.combo, std::memory_order_relaxed);
         s_maxCombo.store(st.maxCombo, std::memory_order_relaxed);
 
-        if (!ctrl)
+        if (!s_levelLatch)
         {
+            // 回到菜单 / 关卡已卸载：清空谱面身份与全部运行时残留。
+            // 这里不清 g_lastModeSig（模式没变，避免下一帧又触发一次无效重建）。
             s_chartKey = nullptr;
             s_chartFloorN = 0;
+            g_lastFp = 0u;
+            g_sigValid = false;
+            g_lastBuilt = -1;
             std::lock_guard<std::mutex> lk(s_notesMutex);
-            if (!s_notes.empty())
+            if (!s_notes.empty() || s_chartSize != 0)
             {
                 s_notes.clear();
+                s_catchX.clear();
+                s_consumed.clear();
+                s_missed.clear();
+                s_tailDone.clear();
                 s_chartSize = 0;
                 s_noteCount.store(0, std::memory_order_relaxed);
             }
@@ -3287,29 +3943,60 @@ namespace Chart4K
         if (!chartKeyNow && ctrl && oCtrl_firstFloor)
             chartKeyNow = ReadPtrField(ctrl, oCtrl_firstFloor);
 
-        static DWORD s_lastExtract = 0;
-        static bool  s_lastExtractOK = false;
-        static int   s_lastModeSig = -1000;
+        // ---- 进入新关卡 / 谱面内容变化 → 立即重建（跨曲、DLC、额外关卡） ----
+        //   ① 指针可能被分配器复用 → 用内容指纹兜底；
+        //   ② 进入关卡瞬间强制清空上一首的残留谱面，避免"下一首读不出来"；
+        //   ③ 歌曲时刻大回卷（重开 / 世界关连打）→ 同样重提；
+        //   ④ 以上任何一条都走 InvalidateChart()，把提取节流、内容指纹基线、构建签名
+        //      一次性作废，杜绝"读到旧谱 / 迟迟读不出新谱"。
+        {
+            const unsigned fpNow = (chartKeyNow && chartCountNow > 2)
+                                       ? ChartFingerprint(chartKeyNow, chartCountNow) : 0u;
+            // 进入关卡的失效已经在上面通过 s_levelLatch 处理；这里只做内容指纹比对。
+            if (fpNow != 0u && g_lastFp != 0u && fpNow != g_lastFp)
+            {
+                Log::Printf("[4K] chart content changed (fp %08x -> %08x)", g_lastFp, fpNow);
+                InvalidateChart("chart content changed", true);
+            }
+            if (fpNow != 0u) g_lastFp = fpNow;
+        }
+
+        // 歌曲时刻大回卷（重开 / 世界关连续进入下一关）→ 同样重提谱面
+        if (s_chartRewind.exchange(false, std::memory_order_relaxed))
+            InvalidateChart("song rewound", true);
+
         int  miNow = ActiveModeIndex();
         int  modeSig = ((miNow < 0) ? 0 : miNow) * 10 +
                        s_style[(miNow < 0) ? 0 : miNow].load(std::memory_order_relaxed);
-        if (modeSig != s_lastModeSig)
+        if (modeSig != g_lastModeSig)
         {
-            s_lastModeSig = modeSig;      // 模式/风格切换：下一帧立即重建谱面
-            s_lastExtract = 0;
+            g_lastModeSig = modeSig;      // 模式/风格切换：立即重建谱面
+            InvalidateChart("mode/style changed", true);
         }
         DWORD now = GetTickCount();
-        DWORD interval = s_lastExtractOK ? 3000 : 150;   // 成功 3s 复检；失败快速重试
+        // 复检节流：
+        //   · 上一次没取到谱面，或"在关卡里但一个音符都没有" → 120ms 快重试
+        //     （保证进关卡后最多 ~0.12s 就出谱面，而不是干等 1.5s/3s）；
+        //   · 已就绪 → 1.5s 低频复检（DLC / 工作坊 / 编辑器关卡地砖异步建好时可自愈）。
+        DWORD interval;
+        if (!g_lastExtractOK || s_noteCount.load(std::memory_order_relaxed) <= 0)
+            interval = 120;
+        else
+            interval = 1500;
         if (chartKeyNow != s_chartKey || chartCountNow != s_chartFloorN ||
-            (now - s_lastExtract) > interval)
+            (now - g_lastExtract) > interval)
         {
-            s_lastExtract = now;
-            s_lastExtractOK = ExtractChart(ctrl);
+            g_lastExtract = now;
+            g_lastExtractOK = ExtractChart(ctrl);
         }
 
-        // 诊断：每 5 秒打印一次关键引用（定位"读不到谱面"用）
+        // 诊断：每 5 秒打印一次关键引用（定位"读不到谱面"用；仅在开诊断时输出）
         static DWORD s_lastDiag = 0;
-        if (now - s_lastDiag > 5000)
+        static const bool s_diagOn = [] {
+            char v[8] = { 0 };
+            return GetEnvironmentVariableA("ADOFAI_PERFECT_DIAG", v, sizeof(v)) > 0 && v[0] == '1';
+        }();
+        if (s_diagOn && now - s_lastDiag > 5000)
         {
             s_lastDiag = now;
             void* list = (g_lm && oLM_floors) ? ReadPtrField(g_lm, oLM_floors) : nullptr;
@@ -3344,12 +4031,13 @@ namespace Chart4K
         s_laneHitBg[lane] = (kind <= 1) ? 1.f : 0.55f;
     }
 
-    static void JudgePress(int lane, double clock)
+    static void JudgePress(int lane, double clock, bool anyLane = false)
     {
         const double win  = JudgeWinMs()  / 1000.0;
         const double marv = JudgeMarvMs() / 1000.0;
         const double perf = JudgePerfMs() / 1000.0;
         int    best = -1;
+        int    effLane = lane;               // CATCH(anyLane)：记下实际被吃掉那颗雨的轨（特效/HUD 用）
         double bestAd = 1e9, bestDt = 0.0;
         {
             std::lock_guard<std::mutex> lk(s_notesMutex);
@@ -3358,7 +4046,7 @@ namespace Chart4K
                 if (s_consumed[i] || s_missed[i])
                     continue;
                 const Note& n = s_notes[i];
-                if (n.lane != lane)
+                if (!anyLane && n.lane != lane)
                     continue;
                 double dt = n.time - clock;
                 if (dt > win)                // 时间有序：后面的只会更远
@@ -3372,10 +4060,14 @@ namespace Chart4K
                 }
             }
             if (best >= 0)
+            {
                 s_consumed[best] = 1;
+                effLane = (int)s_notes[best].lane;
+            }
         }
         if (best < 0)
             return;                          // 空打：不扣分（Malody 的 OverPress）
+        if (anyLane) lane = effLane;          // 无轨：后续 HUD / 特效按雨的实际横坐标落点
         int kind = (bestAd < marv) ? 0 : (bestAd < perf) ? 1 : 2;
         s_jdCounts[kind].fetch_add(1, std::memory_order_relaxed);
         // 金判（Cynosure hitcount1 = MV）：|offset|<=20ms，与 cynosure.lua 的边界一致
@@ -3390,7 +4082,7 @@ namespace Chart4K
         s_jdLastTime.store(clock, std::memory_order_relaxed);
         s_jdLastLane.store(lane, std::memory_order_relaxed);
         s_jdLastOff.store(bestDt, std::memory_order_relaxed);
-        SkinLua::PushHit(kind, bestDt * 1000.0);          // 皮肤 Lua：OnHit/HitEvent
+        SkinLua::PushHit(kind, bestDt * 1000.0, lane + 1);   // 皮肤 Lua：OnHit/HitEvent（HitX = 轨号 1 起）
         if (bestAd <= 0.09)              // 只统计正常范围内的偏差，避免乱按污染校准
         {
             BiasPush(bestDt);
@@ -3450,7 +4142,8 @@ namespace Chart4K
             s_jdCombo.store(0, std::memory_order_relaxed);
             s_jdLastKind.store(3, std::memory_order_relaxed);
             s_jdLastTime.store(clock, std::memory_order_relaxed);
-            SkinLua::PushHit(3, (k < 16) ? missedOff[k] : 0.f);   // 皮肤 Lua：漏键也要走 OnHit/HitEvent
+            SkinLua::PushHit(3, (k < 16) ? missedOff[k] : 0.f,    // 皮肤 Lua：漏键也要走 OnHit/HitEvent
+                             (k < 16) ? missedLane[k] + 1 : 1);
             if (s_hitFx.load(std::memory_order_relaxed))
             {
                 HitFx fx;
@@ -3463,6 +4156,364 @@ namespace Chart4K
                     s_fx.erase(s_fx.begin());
             }
         }
+    }
+
+    // ---------------- CATCH v2：无轨接盘判定（一键自动接 + 鼠标接盘） ----------------
+    //   CATCH 不再需要按键：接盘横坐标由鼠标给出，雨点落线瞬间若接盘盖住它就算接住。
+    //   判定档按"落点离接盘中心的距离"给（正中 MARV，越靠边越低），保证实时成绩有反馈；
+    //   没盖住又过了判定窗 → MISS；MISS 只是照常显示一条判定（和 PERFECT / GOOD 完全一样），
+    //   绝不自动返回 / 重开本关 —— 是否致死交给游戏原关自身判定与玩家自己的不死开关。
+    static std::atomic<float>  s_catchPlateX{ 0.5f };
+    static std::atomic<float>  s_catchFxX{ 0.5f };
+    static std::atomic<int>    s_catchMissN{ 0 };
+    static std::atomic<int>    s_catchLastDir{ 0 };   // 最近一次判定方向：+1=慢(SLOW) / -1=快(FAST)
+
+    static inline int CatchKindByDx(double adx, double halfW)
+    {
+        if (halfW <= 1e-6) return 0;
+        const double t = adx / halfW;        // 0 = 正中，1 = 接盘边缘
+        if (t <= 0.34) return 0;             // MARVELOUS
+        if (t <= 0.67) return 1;             // PERFECT
+        return 2;                            // GOOD
+    }
+
+    static void CatchPublishPlayTarget(double t, double frac);   // 背景打歌引擎：发布归一化目标偏差（定义见本文件下方）
+
+    int CatchTick(double clock, float plateX, float plateHalfW)
+    {
+        s_catchPlateX.store(plateX, std::memory_order_relaxed);
+        if (plateHalfW < 0.004f) plateHalfW = 0.004f;
+        const double win = JudgeWinMs() / 1000.0;
+        const int    lane = 0;                        // CATCH 无轨：统一按 lane 0 上报（特效/HUD 用）
+        const bool   doFx = s_hitFx.load(std::memory_order_relaxed);
+        // 换谱 / 重开后的第一帧：谱面刚建好，时钟往往已经在半途（长前奏/测试直载），
+        // 若照常判定会把"已经过去"的音全判成 MISS → 一进关就死。首帧只做静默跳过。
+        static int s_catchGen = -1;
+        const int  genNow = s_chartGen.load(std::memory_order_relaxed);
+        const bool fresh  = (genNow != s_catchGen);
+        s_catchGen = genNow;
+        int          missN = 0;
+        {
+            std::lock_guard<std::mutex> lk(s_notesMutex);
+            const int n = (int)s_notes.size();
+            for (int i = 0; i < n; i++)
+            {
+                if (s_consumed[i] || s_missed[i]) continue;
+                const double dt = s_notes[i].time - clock;
+                if (dt > win) break;                  // 时间有序：后面的更远
+                if (fresh) { s_consumed[i] = 1; continue; }   // 新谱首帧：已过去的音不计 MISS
+                const float nx  = (i < (int)s_catchX.size()) ? s_catchX[i] : 0.5f;
+                const float adx = fabsf(nx - plateX);
+                if (adx <= plateHalfW)
+                {
+                    // 接住：判定档按落点离中心的比例给（完全自动计时 → 偏差只体现在位置上）
+                    const int kind = CatchKindByDx((double)adx, (double)plateHalfW);
+                    s_consumed[i] = 1;
+                    s_jdCounts[kind].fetch_add(1, std::memory_order_relaxed);
+                    if (kind <= 2 && adx <= (float)(plateHalfW * 0.34))
+                        s_jdGold[kind].fetch_add(1, std::memory_order_relaxed);
+                    s_jdTotal.fetch_add(1, std::memory_order_relaxed);
+                    s_jdWeight.fetch_add(kJudgeWeight[kind], std::memory_order_relaxed);
+                    int combo = s_jdCombo.fetch_add(1, std::memory_order_relaxed) + 1;
+                    int mc = s_jdMaxCombo.load(std::memory_order_relaxed);
+                    while (combo > mc && !s_jdMaxCombo.compare_exchange_weak(mc, combo)) {}
+                    s_jdLastKind.store(kind, std::memory_order_relaxed);
+                    s_jdLastTime.store(clock, std::memory_order_relaxed);
+                    s_jdLastLane.store(lane, std::memory_order_relaxed);
+                    s_jdLastOff.store((double)(nx - plateX), std::memory_order_relaxed);
+                    s_catchFxX.store(nx, std::memory_order_relaxed);
+                    // 快慢方向：落点在接盘中心右侧 = 慢(SLOW)、左侧 = 快(FAST)，
+                    // 与背景原关"早/晚"的方向严格一致（同一个符号既发布给打歌引擎，也用于 HUD）。
+                    const double late = (nx >= plateX) ? 1.0 : -1.0;
+                    s_catchLastDir.store((int)late, std::memory_order_relaxed);
+                    {   // 背景打歌引擎的目标偏差（归一化，见 Chart4K.h）：
+                        //   MARV=0.20（窗内正中）/ PERFECT=0.42（窗内，仍是 Perfect）/
+                        //   GOOD=0.88（超出 Pure 但未出计数窗 → 背景 VeryEarly/VeryLate）
+                        const double base = (kind == 0) ? 0.20 : (kind == 1 ? 0.42 : 0.88);
+                        CatchPublishPlayTarget(s_notes[i].time, late * base);
+                    }
+                    SkinLua::PushHit(kind, (double)adx * 1000.0, lane + 1);
+                    if (doFx) JudgePushFx(lane, kind);
+                }
+                else if (dt < -win)
+                {
+                    // 漏音：过了判定窗还没盖住 → MISS（实时反馈 + 断连击）
+                    s_missed[i] = 1;
+                    s_jdCounts[3].fetch_add(1, std::memory_order_relaxed);
+                    s_jdTotal.fetch_add(1, std::memory_order_relaxed);
+                    s_jdWeight.fetch_add(0.0, std::memory_order_relaxed);
+                    s_jdCombo.store(0, std::memory_order_relaxed);
+                    s_jdLastKind.store(3, std::memory_order_relaxed);
+                    s_jdLastTime.store(clock, std::memory_order_relaxed);
+                    s_jdLastLane.store(lane, std::memory_order_relaxed);
+                    s_catchFxX.store(nx, std::memory_order_relaxed);
+                    s_catchMissN.fetch_add(1, std::memory_order_relaxed);
+                    // 漏音 → 背景原关也 MISS：目标偏差放到"计数窗"之外（1.60 > 1.0），
+                    // 背景必吃 TooEarly/TooLate（断连击）；快慢方向交替，避免清一色。
+                    s_catchLastDir.store((i & 1) ? 1 : -1, std::memory_order_relaxed);
+                    CatchPublishPlayTarget(s_notes[i].time, ((i & 1) ? 1.0 : -1.0) * 1.60);
+                    SkinLua::PushHit(3, 0.f, lane + 1);
+                    if (doFx)
+                    {
+                        HitFx fx;
+                        fx.lane = lane;
+                        fx.kind = 3;
+                        fx.t0 = ImGui::GetTime();
+                        fx.scale = 1.f;
+                        s_fx.push_back(fx);
+                        if (s_fx.size() > 64) s_fx.erase(s_fx.begin());
+                    }
+                    missN++;
+                }
+            }
+        }
+        if (missN > 0)
+            Log::Printf("[CATCH] miss=%d total-miss=%d clock=%.2f",
+                        missN, s_catchMissN.load(std::memory_order_relaxed), clock);
+        return missN;
+    }
+
+    void  CatchSetPlateX(float x)
+    {
+        if (x < 0.02f) x = 0.02f;
+        if (x > 0.98f) x = 0.98f;
+        s_catchPlateX.store(x, std::memory_order_relaxed);
+    }
+    float CatchPlateX()  { return s_catchPlateX.load(std::memory_order_relaxed); }
+    float CatchFxX()     { return s_catchFxX.load(std::memory_order_relaxed); }
+    int   CatchMissCount() { return s_catchMissN.load(std::memory_order_relaxed); }
+    void  CatchReset()
+    {
+        s_catchMissN.store(0, std::memory_order_relaxed);
+        s_catchLastDir.store(0, std::memory_order_relaxed);
+    }
+    int   CatchPlateWMil()
+    {
+        int mi = ActiveModeIndex();
+        if (mi < 0) mi = kModeCatch;
+        int v = s_catchPlateW[mi].load(std::memory_order_relaxed);
+        if (v < 60) v = 60;
+        if (v > 400) v = 400;
+        return v;
+    }
+    void  CatchPlateWSet(int mil)
+    {
+        int mi = ActiveModeIndex();
+        if (mi < 0) mi = kModeCatch;
+        if (mil < 60) mil = 60;
+        if (mil > 400) mil = 400;
+        s_catchPlateW[mi].store(mil, std::memory_order_relaxed);
+    }
+
+    // ---------------- CATCH → 背景打歌引擎：发布每次判定的"归一化目标偏差" ----------------
+    //   CATCH 覆盖层的判定（接盘离落点多远）决定背景那首冰与火原关该怎么打：
+    //     · 接得正中（MARV） → 0.20 → 背景 Perfect；
+    //     · CATCH PERFECT    → 0.42 → 背景 Perfect（仍在 Pure 窗内）；
+    //     · CATCH GOOD       → 0.88 → 背景 VeryEarly/VeryLate（"GOOD"档，带早/晚）；
+    //     · 漏音（MISS）     → ±1.60 → 背景 TooEarly/TooLate（断连击 = MISS）。
+    //   归一化单位 = 背景"计数窗(Counted)"半宽（60° × marginScale），符号 = 慢/快。
+    //   这是 CATCH 专用的打歌算法（独立于"冰与火宏"，状态/随机源/参数都不共用）。
+    static constexpr int kCatchPubN = 96;
+    struct CatchPub { double t; double ms; };
+    static CatchPub       s_catchPub[kCatchPubN];
+    static bool           s_catchPubInit = false;
+    static unsigned       s_catchPubW = 0;
+    static std::mutex     s_catchPubMx;
+    static std::atomic<int> s_catchPlayAcc{ 100 };   // 打歌精准度 0..100（把 CATCH 偏差带到背景的比例）
+
+    static void CatchPublishPlayTarget(double t, double frac)
+    {
+        std::lock_guard<std::mutex> lk(s_catchPubMx);
+        if (!s_catchPubInit)
+        {
+            for (int i = 0; i < kCatchPubN; i++) { s_catchPub[i].t = -1e18; s_catchPub[i].ms = 0.0; }
+            s_catchPubInit = true;
+        }
+        CatchPub& e = s_catchPub[s_catchPubW % kCatchPubN];
+        e.t  = t;
+        e.ms = frac;
+        s_catchPubW++;
+    }
+
+    // 打歌引擎按"当前歌曲时刻"取最近的一条 CATCH 判定（窗口 0.40s；找不到返回 false）
+    bool CatchPlayTargetFrac(double songTime, double* outFrac)
+    {
+        if (!outFrac) return false;
+        std::lock_guard<std::mutex> lk(s_catchPubMx);
+        if (!s_catchPubInit) return false;
+        double best = 0.0, bestD = 0.40;
+        bool   found = false;
+        for (int i = 0; i < kCatchPubN; i++)
+        {
+            const double t = s_catchPub[i].t;
+            if (t < -1e17) continue;
+            const double d = fabs(t - songTime);
+            if (d < bestD) { bestD = d; best = s_catchPub[i].ms; found = true; }
+        }
+        if (found) *outFrac = best;
+        return found;
+    }
+    int  CatchLastDir() { return s_catchLastDir.load(std::memory_order_relaxed); }
+    int  CatchPlayAccGet() { return s_catchPlayAcc.load(std::memory_order_relaxed); }
+    void CatchPlayAccSet(int v)
+    {
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        s_catchPlayAcc.store(v, std::memory_order_relaxed);
+    }
+
+    // ---------------- OSU（戳泡泡）：osu! standard 判定 ----------------
+    //   判定窗（研究自 osu! 官方；单侧毫秒，与 osu! 文档一致）：
+    //     GREAT/300 = 80-6*OD · OK/100 = 140-8*OD · MEH/50 = 200-10*OD · 超窗 = MISS
+    //   命中条件：点击（左/右键 或 Z/X）那一刻，光标落在泡泡半径内且时间在 MEH 窗内。
+    //   判定结果同步回背景原关（与 CATCH 共用同一套打歌引擎发布通道）。
+    static std::atomic<float> s_osuCursorX{ 0.5f }, s_osuCursorY{ 0.5f };
+    static std::atomic<int>   s_osuCombo{ 0 }, s_osuMaxCombo{ 0 }, s_osuMissN{ 0 };
+    static std::atomic<int>   s_osuOd{ 8 };
+    static std::atomic<int>   s_osuPreemptMs{ 1200 };   // AR5 起手（osu! AR5 = 1200ms）
+    static std::atomic<float> s_osuLastDx{ 0.f }, s_osuLastDy{ 0.f };
+
+    static inline double OsuWindowMs(int kind)
+    {
+        const double od = (double)s_osuOd.load(std::memory_order_relaxed);
+        switch (kind)
+        {
+        case 0:  return 80.0 - 6.0 * od;
+        case 1:  return 140.0 - 8.0 * od;
+        default: return 200.0 - 10.0 * od;
+        }
+    }
+
+    int OsuTick(double clock, float mx, float my, bool clickEdge, bool clickDown)
+    {
+        (void)clickDown;
+        s_osuCursorX.store(mx, std::memory_order_relaxed);
+        s_osuCursorY.store(my, std::memory_order_relaxed);
+        const double w0 = OsuWindowMs(0) / 1000.0;
+        const double w1 = OsuWindowMs(1) / 1000.0;
+        const double w2 = OsuWindowMs(2) / 1000.0;
+        const float  R  = 54.4f - 4.48f * 4.0f;      // 判定场（512x384）命中半径
+        static int s_osuGen = -1;
+        const int  genNow = s_chartGen.load(std::memory_order_relaxed);
+        const bool fresh  = (genNow != s_osuGen);
+        s_osuGen = genNow;
+        int missN = 0;
+        std::lock_guard<std::mutex> lk(s_notesMutex);
+        const int n = (int)s_notes.size();
+        for (int i = 0; i < n; i++)
+        {
+            if (s_consumed[i] || s_missed[i]) continue;
+            const Note& nt = s_notes[i];
+            const double dt = nt.time - clock;          // >0 = 还早（按快）/ <0 = 已过（按慢）
+            if (dt > w2) break;                         // 时间有序：后面的更远
+            if (fresh) { s_consumed[i] = 1; continue; } // 新谱首帧：只静默跳过"已经过去"的音
+            const float nx = (i < (int)s_osuX.size()) ? s_osuX[i] * 512.f : 256.f;
+            const float ny = (i < (int)s_osuY.size()) ? s_osuY[i] * 384.f : 192.f;
+            if (dt < -w2)
+            {
+                // 超窗未点 → MISS（照常显示 / 断连击；不自动返回、不自动重开）
+                s_missed[i] = 1;
+                s_jdCounts[3].fetch_add(1, std::memory_order_relaxed);
+                s_jdTotal.fetch_add(1, std::memory_order_relaxed);
+                s_jdWeight.fetch_add(0.0, std::memory_order_relaxed);
+                s_jdCombo.store(0, std::memory_order_relaxed);
+                s_jdLastKind.store(3, std::memory_order_relaxed);
+                s_jdLastTime.store(clock, std::memory_order_relaxed);
+                s_jdLastLane.store(0, std::memory_order_relaxed);
+                s_osuCombo.store(0, std::memory_order_relaxed);
+                s_osuMissN.fetch_add(1, std::memory_order_relaxed);
+                s_osuLastDx.store(0.f, std::memory_order_relaxed);
+                s_osuLastDy.store(0.f, std::memory_order_relaxed);
+                CatchPublishPlayTarget(nt.time, ((i & 1) ? 1.0 : -1.0) * 1.60);
+                SkinLua::PushHit(3, 0.f, 1);
+                missN++;
+                continue;
+            }
+            if (!clickEdge) break;                      // 没点：等下一帧
+            const float dx = mx - nx, dy = my - ny;
+            if (sqrtf(dx * dx + dy * dy) > R * 1.15f) break;   // 点偏了：不算（osu! 空点无惩罚）
+            const double adt = fabs(dt);
+            const int kind = (adt <= w0) ? 0 : (adt <= w1 ? 1 : 2);
+            s_consumed[i] = 1;
+            s_jdCounts[kind].fetch_add(1, std::memory_order_relaxed);
+            if (kind == 0 && adt <= 0.020) s_jdGold[0].fetch_add(1, std::memory_order_relaxed);
+            s_jdTotal.fetch_add(1, std::memory_order_relaxed);
+            s_jdWeight.fetch_add(kJudgeWeight[kind], std::memory_order_relaxed);
+            const int combo = s_osuCombo.fetch_add(1, std::memory_order_relaxed) + 1;
+            int mc = s_osuMaxCombo.load(std::memory_order_relaxed);
+            while (combo > mc && !s_osuMaxCombo.compare_exchange_weak(mc, combo)) {}
+            s_jdCombo.store(combo, std::memory_order_relaxed);
+            {
+                int jmc = s_jdMaxCombo.load(std::memory_order_relaxed);
+                while (combo > jmc && !s_jdMaxCombo.compare_exchange_weak(jmc, combo)) {}
+            }
+            s_jdLastKind.store(kind, std::memory_order_relaxed);
+            s_jdLastTime.store(clock, std::memory_order_relaxed);
+            s_jdLastLane.store(0, std::memory_order_relaxed);
+            s_jdLastOff.store(-dt, std::memory_order_relaxed);
+            s_osuLastDx.store(dx, std::memory_order_relaxed);
+            s_osuLastDy.store(dy, std::memory_order_relaxed);
+            // 背景原关：GREAT/OK → Perfect（0.20 / 0.42）；MEH → 0.88（VeryEarly/Late = GOOD）
+            const double base = (kind == 0) ? 0.20 : (kind == 1 ? 0.42 : 0.88);
+            const double late = (dt < 0.0) ? 1.0 : -1.0;   // 按晚 = 慢(+)，按早 = 快(-)
+            CatchPublishPlayTarget(nt.time, late * base);
+            SkinLua::PushHit(kind, dt * 1000.0, 1);
+            if (s_hitFx.load(std::memory_order_relaxed)) JudgePushFx(0, kind);
+            break;                                      // 一次点击只算一个泡泡
+        }
+        if (missN > 0)
+            Log::Printf("[OSU] miss=%d total-miss=%d clock=%.2f", missN,
+                        s_osuMissN.load(std::memory_order_relaxed), clock);
+        return missN;
+    }
+
+    int OsuNotes(OsuHit* out, int cap, double minT)
+    {
+        if (!out || cap <= 0) return 0;
+        std::lock_guard<std::mutex> lk(s_notesMutex);
+        int c = 0;
+        for (size_t i = 0; i < s_notes.size() && c < cap; i++)
+        {
+            if (s_notes[i].time < minT) continue;
+            OsuHit h;
+            h.t    = s_notes[i].time;
+            h.x    = (i < s_osuX.size()) ? s_osuX[i] : 0.5f;
+            h.y    = (i < s_osuY.size()) ? s_osuY[i] : 0.5f;
+            h.hold = s_notes[i].hold;
+            h.state = s_missed[i] ? 2 : (s_consumed[i] ? 1 : 0);
+            out[c++] = h;
+        }
+        return c;
+    }
+
+    float OsuCursorX() { return s_osuCursorX.load(std::memory_order_relaxed); }
+    float OsuCursorY() { return s_osuCursorY.load(std::memory_order_relaxed); }
+    int   OsuCombo()    { return s_osuCombo.load(std::memory_order_relaxed); }
+    int   OsuMaxCombo() { return s_osuMaxCombo.load(std::memory_order_relaxed); }
+    float OsuLastDx()   { return s_osuLastDx.load(std::memory_order_relaxed); }
+    float OsuLastDy()   { return s_osuLastDy.load(std::memory_order_relaxed); }
+    int   OsuMissCount(){ return s_osuMissN.load(std::memory_order_relaxed); }
+    void  OsuReset()
+    {
+        s_osuCombo.store(0, std::memory_order_relaxed);
+        s_osuMaxCombo.store(0, std::memory_order_relaxed);
+        s_osuMissN.store(0, std::memory_order_relaxed);
+        s_osuLastDx.store(0.f, std::memory_order_relaxed);
+        s_osuLastDy.store(0.f, std::memory_order_relaxed);
+    }
+    int  OsuPreemptMs() { return s_osuPreemptMs.load(std::memory_order_relaxed); }
+    void OsuPreemptSet(int ms)
+    {
+        if (ms < 300) ms = 300;
+        if (ms > 2500) ms = 2500;
+        s_osuPreemptMs.store(ms, std::memory_order_relaxed);
+    }
+    int  OsuOd() { return s_osuOd.load(std::memory_order_relaxed); }
+    void OsuOdSet(int od)
+    {
+        if (od < 0) od = 0;
+        if (od > 10) od = 10;
+        s_osuOd.store(od, std::memory_order_relaxed);
     }
 
     // ---------------- 长按尾端（松手拍）判定 ----------------
@@ -3493,7 +4544,7 @@ namespace Chart4K
         s_jdLastTime.store(clock, std::memory_order_relaxed);
         s_jdLastLane.store(lane, std::memory_order_relaxed);
         s_jdLastOff.store(off, std::memory_order_relaxed);
-        SkinLua::PushHit(kind, off * 1000.0);             // 皮肤 Lua：OnHit/HitEvent
+        SkinLua::PushHit(kind, off * 1000.0, lane + 1);   // 皮肤 Lua：OnHit/HitEvent（HitX = 轨号 1 起）
         if (kind == 3 && s_hitFx.load(std::memory_order_relaxed))
         {
             HitFx fx;
@@ -3533,6 +4584,40 @@ namespace Chart4K
                 JdTailCount((dt > perf) ? 2 : 0, dt, clock, lane);
             }
             return;
+        }
+    }
+
+    // CATCH（无轨）：松手时结算"当前那条还挂着的长条"，不区分轨
+    static void JudgeHoldReleaseAny(double clock)
+    {
+        const double win  = JudgeWinMs()  / 1000.0;
+        const double perf = JudgePerfMs() / 1000.0;
+        std::lock_guard<std::mutex> lk(s_notesMutex);
+        for (size_t i = 0; i < s_notes.size(); i++)
+        {
+            const Note& n = s_notes[i];
+            if (n.hold <= 0.f || !s_consumed[i] || s_missed[i] || s_tailDone[i])
+                continue;
+            const double dt = (n.time + (double)n.hold) - clock;
+            if (dt > win) { s_tailDone[i] = 2; JdTailCount(3, 0.0, clock, n.lane); }
+            else          { s_tailDone[i] = 1; JdTailCount((dt > perf) ? 2 : 0, dt, clock, n.lane); }
+            return;
+        }
+    }
+
+    // CATCH（无轨）：还有任意键按住时，长条到尾端即算 PERFECT
+    static void JudgeHoldScanAny(double clock, bool anyDown)
+    {
+        if (!anyDown) return;
+        std::lock_guard<std::mutex> lk(s_notesMutex);
+        for (size_t i = 0; i < s_notes.size(); i++)
+        {
+            const Note& n = s_notes[i];
+            if (n.hold <= 0.f || !s_consumed[i] || s_missed[i] || s_tailDone[i])
+                continue;
+            if (clock < n.time + (double)n.hold) continue;
+            s_tailDone[i] = 1;
+            JdTailCount(0, 0.0, clock, n.lane);
         }
     }
 
@@ -5422,18 +6507,20 @@ namespace Chart4K
     //  所以 Patch 直接写入 RoleMod 副本即可，和 info.asm 静态值同坐标系。
     static void MspApplyLuaPatch(const SkinLua::Patch& p, SkinMsp::RoleMod* d)
     {
-        // 脚本坐标单位（逆向自各皮肤 info.asm 与 .lua 的对照）：
-        //   · 模块声明过任一 X 位置字段（x / xu / dx）→ 脚本值按 1080 基准像素（u）解释。
-        //     证据：Mango233 time(dx=-295,dxu=1) 的 Lua True_Time.X=-840*scale；
-        //           Rurudo rrdcb(x=-25,xu=1) 的 Lua X=520 / DoMoveX 520→0。
-        //   · 模块完全没有声明 X（x=xu=dx=0）→ 脚本值按百分比解释。
-        //     证据：Phigros effect/particle、Kalpa hit1..5 的 Lua X=11.34+22.68*(hitx-1)，
-        //           是 4K 轨道中心百分比；旧实现一律按 u 解释 → 特效落在屏幕最左边 11..79px
-        //           （实测症状"左边一直出现白色的打击特效"，且与官方 Malody 位置不符）。
-        const bool xPosDeclared = (d->x != 0.f) || (d->xu != 0) || (d->dx != 0.f);
-        const bool yPosDeclared = (d->y != 0.f) || (d->yu != 0) || (d->dy != 0.f);
-        if (p.x) { d->dx = p.xv; d->dxu = xPosDeclared ? 1 : 0; }
-        if (p.y) { d->dy = p.yv; d->dyu = yPosDeclared ? 1 : 0; }
+        // 脚本 X / Y 恒为「单位量」（unit = 父矩形高 / 1080），没有百分比分支。
+        // 反汇编证据（MalodyV GameAssembly.dll，ImageBase 0x180000000）：
+        //   · SkinModuleBase.set_X   VA 0x18059C6D3：mulss xmm6,[this+0x38] → anchoredPosition.x
+        //         = value × unit（[this+0x38] 即 unit，见下）。
+        //   · SkinModuleBase.get_X   VA 0x18059BE43：anchoredPosition.x ÷ [this+0x38]（严格互逆）。
+        //   · SkinModuleBase.Awake   VA 0x18059B535：[this+0x38] = 父矩形高 ÷ 常量；
+        //         该常量 VA 0x182274DB0 = 0x44870000 = 1080.000000（已读出）。
+        //   全程不存在「按父尺寸百分比」的分支 → 旧实现按 xPosDeclared 猜百分比是错的
+        //   （percent 会把脚本值再除以父宽，等于对已修好的 unit 做了二次补偿）。
+        // 数值自证（Phigros V phi.lua）：spx = 11.34 + 22.68*(hitx-1)，unit = 20000*scale*u/1080；
+        //   22.68 × 18.5185 = 420 ≈ 一条轨宽 (gw-240.7595u)/4 = 419.81
+        //   11.34 × 18.5185 = 210 ≈ 半个轨宽 → (i+0.5)×laneW，精确落在轨心。
+        if (p.x) { d->dx = p.xv; d->dxu = 1; }
+        if (p.y) { d->dy = p.yv; d->dyu = 1; }
         if (p.color)
         {
             const int r = p.cr < 0 ? 0 : (p.cr > 255 ? 255 : p.cr);
@@ -5641,6 +6728,66 @@ namespace Chart4K
             }
         }
     }
+    // ---------------- 每模式开关持久化（模式辅助 / 宏打歌 / 自动打歌） ----------------
+    //   此前这三组开关只存在内存里，重开游戏即丢：别人拿到发布包后打开「宏模式」
+    //   勾了参与模式，却没开对应的模式辅助 —— 而 DrawPlayfield 在 ActiveModeIndex()<0
+    //   时直接返回（不铺覆盖层也不跑 AutoPlayTick），于是表现为"宏不生效"。
+    //   这里把三者一起写进 adofai_perfect.cfg，下次启动自动恢复现场。
+    static void ModeCfgSave()
+    {
+        for (int i = 0; i < kModeN; i++)
+        {
+            char k[24];
+            snprintf(k, sizeof(k), "mode%d.en",    i); I18N::Prefs::SetInt(k, s_en[i].load(std::memory_order_relaxed) ? 1 : 0);
+            snprintf(k, sizeof(k), "mode%d.macro", i); I18N::Prefs::SetInt(k, s_macroPlay[i].load(std::memory_order_relaxed) ? 1 : 0);
+            snprintf(k, sizeof(k), "mode%d.auto",  i); I18N::Prefs::SetInt(k, s_autoPlay[i].load(std::memory_order_relaxed) ? 1 : 0);
+            snprintf(k, sizeof(k), "mode%d.ckill",  i); I18N::Prefs::SetInt(k, s_catchKill[i].load(std::memory_order_relaxed) ? 1 : 0);
+            snprintf(k, sizeof(k), "mode%d.cplate", i); I18N::Prefs::SetInt(k, s_catchPlateW[i].load(std::memory_order_relaxed));
+        }
+        I18N::Prefs::SetInt("macro_acc",   s_macroAcc.load(std::memory_order_relaxed));
+        I18N::Prefs::SetInt("macro_human", s_macroHuman.load(std::memory_order_relaxed));
+        I18N::Prefs::SetInt("catch_playacc", s_catchPlayAcc.load(std::memory_order_relaxed));
+        I18N::Prefs::Save();
+    }
+    static void ModeCfgLoadOnce()
+    {
+        static bool done = false;
+        if (done) return;
+        done = true;
+        for (int i = 0; i < kModeN; i++)
+        {
+            char k[24];
+            snprintf(k, sizeof(k), "mode%d.en",    i); s_en[i].store(I18N::Prefs::GetInt(k, 0) != 0, std::memory_order_relaxed);
+            snprintf(k, sizeof(k), "mode%d.macro", i); s_macroPlay[i].store(I18N::Prefs::GetInt(k, 0) != 0, std::memory_order_relaxed);
+            snprintf(k, sizeof(k), "mode%d.auto",  i); s_autoPlay[i].store(I18N::Prefs::GetInt(k, 0) != 0, std::memory_order_relaxed);
+            snprintf(k, sizeof(k), "mode%d.ckill",  i); s_catchKill[i].store(I18N::Prefs::GetInt(k, 1) != 0, std::memory_order_relaxed);
+            snprintf(k, sizeof(k), "mode%d.cplate", i); s_catchPlateW[i].store(I18N::Prefs::GetInt(k, 160), std::memory_order_relaxed);
+        }
+        // 宏打歌依赖对应模式的键位/判定管线：存档里若只有宏没开模式，补开一次，
+        // 否则覆盖层不铺、宏永远不跑（老配置 / 手改 cfg 的兜底）。
+        for (int i = 0; i < kModeN; i++)
+        {
+            if (s_macroPlay[i].load(std::memory_order_relaxed))
+            {
+                for (int j = 0; j < kModeN; j++)
+                    s_en[j].store(j == i, std::memory_order_relaxed);
+                break;
+            }
+        }
+        int acc = I18N::Prefs::GetInt("macro_acc", 98);
+        if (acc < 90) acc = 90;
+        if (acc > 100) acc = 100;
+        s_macroAcc.store(acc, std::memory_order_relaxed);
+        int hum = I18N::Prefs::GetInt("macro_human", 60);
+        if (hum < 0) hum = 0;
+        if (hum > 100) hum = 100;
+        s_macroHuman.store(hum, std::memory_order_relaxed);
+        int cpa = I18N::Prefs::GetInt("catch_playacc", 100);
+        if (cpa < 0) cpa = 0;
+        if (cpa > 100) cpa = 100;
+        s_catchPlayAcc.store(cpa, std::memory_order_relaxed);
+    }
+
     // ---------------- 主绘制 ----------------
     // 版面按示例图（Malody V · Rurudo 4K）逐像素实测重建，1080p 基准 u = gh/1080：
     //   轨道外框 744u（金边 11u）· 内侧键区 177u×4 · 音符 168×63u
@@ -5664,6 +6811,10 @@ namespace Chart4K
         else if (!_stricmp(v, "5k")) mi = 1;
         else if (!_stricmp(v, "6k")) mi = 2;
         else if (!_stricmp(v, "10k")) mi = 3;
+        else if (!_stricmp(v, "16k") || !_stricmp(v, "pad")) mi = 4;
+        else if (!_stricmp(v, "catch")) mi = 5;
+        else if (!_stricmp(v, "8k")) mi = kMode8K;
+        else if (!_stricmp(v, "osu")) mi = kModeOsu;
         if (mi >= 0)
         {
             for (int i = 0; i < kModeN; i++)
@@ -5681,20 +6832,135 @@ namespace Chart4K
                     Log::Printf("[debug] style set by env: %d (mode %d)", sv, mi);
                 }
             }
+
+            // 同批测试钩子：ADOFAI_PERFECT_PSEUDO2=1 打开伪双押优化（回归测试用）
+            char p2[16] = { 0 };
+            if (GetEnvironmentVariableA("ADOFAI_PERFECT_PSEUDO2", p2, sizeof(p2)) > 0)
+            {
+                s_pseudo2[mi].store(atoi(p2) != 0 ? 1 : 0, std::memory_order_relaxed);
+                Log::Printf("[debug] pseudo2 set by env: %d (mode %d)", atoi(p2) != 0, mi);
+            }
+        }
+    }
+
+    // ---------------- 录制引擎（与"谱面是否就绪"解耦） ----------------
+    //   旧实现把 Start/Stop 放在 DrawPlayfield 末尾，而 DrawPlayfield 在"谱面未就绪"
+    //   时会提前 return —— 于是在菜单/结算界面点"开始录制"只置了 wanted 标记、
+    //   编码器从未建起来，UI 一直显示 0/x，看起来就是"没录上"。
+    //   这里拆成独立 tick：手动录制在任意界面都能立刻开始；自动录制仍只在关卡内起录。
+    static int   s_recStopSec = -1;      // 测试钩子（ADOFAI_PERFECT_RECSTOP）：N 秒后自动停
+    static DWORD s_recStopT0  = 0;
+    void RecStopArm(int sec) { s_recStopSec = (sec > 0) ? sec : -1; s_recStopT0 = GetTickCount(); }
+
+    // 一次性环境变量钩子（仅自动化测试用，正常游玩零开销）：
+    //   ADOFAI_PERFECT_AUTOPLAY=1|macro、ADOFAI_PERFECT_RECORD=1、ADOFAI_PERFECT_RECDIR=<目录>、
+    //   ADOFAI_PERFECT_RECSTOP=<秒>、ADOFAI_PERFECT_FIRE=1
+    static void TestEnvOnce()
+    {
+        static bool s_done = false;
+        if (s_done) return;
+        s_done = true;
+        const int mi = ActiveModeIndex();
+        const char* ap = getenv("ADOFAI_PERFECT_AUTOPLAY");
+        if (ap && ap[0] && mi >= 0)
+        {
+            if (!_stricmp(ap, "macro")) s_macroPlay[mi].store(true, std::memory_order_relaxed);
+            else if (ap[0] == '1')      s_autoPlay[mi].store(true, std::memory_order_relaxed);
+            Log::Printf("[test] autoplay hook '%s' -> auto=%d macro=%d", ap,
+                        (int)s_autoPlay[mi].load(std::memory_order_relaxed),
+                        (int)s_macroPlay[mi].load(std::memory_order_relaxed));
+        }
+        const char* rd = getenv("ADOFAI_PERFECT_RECDIR");
+        if (rd && rd[0]) { RecDirSet(rd); Log::Printf("[test] rec dir '%s'", rd); }
+        const char* rc = getenv("ADOFAI_PERFECT_RECORD");
+        if (rc && rc[0] == '1')
+        {
+            RecAutoSet(0);
+            RecOnSet(1);
+            Log::Printf("[test] record hook on");
+        }
+        const char* rs = getenv("ADOFAI_PERFECT_RECSTOP");
+        if (rs && rs[0]) RecStopArm(atoi(rs));
+        const char* fm = getenv("ADOFAI_PERFECT_FIRE");
+        if (fm && fm[0] == '1')
+        {
+            s_macroFire.store(true, std::memory_order_relaxed);   // 测试钩子：不写配置
+            for (int i = 0; i < kModeN; i++)
+            {
+                s_macroPlay[i].store(false, std::memory_order_relaxed);
+                s_autoPlay[i].store(false, std::memory_order_relaxed);
+            }
+            Log::Printf("[test] fire macro hook on");
+        }
+    }
+
+    static void RecEngineTick(bool inPlay)
+    {
+        RecCfgLoadOnce();
+        const bool on     = s_recOn.load(std::memory_order_relaxed);
+        const bool paused = s_recPaused.load(std::memory_order_relaxed);
+        const bool autoRec = s_recAuto.load(std::memory_order_relaxed);
+        if (s_recStopSec > 0 && s_recStopT0 &&
+            (GetTickCount() - s_recStopT0) > (DWORD)s_recStopSec * 1000u)
+        {
+            const int ran = (int)((GetTickCount() - s_recStopT0) / 1000u);
+            s_recStopSec = -1;
+            Log::Printf("[test] rec auto-stop after %ds", ran);
+            RecOnSet(0);                     // 走 RecCfgApply → Stop()
+            return;
+        }
+        RenderHook_SetRecordWanted(on && !paused);
+        if (on && !paused)
+        {
+            if (!autoRec || inPlay)          // 手动：任意界面；自动：仅关卡内
+            {
+                if (!GameRecorder::Active())
+                {
+                    if (GameRecorder::Start(s_recDir, s_recFps.load(std::memory_order_relaxed),
+                                            s_recMbps.load(std::memory_order_relaxed)))
+                        Log::Printf("[rec] start (inPlay=%d auto=%d dir='%s')",
+                                    (int)inPlay, (int)autoRec, s_recDir);
+                }
+            }
+            else if (GameRecorder::Active())  // 自动录制 + 离开关卡
+            {
+                GameRecorder::Stop();
+                Log::Printf("[rec] auto stop (left level)");
+            }
+        }
+        else if (GameRecorder::Active())
+        {
+            GameRecorder::Stop();
+            Log::Printf("[rec] stop (toggle off/paused)");
         }
     }
 
     void DrawPlayfield()
     {
-        ApplyEnableEnvOnce();
+        ModeCfgLoadOnce();          // 恢复上次的模式辅助 / 宏 / 自动开关
+        ApplyEnableEnvOnce();       // 测试钩子优先级更高（覆盖加载结果）
+        TestEnvOnce();              // 一次性环境变量钩子（自动打歌 / 录制 / 冰火宏，仅测试用）
+        RecEngineTick(false);       // 录制引擎：不依赖谱面是否就绪（菜单里也能起录）
         const int  mi = ActiveModeIndex();
         if (mi < 0)
         {
             RenderHook_SetCaptureWanted(false);
             return;
         }
+        // 谱面未就绪（菜单 / 编辑器 / DLC 关卡提取尚未成功）→ 不铺任何覆盖层。
+        // 旧行为在没有谱面时也照画轨道、键条与底板，会把游戏原本的菜单、结算画面
+        // 和"金币任务"界面挡住，看起来就是"卡关 / 没法完成收集金币的任务"。
+        // 提取成功（notes>0）后才开始绘制。
+        if (s_noteCount.load(std::memory_order_relaxed) <= 0)
+        {
+            RenderHook_SetCaptureWanted(false);
+            return;
+        }
         // 键位布局由模式决定：4K=DFJK / 5K=SDFJK / 6K=SDFJKL / 10K=ASDFG+HJKL;
         const int  cols = kLanesOf[mi];
+        const bool padMode = (cols == 16);   // 16K：4x4 面板（PAD），渲染/几何另走一路
+        const bool catchMode = (mi == 5);     // CATCH：无轨道下落雨（独立覆盖层）
+        const bool osuMode   = (mi == 7);     // OSU：戳泡泡（独立覆盖层）
         int vkBuf[kMaxLanes];
         for (int i = 0; i < kMaxLanes; i++)
             vkBuf[i] = 0;
@@ -5704,22 +6970,55 @@ namespace Chart4K
 
         float gw = 1280.f, gh = 720.f;
         RenderHook::GetGameWindowSize(&gw, &gh);
+        // 尺寸兜底：最小化/窗口重建期间客户区会短暂为 0x0，这时必须沿用上一帧有效值，
+        // 直接 return 会让整帧覆盖层消失（症状：谱面忽然不显示，日志里 "bad window size"）。
+        static float s_szW = 0.f, s_szH = 0.f;
         if (gw < 200.f || gh < 200.f)
         {
             static DWORD s_lastSzLog = 0;
             if (GetTickCount() - s_lastSzLog > 2000)
             {
                 s_lastSzLog = GetTickCount();
-                Log::Printf("[4K] draw: bad window size %.0fx%.0f -> skip", gw, gh);
+                Log::Printf("[4K] draw: bad window size %.0fx%.0f (fallback %.0fx%.0f)",
+                            gw, gh, s_szW, s_szH);
             }
-            return;
+            if (s_szW < 200.f || s_szH < 200.f) return;
+            gw = s_szW; gh = s_szH;
+        }
+        else
+        {
+            s_szW = gw; s_szH = gh;
         }
 
-        if (!s_skinLoaded)
+        // 每模式皮肤：切换模式时卸载并重新加载该模式自己的皮肤（皮肤不互通）
         {
-            static int s_frame = 0;
-            if ((s_frame++ % 30) == 0)
-                LoadSkin();
+            static int   s_skinModeLoaded = -1;
+            static int   s_skinTryCount = 0;
+            static DWORD s_skinNextTryMs = 0;
+            if (s_skinModeLoaded != mi)
+            {
+                s_skinModeLoaded = mi;
+                s_skinLoaded = false;
+                s_skinTryCount = 0;
+                s_skinNextTryMs = 0;
+            }
+            s_loadSkinMode = catchMode ? -1 : mi;
+            // CATCH 用内置 Dylamo 皮肤（ChartCatch.cpp 自管），不加载轨道皮肤。
+            // 限流但不放弃：前 6 次每 400ms 试一次（快速就绪），之后降为每 5s 一次 ——
+            // 皮肤文件夹晚到（换歌 / 切模式 / 用户中途放入 KSkin）也能自动恢复显示；
+            // 低频重试不会像旧版（每 30 帧无限重试）那样在渲染线程里反复全量扫描。
+            if (!s_skinLoaded && !catchMode)
+            {
+                const DWORD tn = GetTickCount();
+                if (tn >= s_skinNextTryMs)
+                {
+                    const DWORD interval = (s_skinTryCount < 6) ? 400u : 5000u;
+                    s_skinNextTryMs = tn + interval;
+                    s_skinTryCount++;
+                    if (!LoadSkin() && s_skinTryCount == 6)
+                        Log::Printf("[skin] slow retry (5s) mode %d; chart shows once KSkin/skin is ready", mi);
+                }
+            }
         }
 
         const float u = gh / 1080.f;
@@ -5815,20 +7114,23 @@ namespace Chart4K
             {
                 const KeyPressEv ev = s_keyEv[s_keyEvRead % kKeyEvN];
                 s_keyEvRead++;
+                if (catchMode || osuMode) continue;       // CATCH/OSU：键鼠由各自覆盖层处理，键盘事件不参与轨道判定
                 if (ev.wallT < wallNow - 1.0) continue;   // 暂停/切关期间积压的事件丢弃
                 if (ev.lane < 0 || ev.lane >= cols) continue;
-                if (ev.vk != vkp[ev.lane])     continue;  // 键位已改，丢弃旧事件
+                // CATCH 无轨：任意键都是有效输入（事件 lane 恒为 0），不做键位比对
+                if (!catchMode && ev.vk != vkp[ev.lane]) continue;  // 键位已改，丢弃旧事件
                 if (!inPlay)                   continue;
                 if (ev.kind == 1)              // 抬起：只用于长按尾端判定
                 {
-                    JudgeHoldRelease(ev.lane, ev.songT);
+                    if (catchMode) JudgeHoldReleaseAny(ev.songT);
+                    else           JudgeHoldRelease(ev.lane, ev.songT);
                     continue;
                 }
                 keyHit[ev.lane] = true;
                 SkinLua::PushInput(1, ev.lane + 1);   // 皮肤 Lua：OnInput/InputEvent
                 s_keyPressCount[ev.lane].fetch_add(1, std::memory_order_relaxed);
                 s_keyHist[ev.lane][(s_keyHistPos[ev.lane]++) & 63] = nowT;
-                JudgePress(ev.lane, ev.songT);
+                JudgePress(catchMode ? 0 : ev.lane, ev.songT, catchMode);
                 s_poseUntil[ev.lane] = nowT + 0.18;
             }
         }
@@ -5836,44 +7138,6 @@ namespace Chart4K
             if (keyDown[i] && inPlay)
                 s_poseUntil[i] = std::max(s_poseUntil[i], nowT + 0.10);
         // 自动 / 宏打歌：内部虚拟按键（不注入系统键鼠），与真人输入共用同一条判定管线
-        //   （一次性环境变量钩子：ADOFAI_PERFECT_AUTOPLAY=1|macro、ADOFAI_PERFECT_RECORD=1、
-        //     ADOFAI_PERFECT_RECDIR=<目录>，仅用于自动化测试）
-        {
-            static bool s_envOnce = false;
-            if (!s_envOnce)
-            {
-                s_envOnce = true;
-                const char* ap = getenv("ADOFAI_PERFECT_AUTOPLAY");
-                if (ap && ap[0])
-                {
-                    if (!_stricmp(ap, "macro")) s_macroPlay[mi].store(true, std::memory_order_relaxed);
-                    else if (ap[0] == '1')      s_autoPlay[mi].store(true, std::memory_order_relaxed);
-                    Log::Printf("[test] autoplay hook '%s' -> auto=%d macro=%d", ap,
-                                (int)s_autoPlay[mi].load(std::memory_order_relaxed),
-                                (int)s_macroPlay[mi].load(std::memory_order_relaxed));
-                }
-                const char* rd = getenv("ADOFAI_PERFECT_RECDIR");
-                if (rd && rd[0]) { RecDirSet(rd); Log::Printf("[test] rec dir '%s'", rd); }
-                const char* rc = getenv("ADOFAI_PERFECT_RECORD");
-                if (rc && rc[0] == '1')
-                {
-                    RecAutoSet(0);
-                    RecOnSet(1);
-                    Log::Printf("[test] record hook on");
-                }
-                const char* fm = getenv("ADOFAI_PERFECT_FIRE");
-                if (fm && fm[0] == '1')
-                {
-                    s_macroFire.store(true, std::memory_order_relaxed);   // 测试钩子：不写配置
-                    for (int mi2 = 0; mi2 < kModeN; mi2++)
-                    {
-                        s_macroPlay[mi2].store(false, std::memory_order_relaxed);
-                        s_autoPlay[mi2].store(false, std::memory_order_relaxed);
-                    }
-                    Log::Printf("[test] fire macro hook on");
-                }
-            }
-        }
         if (inPlay)
         {
             static double s_lastNowT = 0.0;
@@ -5881,7 +7145,7 @@ namespace Chart4K
             s_lastNowT = nowT;
             if (frameDt < 0.0 || frameDt > 0.5) frameDt = 0.016;
             const double lead = std::min(0.12, std::max(0.020, frameDt * 1.5));
-            AutoPlayTick(clock, nowT, lead);
+            if (!catchMode && !osuMode) AutoPlayTick(clock, nowT, lead);   // CATCH/OSU 自带判定，不走通用自动/宏管线
             {
                 static DWORD s_lastAutoLog = 0;
                 const bool autoOn = s_autoPlay[mi].load(std::memory_order_relaxed) ||
@@ -5910,51 +7174,91 @@ namespace Chart4K
             for (int i = 0; i < kMaxLanes; i++)
                 s_virtualDown[i] = false;
         }
-        // 自动录制：画面源 = 游戏原生后缓冲（不含本工具覆盖层）
+        // 录制引擎：画面源 = 游戏原生后缓冲（不含本工具覆盖层）。
+        //   本帧带真实 inPlay（自动模式据此"进关卡起录 / 离开关卡停录"）。
+        RecEngineTick(inPlay);
         {
-            static bool s_wasInPlay = false;
-            RecCfgLoadOnce();
-            const bool recOn = s_recOn.load(std::memory_order_relaxed);
-            const bool recPaused = s_recPaused.load(std::memory_order_relaxed);
-            RenderHook_SetRecordWanted(recOn && !recPaused);
-            if (recOn && !recPaused)
+            static const bool s_recDiag = [] {
+                char v[8] = { 0 };
+                return GetEnvironmentVariableA("ADOFAI_PERFECT_DIAG", v, sizeof(v)) > 0 && v[0] == '1';
+            }();
+            static DWORD s_lastRecDiag = 0;
+            if (s_recDiag && GameRecorder::Active() && GetTickCount() - s_lastRecDiag > 3000)
             {
-                const bool autoRec = s_recAuto.load(std::memory_order_relaxed);
-                const int fps = s_recFps.load(std::memory_order_relaxed);
-                const int mbps = s_recMbps.load(std::memory_order_relaxed);
-                if (!autoRec)
-                {
-                    if (!GameRecorder::Active())
-                    {
-                        Log::Printf("[rec] start (manual, dir='%s')", s_recDir);
-                        GameRecorder::Start(s_recDir, fps, mbps);
-                    }
-                }
-                else if (inPlay && !s_wasInPlay)
-                {
-                    if (!GameRecorder::Active()) GameRecorder::Start(s_recDir, fps, mbps);
-                    Log::Printf("[rec] auto start (inPlay)");
-                }
-                else if (!inPlay && s_wasInPlay)
-                {
-                    GameRecorder::Stop();
-                    Log::Printf("[rec] auto stop");
-                }
+                s_lastRecDiag = GetTickCount();
+                int fi = 0, fo = 0, dr = 0; double sec = 0.0;
+                GameRecorder::GetStats(&fi, &fo, &dr, &sec);
+                Log::Printf("[rec] diag in=%d written=%d dropped=%d t=%.1fs err='%s'",
+                            fi, fo, dr, sec, GameRecorder::LastError());
             }
-            else if (GameRecorder::Active())
-            {
-                Log::Printf("[rec] stop (toggle off)");
-                GameRecorder::Stop();
-            }
-            s_wasInPlay = inPlay;
         }
         if (s_resetKeys.exchange(false, std::memory_order_relaxed))
             for (int i = 0; i < kMaxLanes; i++)
                 s_keyPressCount[i].store(0, std::memory_order_relaxed);
         if (inPlay)
         {
-            JudgeMissScan(clock);
-            JudgeHoldScan(clock, keyDown);
+            if (catchMode)
+            {
+                // CATCH v2（一键自动接 + 鼠标接盘 + 漏音即死）：
+                //   接盘横坐标 = 鼠标 X（菜单打开或鼠标离开窗口时保持原位，避免跳变）；
+                //   雨点落线瞬间被接盘盖住即自动接住，没盖住判 MISS。
+                const ImVec2 mp = ImGui::GetIO().MousePos;
+                const bool menuOpen = CheatState::MenuVisible.load(std::memory_order_relaxed);
+                static float s_plateX = 0.5f;
+                if (!menuOpen && mp.x >= 0.f && mp.x <= gw && mp.y >= 0.f && mp.y <= gh)
+                {
+                    const float dt = std::min(0.05f, (float)ImGui::GetIO().DeltaTime);
+                    s_plateX += (mp.x / gw - s_plateX) * (1.f - expf(-dt * 40.f));   // 平滑跟随
+                    if (s_plateX < 0.02f) s_plateX = 0.02f;
+                    if (s_plateX > 0.98f) s_plateX = 0.98f;
+                    CatchSetPlateX(s_plateX);
+                }
+                const float halfW = 0.5f * (float)CatchPlateWMil() / 1000.f;
+                // MISS 不做任何自动返回 / 重开：判定照常显示，继续游玩即可
+                // （是否致死完全交给游戏原关自身判定 / 玩家的不死开关）。
+                CatchTick(clock, CatchPlateX(), halfW);
+            }
+            else if (osuMode)
+            {
+                // OSU（戳泡泡）：光标 = 鼠标；点击 = 鼠标左/右键 或 Z / X（osu! 默认键）。
+                //   判定窗按 OD；一次点击只算一个泡泡（最近未命中的那个）。
+                const ImVec2 mp = ImGui::GetIO().MousePos;
+                const bool menuOpen = CheatState::MenuVisible.load(std::memory_order_relaxed);
+                float fx0, fy0, fw, fh;
+                OsuFieldRect(gw, gh, &fx0, &fy0, &fw, &fh);
+                float px = 256.f, py = 192.f;
+                if (fw > 1.f && fh > 1.f)
+                {
+                    px = (mp.x - fx0) / fw * 512.f;
+                    py = (mp.y - fy0) / fh * 384.f;
+                }
+                const ImGuiIO& io = ImGui::GetIO();
+                static bool s_prevClick = false;
+                bool down = io.MouseDown[0] || io.MouseDown[1];
+                if (cols >= 2)
+                {
+                    down = down ||
+                           ((GetAsyncKeyState(0x5A) & 0x8000) != 0) ||   // Z
+                           ((GetAsyncKeyState(0x58) & 0x8000) != 0);     // X
+                }
+                const bool edge = down && !s_prevClick;
+                s_prevClick = down;
+                if (menuOpen) { px = 256.f; py = 192.f; }
+                OsuTick(clock, px, py, edge && !menuOpen, down);
+            }
+            else
+            {
+                JudgeMissScan(clock);
+                JudgeHoldScan(clock, keyDown);
+            }
+        }
+
+        // CATCH：公共判定 / 自动 / 宏已经跑完，交给独立覆盖层渲染（雨 + 接盘 + HUD）
+        if (catchMode || osuMode)
+        {
+            if (catchMode) DrawCatchOverlay();
+            else           DrawOsuOverlay();
+            return;
         }
 
         // KPS：最近 1 秒内每轨按键次数（右上数字）
@@ -6084,11 +7388,208 @@ namespace Chart4K
         char pfId[32];
         snprintf(pfId, sizeof(pfId), "##playfield_%d", mi);
         ImGui::Begin(pfId, nullptr, fl);
+        StreamMode::MarkWindow(pfId, StreamMode::EL_TRACK);   // 直播模式：下坠谱面/轨道辅助
         // 皮肤整屏窗口永远压到 ImGui 显示序最底层：菜单/MOD 窗口/KeyViewer 都在其之上，
         // 避免皮肤立绘（L4 大图）盖住本工具界面。依据：imgui.cpp BringWindowToDisplayBack。
         ImGui::BringWindowToDisplayBack(ImGui::GetCurrentWindow());
         ImDrawList* dl = ImGui::GetWindowDrawList();
 
+        // ================= 16K（PAD）：4x4 面板渲染（独立版式，非下落式）=================
+        if (padMode)
+        {
+            const float op = (float)opacity / 255.f;
+            float side = gh * 0.70f;
+            if (side > gw * 0.46f) side = gw * 0.46f;
+            if (side < 260.f * u) side = 260.f * u;
+            const float cell = side / 4.f;
+            const float gx = cx - side * 0.5f;
+            const float gy = gh * 0.58f - side * 0.5f;
+            const float rr = cell * 0.10f;
+            const float gap = cell * 0.055f;
+
+            dl->AddRectFilled(ImVec2(gx - cell * 0.08f, gy - cell * 0.08f),
+                              ImVec2(gx + side + cell * 0.08f, gy + side + cell * 0.08f),
+                              IM_COL32(12, 13, 16, (int)(210.f * op)), cell * 0.12f);
+
+            for (int i = 0; i < 16; i++)
+            {
+                const float x0 = gx + (i & 3) * cell, y0 = gy + (i >> 2) * cell;
+                const ImVec2 a(x0 + gap, y0 + gap), b(x0 + cell - gap, y0 + cell - gap);
+                dl->AddRectFilled(a, b, IM_COL32(30, 32, 37, (int)(238.f * op)), rr);
+                float act = 0.f;
+                if (keyDown[i]) act = 1.f;
+                else if (s_poseUntil[i] > nowT) act = (float)((s_poseUntil[i] - nowT) / 0.18);
+                if (s_laneHitBg[i] > act) act = s_laneHitBg[i];
+                if (act > 0.01f)
+                    dl->AddRectFilled(a, b, IM_COL32(110, 180, 255, (int)(160.f * act * op)), rr);
+                dl->AddRect(a, b, IM_COL32(92, 97, 108, (int)(200.f * op)), rr, 0, 2.f * u);
+                if (s_laneFlash[i] > 0.01f)
+                    dl->AddRect(a, b, IM_COL32(255, 255, 255, (int)(220.f * s_laneFlash[i] * op)),
+                                rr, 0, 3.f * u);
+            }
+
+            // 音符：面板中央的小方块随接近判定而放大到铺满面板（Malody Pad 的 marker 行为）
+            if (inPlay)
+            {
+                std::lock_guard<std::mutex> lk(s_notesMutex);
+                for (size_t i = 0; i < s_notes.size(); i++)
+                {
+                    const Note& n = s_notes[i];
+                    if (n.lane < 0 || n.lane >= 16) continue;
+                    const bool eaten = s_consumed[i];
+                    bool holding = false;
+                    if (n.hold > 0.f && eaten && s_tailDone[i] != 2 && n.lane < kMaxLanes)
+                    {
+                        const double tailT = n.time + (double)n.hold;
+                        if (clock <= tailT + 0.02 && (keyDown[n.lane] || s_poseUntil[n.lane] > nowT))
+                            holding = true;
+                    }
+                    if ((eaten || s_missed[i]) && !holding) continue;
+                    const double dt = n.time - clock;
+                    if (dt > fallTime) break;
+                    const float x0 = gx + (n.lane & 3) * cell, y0 = gy + (n.lane >> 2) * cell;
+                    const ImVec2 a(x0 + gap, y0 + gap), b(x0 + cell - gap, y0 + cell - gap);
+                    const float ccx = (a.x + b.x) * 0.5f, ccy = (a.y + b.y) * 0.5f;
+                    const float full = b.x - a.x;
+                    float k = 1.f - (float)(dt / (double)fallTime);
+                    if (k < 0.f) k = 0.f;
+                    if (k > 1.f) k = 1.f;
+                    const float sc = holding ? 1.f : (0.14f + 0.86f * k);
+                    const float hw = full * 0.5f * sc;
+                    ImU32 col = IM_COL32(246, 249, 255, (int)(240.f * op));
+                    if (n.hold > 0.f) col = IM_COL32(255, 206, 122, (int)(245.f * op));
+                    if (holding)      col = IM_COL32(255, 214, 140, (int)(235.f * op));
+                    dl->AddRectFilled(ImVec2(ccx - hw, ccy - hw), ImVec2(ccx + hw, ccy + hw),
+                                      col, cell * 0.08f);
+                    if (n.hold > 0.f && holding)
+                        dl->AddRect(a, b, IM_COL32(255, 214, 140, 235), rr, 0, 3.f * u);
+                }
+            }
+
+            // 打击特效：hits 动画居中于命中面板（MSP 或内置皮肤贴图；缺失时用光环兜底）
+            if (hitFx && inPlay)
+            {
+                const float kFxDur = 0.27f;
+                const int kFxN = (s_hitFxN > 1) ? s_hitFxN : 1;
+                const float kFxStep = kFxDur / (float)kFxN;
+                for (size_t i = 0; i < s_fx.size();)
+                {
+                    HitFx& fx = s_fx[i];
+                    const float age = (float)(nowT - fx.t0);
+                    if (age > kFxDur) { s_fx.erase(s_fx.begin() + (long)i); continue; }
+                    if (fx.lane >= 0 && fx.lane < 16)
+                    {
+                        const float px = gx + ((fx.lane & 3) + 0.5f) * cell;
+                        const float py = gy + ((fx.lane >> 2) + 0.5f) * cell;
+                        const float kk = age / kFxDur;
+                        if (fx.kind == 3)
+                        {
+                            dl->AddRect(ImVec2(px - cell * 0.42f, py - cell * 0.42f),
+                                        ImVec2(px + cell * 0.42f, py + cell * 0.42f),
+                                        IM_COL32(190, 60, 70, (int)((1.f - kk) * 170.f)), rr, 0, 3.f * u);
+                        }
+                        else if (s_texHits[0])
+                        {
+                            int frame = (int)(age / kFxStep);
+                            if (frame < 0) frame = 0;
+                            if (frame > kFxN - 1) frame = kFxN - 1;
+                            void* tex = s_texHits[frame];
+                            if (tex)
+                            {
+                                const float size = cell * 1.35f * fx.scale *
+                                    (0.90f + 0.24f * (float)frame / (float)(kFxN > 1 ? kFxN - 1 : 1));
+                                dl->AddImage(TRef(tex), ImVec2(px - size * 0.5f, py - size * 0.5f),
+                                             ImVec2(px + size * 0.5f, py + size * 0.5f),
+                                             ImVec2(0.f, 0.f), ImVec2(1.f, 1.f));
+                            }
+                        }
+                        else
+                        {
+                            dl->AddCircle(ImVec2(px, py), cell * (0.30f + 0.42f * kk),
+                                          IM_COL32(160, 220, 255, (int)((1.f - kk) * 200.f)), 0, 4.f * u);
+                        }
+                    }
+                    i++;
+                }
+            }
+
+            // ---- PAD HUD（左上信息 / 右上准确率 / 顶部连击 / 中央判定）----
+            {
+                const int    combo  = s_jdCombo.load(std::memory_order_relaxed);
+                const int    total  = s_jdTotal.load(std::memory_order_relaxed);
+                const double weight = s_jdWeight.load(std::memory_order_relaxed);
+                double acc = (total > 0) ? weight / (double)total : 1.0;
+                if (acc < 0.0) acc = 0.0;
+                if (acc > 1.0) acc = 1.0;
+
+                ImGui::PushFont(nullptr, 20.f * u);
+                char lb[160];
+                snprintf(lb, sizeof(lb), "16K PAD   LV %d   BPM %.0f",
+                         s_level.load(std::memory_order_relaxed),
+                         (double)s_bpm.load(std::memory_order_relaxed));
+                DrawTextShadow(dl, ImVec2(28.f * u, 24.f * u), IM_COL32(255, 255, 255, 235), lb);
+                const char* nm = (st.levelName[0] != 0) ? st.levelName : "ADOFAI";
+                if (strncmp(nm, "scn", 3) == 0) nm = "Custom Level";
+                DrawTextShadow(dl, ImVec2(28.f * u, 52.f * u), IM_COL32(210, 220, 240, 225), nm);
+                ImGui::PopFont();
+
+                ImGui::PushFont(nullptr, 26.f * u);
+                char ab[32];
+                snprintf(ab, sizeof(ab), "%.2f%%", acc * 100.0);
+                const ImVec2 asz = ImGui::CalcTextSize(ab);
+                DrawTextShadow(dl, ImVec2(gw - asz.x - 30.f * u, 26.f * u),
+                               IM_COL32(150, 232, 255, 245), ab);
+                ImGui::PopFont();
+
+                if (combo >= 2)
+                {
+                    ImGui::PushFont(nullptr, 40.f * u);
+                    char cb[24];
+                    snprintf(cb, sizeof(cb), "%d", combo);
+                    const ImVec2 csz = ImGui::CalcTextSize(cb);
+                    DrawTextShadow(dl, ImVec2(cx - csz.x * 0.5f, gy - csz.y - 22.f * u),
+                                   IM_COL32(255, 255, 255, 245), cb);
+                    ImGui::PopFont();
+                }
+
+                if (inPlay && s_judgePop.load(std::memory_order_relaxed))
+                {
+                    const int    kind = s_jdLastKind.load(std::memory_order_relaxed);
+                    const double age  = clock - s_jdLastTime.load(std::memory_order_relaxed);
+                    const double kPopDur = 0.55;
+                    if (kind >= 0 && kind <= 3 && age >= 0.0 && age < kPopDur)
+                    {
+                        const float kk = (float)(age / kPopDur);
+                        float aa = 1.f - kk * kk;
+                        if (aa < 0.f) aa = 0.f;
+                        const int alpha = (int)(255.f * aa);
+                        const char* label = (kind == 0) ? "MARVELOUS" : (kind == 1) ? "PERFECT"
+                                            : (kind == 2) ? "GOOD" : "MISS";
+                        const ImU32 lc = (kind == 0) ? IM_COL32(126, 255, 158, alpha)
+                                       : (kind == 1) ? IM_COL32(255, 226, 120, alpha)
+                                       : (kind == 2) ? IM_COL32(255, 172, 92, alpha)
+                                                     : IM_COL32(255, 92, 92, alpha);
+                        const float ease = 1.f - (1.f - kk) * (1.f - kk);
+                        ImGui::PushFont(nullptr, (1.05f - 0.32f * ease) * 30.f * u);
+                        const ImVec2 tsz = ImGui::CalcTextSize(label);
+                        DrawTextShadow(dl, ImVec2(cx - tsz.x * 0.5f, gy + side + 16.f * u), lc, label);
+                        ImGui::PopFont();
+                    }
+                }
+
+                double prog = (double)st.percentComplete;
+                if (prog < 0.0) prog = 0.0;
+                if (prog > 1.0) prog = 1.0;
+                const float pby = gy + side + 52.f * u;
+                dl->AddRectFilled(ImVec2(gx, pby), ImVec2(gx + side, pby + 6.f * u),
+                                  IM_COL32(255, 255, 255, 40), 3.f * u);
+                dl->AddRectFilled(ImVec2(gx, pby), ImVec2(gx + side * (float)prog, pby + 6.f * u),
+                                  IM_COL32(255, 210, 140, 235), 3.f * u);
+            }
+        }
+
+        if (!padMode)
+        {
         // ---- 轨道底板 + 网格 + 金边 ----
         if (!msp && s_texBg && s_bgEnabled)
             dl->AddImage(TRef(s_texBg), ImVec2(pfL, 0.f), ImVec2(pfR, gh),
@@ -6262,7 +7763,7 @@ namespace Chart4K
                             s_fakeNext = C.songT + 0.4;
                             const int kinds[4] = { 0, 1, 2, 3 };
                             const int fk = kinds[s_fakeK & 3];
-                            SkinLua::PushHit(fk, (s_fakeK & 1) ? 9.0 : -6.0);
+                            SkinLua::PushHit(fk, (s_fakeK & 1) ? 9.0 : -6.0, (s_fakeK & 3) + 1);
                             // 同步推进判定计数：让依赖 {miss}/{combo} 文本的皮肤脚本
                             // （如 Murasame hit_effect 的 ciallo 大图）走完整触发链路。
                             if (fk == 3)
@@ -6315,6 +7816,8 @@ namespace Chart4K
         }
 
         // ---- 音符（含长按条）：只在关卡真正开始后下落，未开始不显示 ----
+        // 皮肤贴图缺失（notex-*.png 没加载成功）时不画音符：宁可不画，也不要用
+        // 形状/颜色都不对的兜底图糊弄。skin 目录定位见 BuiltinSkinDir()。
         if (s_texNote && inPlay)
         {
             std::lock_guard<std::mutex> lk(s_notesMutex);
@@ -6913,6 +8416,8 @@ namespace Chart4K
                          ImVec2(gw, 781.f * u + 301.f * u));
         }   // if (!msp)
 
+        }   // if (!padMode)
+
         // ---- 左下角：冰与火之舞画面缩略图（"小窗"，不含本工具 UI）----
         //   位置/大小可在设置页调整（1080p 基准，随分辨率等比缩放）
         {
@@ -6945,6 +8450,28 @@ namespace Chart4K
         ImGui::PopStyleColor();
     }
     // ---------------- 键位自定义（4K / 6K 共用；确认后才写入生效） ----------------
+    // 可绑定的物理键范围：字母 / 数字 / 标点 (; ' [ ] \ , . / - = `) / 空格 / ENTER /
+    // TAB / BACK / DELETE / 方向键 / F1-F24 / 小键盘。鼠标键与修饰键不参与绑定，
+    // 避免误绑或与系统快捷键冲突（用户要求支持非字母数字键）。
+    static bool KeyCapturable(int vk)
+    {
+        if (vk <= 0x06) return false;                        // 鼠标键
+        if (vk >= VK_SHIFT && vk <= VK_MENU) return false;   // Shift / Ctrl / Alt
+        if (vk == VK_LWIN || vk == VK_RWIN || vk == VK_APPS) return false;
+        if (vk == VK_ESCAPE) return false;                   // ESC = 取消捕获
+        if (vk == VK_PAUSE || vk == VK_SCROLL) return false;
+        if (vk >= VK_F1 && vk <= VK_F24) return true;
+        if (vk >= VK_NUMPAD0 && vk <= VK_DIVIDE) return true;
+        if (vk >= VK_NUMLOCK && vk <= VK_OEM_102) return true;
+        if (vk >= '0' && vk <= '9') return true;
+        if (vk >= 'A' && vk <= 'Z') return true;
+        // 非字母/数字键（用户要求 4K/5K/6K/10K/16K 都能绑）：空格 / ENTER / TAB /
+        // BACK / DELETE / 方向键 / PgUp / PgDn / Home / End / Insert
+        if (vk == VK_BACK || vk == VK_TAB || vk == VK_RETURN || vk == VK_SPACE) return true;
+        if (vk >= VK_PRIOR && vk <= VK_DOWN) return true;
+        if (vk == VK_INSERT || vk == VK_DELETE) return true;
+        return false;
+    }
     static const int kCapVKs[] = {
         'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
         '0','1','2','3','4','5','6','7','8','9',
@@ -6981,7 +8508,54 @@ namespace Chart4K
         case VK_RETURN: snprintf(out, n, "EN"); break;
         case VK_BACK:   snprintf(out, n, "BS"); break;
         case VK_DELETE: snprintf(out, n, "DE"); break;
-        default:        snprintf(out, n, "%c", (vk >= 32 && vk < 127) ? (char)vk : '?'); break;
+        case VK_OEM_1:      snprintf(out, n, ";");  break;
+        case VK_OEM_PLUS:   snprintf(out, n, "=");  break;
+        case VK_OEM_COMMA:  snprintf(out, n, ",");  break;
+        case VK_OEM_MINUS:  snprintf(out, n, "-");  break;
+        case VK_OEM_PERIOD: snprintf(out, n, ".");  break;
+        case VK_OEM_2:      snprintf(out, n, "/");  break;
+        case VK_OEM_3:      snprintf(out, n, "`");  break;
+        case VK_OEM_4:      snprintf(out, n, "[");  break;
+        case VK_OEM_5:      snprintf(out, n, "\\"); break;
+        case VK_OEM_6:      snprintf(out, n, "]");  break;
+        case VK_OEM_7:      snprintf(out, n, "'");  break;
+        case VK_OEM_102:    snprintf(out, n, "\\"); break;
+        case VK_NUMLOCK:    snprintf(out, n, "NL"); break;
+        case VK_CAPITAL:    snprintf(out, n, "CL"); break;
+        case VK_INSERT:     snprintf(out, n, "IN"); break;
+        case VK_HOME:       snprintf(out, n, "HM"); break;
+        case VK_END:        snprintf(out, n, "ED"); break;
+        case VK_PRIOR:      snprintf(out, n, "PU"); break;
+        case VK_NEXT:       snprintf(out, n, "PD"); break;
+        case VK_NUMPAD0: case VK_NUMPAD1: case VK_NUMPAD2: case VK_NUMPAD3: case VK_NUMPAD4:
+        case VK_NUMPAD5: case VK_NUMPAD6: case VK_NUMPAD7: case VK_NUMPAD8: case VK_NUMPAD9:
+            snprintf(out, n, "N%d", vk - VK_NUMPAD0); break;
+        case VK_ADD:      snprintf(out, n, "N+"); break;
+        case VK_SUBTRACT: snprintf(out, n, "N-"); break;
+        case VK_MULTIPLY: snprintf(out, n, "N*"); break;
+        case VK_DIVIDE:   snprintf(out, n, "N/"); break;
+        case VK_DECIMAL:  snprintf(out, n, "N."); break;
+        default:
+            if (vk >= VK_F1 && vk <= VK_F24) snprintf(out, n, "F%d", vk - VK_F1 + 1);
+            else snprintf(out, n, "%c", (vk >= 32 && vk < 127) ? (char)vk : '?');
+            break;
+        }
+    }
+
+    // 键位列表 → 可读字符串（支持非字母数字键；空格分隔）
+    static void KeyListName(const int* vk, int n, char* out, size_t cap)
+    {
+        if (cap == 0) return;
+        out[0] = 0;
+        size_t c = 0;
+        for (int i = 0; i < n; i++)
+        {
+            char nm[8];
+            KeyName(vk[i], nm, sizeof(nm));
+            if (!nm[0]) continue;
+            int w = snprintf(out + c, cap - c, "%s%s", (i ? " " : ""), nm);
+            if (w <= 0 || (size_t)w >= cap - c) break;
+            c += (size_t)w;
         }
     }
 
@@ -6989,8 +8563,8 @@ namespace Chart4K
     static void LockCaptureKeys()
     {
         s_capLockedN = 0;
-        for (int k : kCapVKs)
-            if ((GetAsyncKeyState(k) & 0x8000) && s_capLockedN < 64)
+        for (int k = 0x07; k <= 0xFE && s_capLockedN < 64; k++)
+            if (KeyCapturable(k) && (GetAsyncKeyState(k) & 0x8000))
                 s_capLocked[s_capLockedN++] = k;
     }
     static bool CaptureKeyLocked(int vk)
@@ -7001,8 +8575,8 @@ namespace Chart4K
     }
     static int PollNewKey()
     {
-        for (int k : kCapVKs)
-            if ((GetAsyncKeyState(k) & 0x8000) && !CaptureKeyLocked(k))
+        for (int k = 0x07; k <= 0xFE; k++)
+            if (KeyCapturable(k) && (GetAsyncKeyState(k) & 0x8000) && !CaptureKeyLocked(k))
                 return k;
         return 0;
     }
@@ -7061,11 +8635,11 @@ namespace Chart4K
                 }
             }
             ImGui::SameLine();
-            char cur[16];
-            int c = 0;
-            for (int i = 0; i < n && c < 12; i++)
-                cur[c++] = (char)live[i].load(std::memory_order_relaxed);
-            cur[c] = 0;
+            int livevk[kMaxLanes];
+            for (int i = 0; i < n && i < kMaxLanes; i++)
+                livevk[i] = live[i].load(std::memory_order_relaxed);
+            char cur[160];
+            KeyListName(livevk, n, cur, sizeof(cur));
             ImGui::TextDisabled("%s", cur);
         }
         else
@@ -7089,7 +8663,8 @@ namespace Chart4K
                 }
                 if (cap == i)
                     ImGui::PopStyleColor();
-                if (i + 1 < n) ImGui::SameLine();
+                const int perRow = (n > 10) ? 4 : n;     // 16K PAD：4x4 分组排布
+                if (i + 1 < n && ((i + 1) % perRow) != 0) ImGui::SameLine();
             }
 
             if (cap >= 0)
@@ -7127,11 +8702,8 @@ namespace Chart4K
                     live[i].store(draft[i], std::memory_order_relaxed);
                 editing = false;
                 cap = -1;
-                char cur[16];
-                int c = 0;
-                for (int i = 0; i < n && c < 12; i++)
-                    cur[c++] = (char)draft[i];
-                cur[c] = 0;
+                char cur[160];
+                KeyListName(draft, n, cur, sizeof(cur));
                 Log::Printf("[%dK] key bind -> %s", n, cur);
             }
             if (dupAny)
@@ -7156,52 +8728,31 @@ namespace Chart4K
     // ---------------- 主窗口设置页 ----------------
     void BeginCard4K(const char* id, float height)
     {
-        (void)height;   // 兼容旧调用点：卡片高度改为随内容自适应，滚动统一交给页面外层
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.f, 1.f, 1.f, 0.045f));
-        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 10));
-        ImGui::BeginChild(id, ImVec2(0.f, 0.f), ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_None);
+        (void)height;   // 兼容旧调用点：卡片高度随内容自适应，滚动交给页面外层
+        UiKit::BeginCard(id);   // 统一走 UiKit（NEVERLOSE 风格：半透明圆角卡片 + 描边）
     }
     void EndCard4K()
     {
-        ImGui::EndChild();
-        ImGui::PopStyleVar(2);
-        ImGui::PopStyleColor();
+        UiKit::EndCard();
     }
 
     // 标题行 + 右侧开关；返回开关是否被点击。
     // 调用后光标停在标题行下方（描述/后续控件从这里开始），避免文字与开关重叠。
     bool TitleToggleRow(const char* id, float titleSize, const char* title, bool* v)
     {
-        const float x0 = ImGui::GetCursorPosX();
-        const float y0 = ImGui::GetCursorPosY();
-        const float avail = ImGui::GetContentRegionAvail().x;
-        ImGui::PushFont(nullptr, titleSize);
-        ImGui::TextUnformatted(title);
-        ImGui::PopFont();
-        ImGui::SetCursorPosX(x0 + avail - 62.f);
-        ImGui::SetCursorPosY(y0 - 1.f);
-        const bool clicked = MiniToggle(id, v);
-        ImGui::SetCursorPos(ImVec2(x0, y0 + titleSize + 10.f));
+        (void)titleSize;
+        // 统一走 UiKit 的卡片标题条（左侧强调竖条 + 标题 + 右侧药丸开关），
+        // 保证 4K/5K/6K/10K/16K/CATCH/读谱/录制/宏 各页外观完全一致。
+        ImGui::PushID(id);
+        const bool clicked = UiKit::CardTitle(title, v);
+        ImGui::PopID();
         return clicked;
     }
 
     bool MiniToggle(const char* id, bool* v)
     {
-        float w = 52.f, h = 26.f;
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        bool clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
-        if (clicked)
-            *v = !*v;
-        ImU32 bg = *v ? IM_COL32(46, 190, 160, 235) : IM_COL32(0, 0, 0, 110);
-        if (ImGui::IsItemHovered())
-            bg = *v ? IM_COL32(60, 220, 185, 255) : IM_COL32(255, 255, 255, 40);
-        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), bg, h * 0.5f);
-        float kx = p.x + 4.f + (*v ? 1.f : 0.f) * (w - 8.f - (h - 8.f));
-        dl->AddCircleFilled(ImVec2(kx + (h - 8.f) * 0.5f, p.y + h * 0.5f), (h - 8.f) * 0.5f,
-                            IM_COL32(250, 250, 252, 255));
-        return clicked;
+        // 统一走 UiKit（药丸开关 + 主题强调色 + 缓动动画），替换原先各自手绘的开关
+        return UiKit::Toggle(id, v);
     }
 
     // ---------------- 皮肤管理（皮肤页） ----------------
@@ -7241,6 +8792,7 @@ namespace Chart4K
             char title[128] = { 0 }, creator[128] = { 0 };
             int modeId = -1;
             SkinMsp::ReadMeta(d.c_str(), title, sizeof(title), creator, sizeof(creator), &modeId);
+            if (modeId == 3) return;   // Malody mode 3 = Catch：CATCH 用内置 Dylamo，不混入按键模式皮肤列表
             std::string tn = title[0] ? title : "";
             std::string cn = creator[0] ? creator : "";
             if (tn.empty())
@@ -7253,6 +8805,28 @@ namespace Chart4K
             s_skinListTitle.push_back(tn);
             s_skinListCreator.push_back(cn);
         };
+        // 0) 内置皮肤文件夹（KSkin / skin，位于 DLL 近邻或当前工作目录）
+        {
+            static const char* kLeaf[] = { "KSkin", "skin" };
+            for (int i = 0; i < 2; i++)
+            {
+                char bd[MAX_PATH * 2] = { 0 };
+                if (!ResolveSidecarDir(kLeaf[i], nullptr, bd, (int)sizeof(bd))) continue;
+                add(bd);
+                std::string pat = std::string(bd) + "\\*";
+                WIN32_FIND_DATAA fd{};
+                HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+                if (h != INVALID_HANDLE_VALUE)
+                {
+                    do
+                    {
+                        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+                        add(std::string(bd) + "\\" + fd.cFileName);
+                    } while (FindNextFileA(h, &fd));
+                    FindClose(h);
+                }
+            }
+        }
         // 1) 运行目录 skin\(子目录) 与 skin 本身
         std::string root = SkinDefaultRoot();
         add(root);
@@ -7375,11 +8949,68 @@ namespace Chart4K
         s_skinLoaded = false;
         Log::Printf("[skin] mode -> %s", on ? "builtin" : "msp");
     }
+
+    // ---- 每模式皮肤访问器（皮肤页用；PAD / CATCH / 4K / 5K / 6K / 10K 互不通用）----
+    bool SkinModeOverrideSet(int mi)
+    {
+        SkinModeOverrideLoadOnce();
+        return (mi >= 0 && mi < kModeN) ? s_skinModeOvSet[mi] : false;
+    }
+    const char* SkinActiveForMode(int mi)
+    {
+        SkinModeOverrideLoadOnce();
+        if (mi >= 0 && mi < kModeN && s_skinModeOvSet[mi])
+            return (s_skinBuiltinModeOv[mi] || !s_skinDirMode[mi][0]) ? BuiltinSkinDir() : s_skinDirMode[mi];
+        return SkinActive();
+    }
+    bool SkinBuiltinModeForMode(int mi)
+    {
+        if (mi == kModePad || mi == kModeOsu) return true;   // 16K（PAD）/ OSU：只有内置皮肤
+        SkinModeOverrideLoadOnce();
+        if (mi >= 0 && mi < kModeN && s_skinModeOvSet[mi]) return s_skinBuiltinModeOv[mi];
+        return SkinBuiltinMode();
+    }
+    bool SkinSetActiveFullForMode(int mi, const char* dir)
+    {
+        if (mi < 0 || mi >= kModeN) return false;
+        if (mi == kModePad || mi == kModeOsu)     // 16K（PAD）/ OSU：拒绝外部皮肤（需求）
+        {
+            Log::Printf("[skin] mode%d (built-in only) rejects external skin '%s'", mi, dir ? dir : "");
+            return false;
+        }
+        if (!dir || !dir[0] || !DirHasSkin(dir)) return false;
+        SkinModeOverrideLoadOnce();
+        snprintf(s_skinDirMode[mi], sizeof(s_skinDirMode[mi]), "%s", dir);
+        s_skinBuiltinModeOv[mi] = false;
+        s_skinModeOvSet[mi] = true;
+        char k[32];
+        snprintf(k, sizeof(k), "skin_dir_m%d", mi);  I18N::Prefs::SetStr(k, dir);
+        snprintf(k, sizeof(k), "skin_mode_m%d", mi); I18N::Prefs::SetStr(k, "msp");
+        I18N::Prefs::Save();
+        if (mi == ActiveModeIndex()) { s_skinReload = true; s_skinLoaded = false; }
+        Log::Printf("[skin] mode%d active -> %s", mi, dir);
+        return true;
+    }
+    void SkinSetBuiltinModeForMode(int mi, bool on)
+    {
+        if (mi < 0 || mi >= kModeN) return;
+        SkinModeOverrideLoadOnce();
+        s_skinBuiltinModeOv[mi] = on;
+        s_skinModeOvSet[mi] = true;
+        s_skinDirMode[mi][0] = 0;
+        char k[32];
+        snprintf(k, sizeof(k), "skin_mode_m%d", mi);
+        I18N::Prefs::SetStr(k, on ? "builtin" : "msp");
+        I18N::Prefs::Save();
+        if (mi == ActiveModeIndex()) { s_skinReload = true; s_skinLoaded = false; }
+        Log::Printf("[skin] mode%d builtin -> %d", mi, (int)on);
+    }
+
     void SkinOpenFolder()
     {
         std::string root = SkinDefaultRoot();
         CreateDirectoryA(root.c_str(), nullptr);
-        ShellExecuteA(nullptr, "open", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ShellAsync::Open(root.c_str());      // 渲染线程不做阻塞式 shell（见 GameDir.h）
     }
 
     bool SkinImportMsp(const wchar_t* mspPath, char* msg, int n)
@@ -7399,21 +9030,6 @@ namespace Chart4K
         return true;
     }
 
-    bool SkinImportMspDialog(char* msg, int n)
-    {
-        wchar_t file[MAX_PATH * 2] = { 0 };
-        OPENFILENAMEW ofn{};
-        ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = GetActiveWindow();
-        ofn.lpstrFilter = L"Malody Skin (*.msp)\0*.msp\0All files\0*.*\0";
-        ofn.lpstrFile = file;
-        ofn.nMaxFile = MAX_PATH * 2;
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-        ofn.lpstrTitle = L"Import Malody skin (.msp)";
-        if (!GetOpenFileNameW(&ofn)) return false;
-        return SkinImportMsp(file, msg, n);
-    }
-
     bool HasChart()
     {
         return s_noteCount.load(std::memory_order_relaxed) > 0;
@@ -7424,6 +9040,25 @@ namespace Chart4K
         return s_noteCount.load(std::memory_order_relaxed);
     }
 
+    // CATCH 渲染取数（线程安全拷贝）。x 缺省 0.5（旧谱/降级）。
+    int CatchNotes(CatchRender* out, int cap, double minT)
+    {
+        if (!out || cap <= 0) return 0;
+        std::lock_guard<std::mutex> lk(s_notesMutex);
+        int n = 0;
+        for (size_t i = 0; i < s_notes.size() && n < cap; i++)
+        {
+            if (s_notes[i].time < minT) continue;
+            out[n].t     = s_notes[i].time;
+            out[n].x     = (i < s_catchX.size()) ? s_catchX[i] : 0.5f;
+            out[n].hold  = s_notes[i].hold;
+            out[n].state = (i < s_consumed.size() && s_consumed[i]) ? 1
+                         : (i < s_missed.size() && s_missed[i]) ? 2 : 0;
+            n++;
+        }
+        return n;
+    }
+
     void GetDiag(char* buf, int n)
     {
         strncpy_s(buf, (size_t)n, s_diag, _TRUNCATE);
@@ -7431,7 +9066,9 @@ namespace Chart4K
 
     // ---------------- 配置档案访问器（设置页保存/加载） ----------------
     //   which: 0=en 1=speed 2=offset 3=style 4=judge 5=uphide 6=dnhide 7=autooff
-    //          8=autoplay 9=macro
+    //          8=autoplay 9=macro 10=pseudo2 11=hardresist 12=innerroll
+    //          13=catch.kill（**已废弃**：CATCH 不再有"漏音即死"，槽位保留仅为兼容旧档案）
+    //          14=catch.platew（接盘宽度千分比）
     int ModeLaneCount(int mi) { return (mi >= 0 && mi < kModeN) ? kLanesOf[mi] : 0; }
     int ModeSettingGet(int mi, int which)
     {
@@ -7448,6 +9085,11 @@ namespace Chart4K
         case 7: return s_autoOff[mi].load(std::memory_order_relaxed) ? 1 : 0;
         case 8: return s_autoPlay[mi].load(std::memory_order_relaxed) ? 1 : 0;
         case 9: return s_macroPlay[mi].load(std::memory_order_relaxed) ? 1 : 0;
+        case 10: return s_pseudo2[mi].load(std::memory_order_relaxed) ? 1 : 0;
+        case 11: return s_hardResist[mi].load(std::memory_order_relaxed);
+        case 12: return s_innerRoll[mi].load(std::memory_order_relaxed) ? 1 : 0;
+        case 13: return s_catchKill[mi].load(std::memory_order_relaxed) ? 1 : 0;
+        case 14: return s_catchPlateW[mi].load(std::memory_order_relaxed);
         default: return 0;
         }
     }
@@ -7469,6 +9111,84 @@ namespace Chart4K
         case 7: s_autoOff[mi].store(v != 0, std::memory_order_relaxed); break;
         case 8: s_autoPlay[mi].store(v != 0, std::memory_order_relaxed); break;
         case 9: s_macroPlay[mi].store(v != 0, std::memory_order_relaxed); break;
+        case 10: s_pseudo2[mi].store(v != 0, std::memory_order_relaxed); break;
+        case 11: s_hardResist[mi].store(v, std::memory_order_relaxed); break;
+        case 12: s_innerRoll[mi].store(v != 0, std::memory_order_relaxed); break;
+        case 13: s_catchKill[mi].store(v != 0, std::memory_order_relaxed); break;
+        case 14:
+            if (v < 60) v = 60;
+            if (v > 400) v = 400;
+            s_catchPlateW[mi].store(v, std::memory_order_relaxed);
+            break;
+        default: break;
+        }
+    }
+
+    // ---------------- 全局设置（配置档案整包保存：读谱 / 录制 / 小窗 / 特效 / 宏） ----------------
+    //   键名与 ProfileWrite 里写出的 "g.<key>" 一一对应；顺序即 id。
+    static const char* kGlobalKeys[] = {
+        "read.on", "read.ahead", "read.layout", "read.anchor", "read.px", "read.py",
+        "read.scale", "read.density", "read.opacity", "read.offset", "read.grid",
+        "read.dial", "read.rhythm", "read.marks", "read.hint", "read.angle",
+        "read.windows", "read.adapt",
+        "rec.on", "rec.auto", "rec.fps", "rec.mbps", "rec.paused",
+        "mini.on", "mini.x", "mini.y", "mini.w", "mini.h",
+        "hfx", "jpop", "board", "macro.acc", "macro.human", "macro.fire"
+    };
+    int GlobalSettingCount() { return (int)(sizeof(kGlobalKeys) / sizeof(kGlobalKeys[0])); }
+    const char* GlobalSettingKey(int id)
+    {
+        return (id >= 0 && id < GlobalSettingCount()) ? kGlobalKeys[id] : "";
+    }
+    int GlobalSettingGet(int id)
+    {
+        switch (id)
+        {
+        case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7:
+        case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15:
+        case 16: case 17: return ReadSettingGet(id);
+        case 18: return RecOnGet();
+        case 19: return RecAutoGet();
+        case 20: return RecFpsGet();
+        case 21: return RecMbpsGet();
+        case 22: return RecPausedGet();
+        case 23: return s_miniOn.load(std::memory_order_relaxed) ? 1 : 0;
+        case 24: return s_miniX.load(std::memory_order_relaxed);
+        case 25: return s_miniY.load(std::memory_order_relaxed);
+        case 26: return s_miniW.load(std::memory_order_relaxed);
+        case 27: return s_miniH.load(std::memory_order_relaxed);
+        case 28: return s_hitFx.load(std::memory_order_relaxed) ? 1 : 0;
+        case 29: return s_judgePop.load(std::memory_order_relaxed) ? 1 : 0;
+        case 30: return s_opacity.load(std::memory_order_relaxed);
+        case 31: return MacroAccGet();
+        case 32: return MacroHumanGet();
+        case 33: return FireMacroEnabled() ? 1 : 0;
+        default: return 0;
+        }
+    }
+    void GlobalSettingSet(int id, int v)
+    {
+        switch (id)
+        {
+        case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7:
+        case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15:
+        case 16: case 17: ReadSettingSet(id, v); break;
+        case 18: RecOnSet(v); break;
+        case 19: RecAutoSet(v); break;
+        case 20: RecFpsSet(v); break;
+        case 21: RecMbpsSet(v); break;
+        case 22: RecPausedSet(v); break;
+        case 23: s_miniOn.store(v != 0, std::memory_order_relaxed); break;
+        case 24: s_miniX.store(v, std::memory_order_relaxed); break;
+        case 25: s_miniY.store(v, std::memory_order_relaxed); break;
+        case 26: s_miniW.store(std::max(60, v), std::memory_order_relaxed); break;
+        case 27: s_miniH.store(std::max(34, v), std::memory_order_relaxed); break;
+        case 28: s_hitFx.store(v != 0, std::memory_order_relaxed); break;
+        case 29: s_judgePop.store(v != 0, std::memory_order_relaxed); break;
+        case 30: s_opacity.store(std::max(0, std::min(255, v)), std::memory_order_relaxed); break;
+        case 31: MacroAccSet(v); break;
+        case 32: MacroHumanSet(v); break;
+        case 33: FireMacroSet(v); break;
         default: break;
         }
     }
@@ -7562,6 +9282,15 @@ namespace Chart4K
 
     // ---------------- 冰与火宏（原生关卡）访问器 ----------------
     bool FireMacroEnabled() { return s_macroFire.load(std::memory_order_relaxed); }
+    // CATCH 玩法启用中（GameBridge 据此关掉游戏内置 Auto，背景原关交给 CATCH 专用
+    // 打歌引擎演奏；不再强开不死，失误照原生判定）。
+    bool CatchAssistEnabled()
+    {
+        // CATCH / OSU 都由"独立覆盖层判定 + 专用背景打歌引擎"驱动（不共用轨道按键管线）。
+        const int mi = ActiveModeIndex();
+        return mi == kModeCatch || mi == kModeOsu;
+    }
+    bool AnyAssistEnabled() { return ActiveModeIndex() >= 0; }
     void FireMacroSet(int v)
     {
         RecCfgLoadOnce();
@@ -7594,6 +9323,7 @@ namespace Chart4K
         if (dropped) *dropped = dr;
         if (file) *file = GameRecorder::CurrentFile();
     }
+    const char* RecLastError() { return GameRecorder::LastError(); }
     int ModeKeyGet(int mi, int slot)
     {
         if (mi < 0 || mi >= kModeN || slot < 0 || slot >= 10) return 0;
@@ -7638,13 +9368,17 @@ namespace Chart4K
         BeginCard4K(id, 92.f);
         {
             char title[48];
-            snprintf(title, sizeof(title), "%dK 下坠谱面", cols);
+            if (mi == 4) snprintf(title, sizeof(title), "16K PAD 模式");
+            else if (mi == 5) snprintf(title, sizeof(title), "CATCH 无轨雨");
+            else         snprintf(title, sizeof(title), "%dK 下坠谱面", cols);
             bool en = s_en[mi].load(std::memory_order_relaxed);
             snprintf(id, sizeof(id), "##m%d_en", mi);
             if (TitleToggleRow(id, 19.f, title, &en))
             {
                 for (int i = 0; i < kModeN; i++)
                     s_en[i].store((i == mi) ? en : false, std::memory_order_relaxed);
+                if (!en) s_macroPlay[mi].store(false, std::memory_order_relaxed);  // 关掉辅助也停宏
+                ModeCfgSave();
                 if (en)
                     Log::Printf("[UI] %dK assist enabled", cols);
             }
@@ -7657,13 +9391,47 @@ namespace Chart4K
 
         // 卡片 2：流速 / 延迟 / 转换风格 / 键位 / 底板 / 特效 / 统计
         snprintf(id, sizeof(id), "##cardm%d_set", mi);
-        BeginCard4K(id, 356.f);          // 多出"上隐/下隐/自动调整延迟"一行后重排
+        BeginCard4K(id, 384.f);          // 多出"上隐/下隐/自动调整延迟 + 冰火手法旋钮"两行后重排
         {
             const float colW = LabelCol({ I18N::Tr(I18N::LBL_SPEED), I18N::Tr(I18N::LBL_OFFSET),
                                           I18N::Tr(I18N::LBL_JUDGEW), I18N::Tr(I18N::LBL_STYLE),
                                           I18N::Tr(I18N::LBL_BOARD), I18N::Tr(I18N::LBL_KEYS) });
             g_lblColX = colW;
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 6.f));
+
+            // ---- CATCH v2：一键自动接 + 鼠标接盘 ----
+            //   本模式不再需要键位：雨点落到判定线的瞬间，只要接盘盖住它的落点就
+            //   自动接住（正中 MARV / 靠边 GOOD）；没盖住就判 MISS。接盘横坐标由
+            //   鼠标左右移动控制。MISS 只是照常显示一条判定，不会自动返回 / 重开。
+            if (mi == kModeCatch)
+            {
+                int pwPct = s_catchPlateW[mi].load(std::memory_order_relaxed) / 10;   // 千分比 → 百分比
+                if (pwPct < 6) pwPct = 6;
+                if (pwPct > 40) pwPct = 40;
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_CATCH_PLATEW));
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(colW);
+                ImGui::SetNextItemWidth(-14.f);
+                snprintf(id, sizeof(id), "##m%dcatchpw", mi);
+                if (ImGui::SliderInt(id, &pwPct, 6, 40, "%d %%"))
+                    s_catchPlateW[mi].store(pwPct * 10, std::memory_order_relaxed);
+
+                // 打歌精准度：把 CATCH 的判定偏差按多少比例带到背景原关的成绩上
+                //   （100% = 原样带过去：CATCH 判 GOOD，背景也吃到对应差判；0% = 背景永远满判）。
+                int pa = s_catchPlayAcc.load(std::memory_order_relaxed);
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_CATCH_PLAYACC));
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(colW);
+                ImGui::SetNextItemWidth(-14.f);
+                snprintf(id, sizeof(id), "##m%dcatchpa", mi);
+                if (ImGui::SliderInt(id, &pa, 0, 100, "%d %%"))
+                    s_catchPlayAcc.store(pa, std::memory_order_relaxed);
+
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(160, 166, 182, 255));
+                ImGui::TextWrapped("%s", I18N::Tr(I18N::LBL_CATCH_HINT));
+                ImGui::PopStyleColor();
+                ImGui::Spacing();
+            }
 
             int spd = s_speed[mi].load(std::memory_order_relaxed);
             ImGui::TextUnformatted(I18N::Tr(I18N::LBL_SPEED));
@@ -7726,7 +9494,10 @@ namespace Chart4K
                 ImGui::EndCombo();
             }
 
-            // 转换风格：经典 / 叠 / 技 / 乱 / 切 / 冰火手法（切换后下一帧自动重建谱面）
+            // 转换风格 / 手法：4K~10K = 经典 / 叠 / 技 / 乱 / 切 / 冰火手法；
+            // 16K(PAD) = 经典 / 绕环 / 阶梯 / 十字 / 交互 / 冰火拆手序（经典 16K 写谱手法）；
+            // CATCH = 经典 / 走 / 冲 / 超冲 / 边冲 / 阶梯（osu!catch 移动语汇）。
+            // 切换后下一帧自动重建谱面。
             int style = s_style[mi].load(std::memory_order_relaxed);
             if (style < 0 || style > 5) style = 0;
             ImGui::TextUnformatted(I18N::Tr(I18N::LBL_STYLE));
@@ -7734,15 +9505,15 @@ namespace Chart4K
             ImGui::SetCursorPosX(colW);
             ImGui::SetNextItemWidth(-14.f);
             snprintf(id, sizeof(id), "##m%dstyle", mi);
-            if (ImGui::BeginCombo(id, kStyleNames[style]))
+            if (ImGui::BeginCombo(id, StyleNameOf(mi, style)))
             {
                 for (int i = 0; i < 6; i++)
                 {
                     bool sel = (i == style);
-                    if (ImGui::Selectable(kStyleNames[i], sel) && i != style)
+                    if (ImGui::Selectable(StyleNameOf(mi, i), sel) && i != style)
                     {
                         s_style[mi].store(i, std::memory_order_relaxed);
-                        Log::Printf("[UI] %dK style -> %s", cols, kStyleNames[i]);
+                        Log::Printf("[UI] mode%d style -> %s", mi, StyleNameOf(mi, i));
                     }
                     if (sel)
                         ImGui::SetItemDefaultFocus();
@@ -7759,10 +9530,14 @@ namespace Chart4K
             if (ImGui::SliderInt(id, &op, 0, 255))
                 s_opacity.store(op);
 
-            ImGui::Spacing();
-            snprintf(id, sizeof(id), "##m%dkb", mi);
-            DrawKeyBinder(id, mi);
-            ImGui::Spacing();
+            // CATCH v2 不再使用键位（接盘由鼠标控制），隐藏键位行避免误解。
+            if (mi != kModeCatch)
+            {
+                ImGui::Spacing();
+                snprintf(id, sizeof(id), "##m%dkb", mi);
+                DrawKeyBinder(id, mi);
+                ImGui::Spacing();
+            }
 
             bool hfx = s_hitFx.load(std::memory_order_relaxed);
             snprintf(id, sizeof(id), "##m%dfx", mi);
@@ -7818,7 +9593,66 @@ namespace Chart4K
             ImGui::SameLine();
             ImGui::TextUnformatted(I18N::Tr(I18N::LBL_AUTOOFF));
 
-            // ---- 自动打歌 / 宏打歌 / 录制 ----
+            // ---- 伪双押优化（4K / 5K / 6K / 10K / 16K；CATCH 无轨雨不适用） ----
+            //   冰与火里很多 15°/30° 伪双押（有时只 1°），实际就是双押；开启后把
+            //   "孤立、极小转角"的一对真正生成成同刻双押（而不是几毫秒的突然快轮）。
+            if (mi != kModeCatch)
+            {
+                bool ps = s_pseudo2[mi].load(std::memory_order_relaxed) != 0;
+                snprintf(id, sizeof(id), "##m%dp2", mi);
+                if (MiniToggle(id, &ps))
+                {
+                    s_pseudo2[mi].store(ps ? 1 : 0, std::memory_order_relaxed);
+                    InvalidateChart(nullptr, false);   // 立即按新开关重排谱面（不清空现有音符，无闪烁）
+                    Log::Printf("[UI] %dK pseudo-double -> %d", cols, (int)ps);
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_PSEUDO2));
+                if (ps)
+                {
+                    // 自适应读数：把"绝对时间窗口"换算成当前 BPM 下的转角上限，
+                    // 直观体现"BPM 越高，可合并的角度越大"（自动 BPM 自调配）。
+                    double bpmNow = (double)s_bpm.load(std::memory_order_relaxed);
+                    if (!(bpmNow > 20.0 && bpmNow < 1000.0)) bpmNow = 120.0;
+                    const double winMs = PseudoDoubleWindowMs();
+                    double degCap = winMs / 1000.0 * bpmNow * 6.0;   // 转角 = Δt · BPM · speed · 6
+                    if (degCap > kPDSharpDeg) degCap = kPDSharpDeg;
+                    ImGui::TextDisabled("%s: %.0f ms · <= %.0f° @ %.0f BPM",
+                                        I18N::Tr(I18N::LBL_PSEUDO2_ADAPT), winMs, degCap, bpmNow);
+                }
+            }
+
+            // ---- 冰火手法（拆手序）旋钮：只在"转换风格 = 冰火手法"时出现 ----
+            //   最大硬抗 BPM 与"内轮指"方向都只由 AdoGen（冰火手法引擎）读取，
+            //   其它风格（经典/叠/技/乱/切）根本不使用这两项，所以选其它风格时
+            //   不显示，避免误解。布局上：标签独占一行、控件另起一行，
+            //   长标签（"硬抗 BPM（越低越偏轮指）"）不再和滑块挤在同一行重叠。
+            if (style == kStyleAdo)
+            {
+                int hr = s_hardResist[mi].load(std::memory_order_relaxed);
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_HARDRESIST));
+                ImGui::SetNextItemWidth(-14.f);
+                snprintf(id, sizeof(id), "##m%dhr", mi);
+                if (ImGui::SliderInt(id, &hr, 300, 1100, "%d"))
+                {
+                    s_hardResist[mi].store(hr, std::memory_order_relaxed);
+                    InvalidateChart(nullptr, false);   // 立即按新的硬抗 BPM 重排谱面
+                }
+                bool inr = s_innerRoll[mi].load(std::memory_order_relaxed) != 0;
+                snprintf(id, sizeof(id), "##m%droll", mi);
+                if (MiniToggle(id, &inr))
+                {
+                    s_innerRoll[mi].store(inr ? 1 : 0, std::memory_order_relaxed);
+                    InvalidateChart(nullptr, false);   // 立即按新的轮指方向重排谱面
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_INNERROLL));
+            }
+
+            // ---- 自动打歌 / 录制 ----（宏打歌已独立成「宏功能」页，这里不再重复）
+            //   CATCH 自带"一键自动接"（CatchTick），不走通用自动/宏管线 → 隐藏该行。
+            if (mi != kModeCatch)
+            {
             bool ap = s_autoPlay[mi].load(std::memory_order_relaxed);
             snprintf(id, sizeof(id), "##m%dap", mi);
             if (MiniToggle(id, &ap))
@@ -7826,46 +9660,25 @@ namespace Chart4K
                 s_autoPlay[mi].store(ap, std::memory_order_relaxed);
                 if (ap) s_macroPlay[mi].store(false, std::memory_order_relaxed);   // 互斥
                 if (!ap) AutoPlayStop();
+                if (ap)
+                {
+                    // 自动打歌同样依赖对应模式的覆盖层：勾选即启用该模式（四模式互斥）。
+                    for (int i = 0; i < kModeN; i++)
+                        s_en[i].store(i == mi, std::memory_order_relaxed);
+                }
+                ModeCfgSave();
                 Log::Printf("[UI] %dK auto play -> %d", cols, (int)ap);
             }
             ImGui::SameLine();
             ImGui::TextUnformatted(I18N::Tr(I18N::LBL_AUTOPLAY));
             ImGui::SameLine();
             {
-                float tx4 = ImGui::GetCursorPosX() + 18.f;
-                if (tx4 < colW + 74.f) tx4 = colW + 74.f;
-                ImGui::SetCursorPosX(tx4);
-            }
-            bool mp = s_macroPlay[mi].load(std::memory_order_relaxed);
-            snprintf(id, sizeof(id), "##m%dmp", mi);
-            if (MiniToggle(id, &mp))
-            {
-                s_macroPlay[mi].store(mp, std::memory_order_relaxed);
-                if (mp) s_autoPlay[mi].store(false, std::memory_order_relaxed);
-                if (!mp) AutoPlayStop();
-                Log::Printf("[UI] %dK macro play -> %d", cols, (int)mp);
-            }
-            ImGui::SameLine();
-            ImGui::TextUnformatted(I18N::Tr(I18N::LBL_MACRO));
-            ImGui::SameLine();
-            {
                 float tx5 = ImGui::GetCursorPosX() + 18.f;
-                if (tx5 < colW + 200.f) tx5 = colW + 200.f;
+                if (tx5 < colW + 74.f) tx5 = colW + 74.f;
                 ImGui::SetCursorPosX(tx5);
             }
-            bool ro = s_recOn.load(std::memory_order_relaxed);
-            snprintf(id, sizeof(id), "##m%drec", mi);
-            if (MiniToggle(id, &ro))
-                RecOnSet(ro ? 1 : 0);
-            ImGui::SameLine();
-            ImGui::TextUnformatted(I18N::Tr(I18N::LBL_RECORD));
-            if (s_recOn.load(std::memory_order_relaxed))
-            {
-                int ri = 0, rw = 0, rd = 0;
-                const char* rf = nullptr;
-                RecStatsGet(&ri, &rw, &rd, &rf);
-                ImGui::TextDisabled("[rec] %d/%d%s", rw, ri, rd ? " (drop)" : "");
             }
+
 
             {
                 int bn = 0;
@@ -7974,27 +9787,91 @@ namespace Chart4K
             ImGui::TextUnformatted(I18N::Tr(I18N::MACRO_MODES));
             ImGui::SameLine();
             ImGui::SetCursorPosX(120.f);
-            for (int mi = 0; mi < kModeN; mi++)
             {
-                if (mi) ImGui::SameLine();
-                char lb[32];
-                snprintf(lb, sizeof(lb), "%dK##mpm%d", kLanesOf[mi], mi);
-                bool on = s_macroPlay[mi].load(std::memory_order_relaxed);
-                if (ImGui::Checkbox(lb, &on))
+                // 参与模式按钮：按各按钮实际文字宽度排布，一行放不下就自动换行。
+                //   旧实现把 7 个按钮等分硬塞进同一行（bw 最小 46px）；标签里最长的
+                //   是「冰与火（原生关卡）」这类本地化长词，等分后文字比按钮还宽，
+                //   UiKit::Button 只是居中绘制不裁剪 → 相邻按钮的文字互相压叠，
+                //   看起来就是"全挤在一行、字被挤死"。
+                const float sp   = ImGui::GetStyle().ItemSpacing.x;
+                const float x0   = 120.f;                                   // 行首缩进（与上方标签同行）
+                const float xEnd = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+                const char* labels[kModeN + 1];
+                for (int mi = 0; mi < kModeN; mi++) labels[mi] = ApiModeName(mi);
+                labels[kModeN] = I18N::Tr(I18N::MACRO_FIRE);
+                float x = x0;
+                bool  first = true;
+                for (int bi = 0; bi <= kModeN; bi++)
                 {
-                    s_macroPlay[mi].store(on, std::memory_order_relaxed);
-                    if (on) s_autoPlay[mi].store(false, std::memory_order_relaxed);
-                    else    AutoPlayStop();
+                    float bw = ImGui::CalcTextSize(labels[bi]).x + 22.f;    // 左右内边距
+                    if (bw < 46.f) bw = 46.f;
+                    if (bw > xEnd - x0) bw = xEnd - x0;                     // 单按钮不超过整行
+                    if (!first)
+                    {
+                        if (x + sp + bw > xEnd)                             // 本行放不下 → 换行
+                        {
+                            x = x0;
+                            ImGui::SetCursorPosX(x0);
+                        }
+                        else
+                        {
+                            ImGui::SameLine();
+                            x += sp;
+                        }
+                    }
+                    if (bi < kModeN)
+                    {
+                        char idb[32];
+                        snprintf(idb, sizeof(idb), "##mpm%d", bi);
+                        bool on = s_macroPlay[bi].load(std::memory_order_relaxed);
+                        if (UiKit::Button(idb, labels[bi], ImVec2(bw, 26.f),
+                                          on ? UiKit::BTN_PRIMARY : UiKit::BTN_NORMAL))
+                        {
+                            bool nv = !on;
+                            s_macroPlay[bi].store(nv, std::memory_order_relaxed);
+                            if (nv)
+                            {
+                                // 宏打歌和该模式共用键位/判定管线：勾选即启用对应模式辅助
+                                // （四模式互斥）。否则玩家只勾了宏、没开模式 → 覆盖层不铺，
+                                // 宏永远不跑（这就是"宏模式在别人电脑上不生效"的主因）。
+                                for (int i = 0; i < kModeN; i++)
+                                    s_en[i].store(i == bi, std::memory_order_relaxed);
+                                s_autoPlay[bi].store(false, std::memory_order_relaxed);
+                            }
+                            else
+                            {
+                                AutoPlayStop();
+                            }
+                            ModeCfgSave();
+                        }
+                    }
+                    else
+                    {
+                        // 冰与火（原生关卡）：宏直接代打游戏本体判定线（角度判定），
+                        // 与 4K/5K/6K/10K 宏互斥；开启期间强制 no-fail 并临时关闭游戏自动演奏。
+                        bool fire = s_macroFire.load(std::memory_order_relaxed);
+                        if (UiKit::Button("##mpfire", labels[bi], ImVec2(bw, 26.f),
+                                          fire ? UiKit::BTN_PRIMARY : UiKit::BTN_NORMAL))
+                            FireMacroSet(fire ? 0 : 1);
+                    }
+                    x += bw;
+                    first = false;
+                }
+                if (s_macroFire.load(std::memory_order_relaxed))
+                {
+                    // 冰与火宏依赖原生输入钩子；装不上时必须让用户看得见，而不是"点了没反应"。
+                    const bool hookOk = GameDetour::InputHookActive();
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          hookOk ? IM_COL32(120, 200, 130, 255)
+                                                 : IM_COL32(232, 152, 88, 255));
+                    ImGui::TextWrapped("%s", I18N::Tr(hookOk ? I18N::MACRO_HOOK_ON
+                                                             : I18N::MACRO_HOOK_OFF));
+                    ImGui::PopStyleColor();
                 }
             }
-            // 冰与火（原生关卡）：宏直接代打游戏本体判定线（角度判定），
-            // 与 4K/5K/6K/10K 宏互斥；开启期间强制 no-fail 并临时关闭游戏自动演奏。
-            {
-                bool fire = s_macroFire.load(std::memory_order_relaxed);
-                ImGui::SameLine();
-                if (ImGui::Checkbox(I18N::Tr(I18N::MACRO_FIRE), &fire))
-                    FireMacroSet(fire ? 1 : 0);
-            }
+            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 146, 162, 255));
+            ImGui::TextWrapped("%s", I18N::Tr(I18N::MACRO_MODES_HINT));
+            ImGui::PopStyleColor();
             ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 146, 162, 255));
             ImGui::TextWrapped("%s", I18N::Tr(I18N::MACRO_FIRE_HINT));
             ImGui::PopStyleColor();
@@ -8006,6 +9883,8 @@ namespace Chart4K
             ImGui::SetNextItemWidth(-14.f);
             if (ImGui::SliderInt("##macrocacc", &acc, 90, 100, "%d%%"))
                 MacroAccSet(acc);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                ModeCfgSave();
 
             int hum = MacroHumanGet();
             ImGui::TextUnformatted(I18N::Tr(I18N::MACRO_HUMAN));
@@ -8014,6 +9893,8 @@ namespace Chart4K
             ImGui::SetNextItemWidth(-14.f);
             if (ImGui::SliderInt("##macrochum", &hum, 0, 100, "%d%%"))
                 MacroHumanSet(hum);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                ModeCfgSave();
 
             ImGui::Spacing();
             if (ImGui::Button(I18N::Tr(I18N::MACRO_CALIB), ImVec2(150.f, 26.f)))
@@ -8083,16 +9964,39 @@ namespace Chart4K
             ImGui::SameLine();
             ImGui::SetCursorPosX(120.f);
             const float btnW = 74.f;
+            const float sp   = ImGui::GetStyle().ItemSpacing.x;
             float avail = ImGui::GetContentRegionAvail().x;
-            ImGui::SetNextItemWidth(avail - btnW * 2.f - 16.f);
+            float iw = avail - (btnW * 3.f + sp * 2.f) - 8.f;
+            if (iw < 90.f) iw = 90.f;
+            ImGui::SetNextItemWidth(iw);
             if (ImGui::InputText("##recdir", s_dirBuf, sizeof(s_dirBuf), ImGuiInputTextFlags_EnterReturnsTrue))
                 RecDirSet(s_dirBuf);
+            ImGui::SameLine();
+            // 浏览：弹出系统"选择文件夹"对话框（可先进入任意目录预览，选中即写回并生效）
+            if (ImGui::Button(I18N::Tr(I18N::ST_BROWSE), ImVec2(btnW, 0)))
+                ShellAsync::PickFolder(I18N::Tr(I18N::REC_DIR));
+            {
+                char pick[MAX_PATH * 2] = { 0 };
+                if (ShellAsync::TakeFolder(pick, sizeof(pick)))
+                {
+                    snprintf(s_dirBuf, sizeof(s_dirBuf), "%s", pick);
+                    RecDirSet(s_dirBuf);
+                }
+            }
             ImGui::SameLine();
             if (ImGui::Button(I18N::Tr(I18N::ST_APPLY), ImVec2(btnW, 0)))
                 RecDirSet(s_dirBuf);
             ImGui::SameLine();
-            if (ImGui::Button(I18N::Tr(I18N::REC_OPEN), ImVec2(btnW + 8.f, 0)))
-                ShellExecuteA(nullptr, "open", RecDirGet(), nullptr, nullptr, SW_SHOWNORMAL);
+            // 预览：先在资源管理器里建好并打开当前输出目录，确认"录到哪个文件夹"
+            if (ImGui::Button(I18N::Tr(I18N::REC_PREVIEW), ImVec2(btnW, 0)))
+            {
+                char dir[MAX_PATH * 2] = { 0 };
+                snprintf(dir, sizeof(dir), "%s", RecDirGet());
+                for (char* p = dir + 1; *p; p++)
+                    if (*p == '\\' || *p == '/') { char c = *p; *p = 0; CreateDirectoryA(dir, nullptr); *p = c; }
+                CreateDirectoryA(dir, nullptr);
+                ShellAsync::Open(dir);
+            }
 
             int fps = RecFpsGet();
             ImGui::TextUnformatted(I18N::Tr(I18N::REC_FPS));
@@ -8119,6 +10023,14 @@ namespace Chart4K
                                    rd ? " (drop)" : "", (rf && rf[0]) ? " -> " : "",
                                    (rf && rf[0]) ? rf : "");
                 ImGui::PopStyleColor();
+                // 录制失败原因（例如编码器不可用）：不要让用户对着 0/N 干瞪眼
+                const char* rerr = Chart4K::RecLastError();
+                if (rerr && rerr[0])
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 150, 140, 255));
+                    ImGui::TextWrapped("REC FAILED: %s", rerr);
+                    ImGui::PopStyleColor();
+                }
             }
             ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 146, 162, 255));
             ImGui::TextWrapped("%s", I18N::Tr(I18N::REC_HINT));
@@ -8172,6 +10084,8 @@ namespace Chart4K
         if (mi < 0 || mi >= kModeN) return;
         for (int i = 0; i < kModeN; i++)
             s_en[i].store((i == mi) ? on : false, std::memory_order_relaxed);
+        if (!on) s_macroPlay[mi].store(false, std::memory_order_relaxed);
+        ModeCfgSave();
         if (on)
             Log::Printf("[api] %dK assist enabled by script", kLanesOf[mi]);
     }
@@ -8220,7 +10134,7 @@ namespace Chart4K
 
     const char* ApiModeName(int mi)
     {
-        static const char* kN[kModeN] = { "4K", "5K", "6K", "10K" };
+        static const char* kN[kModeN] = { "4K", "5K", "6K", "10K", "16K", "CATCH", "8K", "OSU" };
         return (mi >= 0 && mi < kModeN) ? kN[mi] : "-";
     }
 
@@ -8250,6 +10164,11 @@ namespace Chart4K
     {
         return (kind >= 0 && kind < 4) ? s_jdCounts[kind].load(std::memory_order_relaxed) : 0;
     }
+
+    int    JudgeLastKind()  { return s_jdLastKind.load(std::memory_order_relaxed); }
+    double JudgeLastTime()  { return s_jdLastTime.load(std::memory_order_relaxed); }
+    double JudgeLastOffMs() { return s_jdLastOff.load(std::memory_order_relaxed) * 1000.0; }
+    int    JudgeLastLane()  { return s_jdLastLane.load(std::memory_order_relaxed); }
 
     const char* ApiLevelName()
     {

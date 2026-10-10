@@ -17,4 +17,5 @@ namespace GameRecorder
     void PushPixels(const void* data, int w, int h, int stride, bool swapRB);
     void GetStats(int* framesIn, int* framesWritten, int* dropped, double* seconds);
     const char* CurrentFile();                        // 当前/最近一次输出文件（无则 ""）
+    const char* LastError();                          // 最近一次失败原因（无则 ""）
 }

@@ -276,6 +276,7 @@ namespace GameDetour
     static std::atomic<bool> g_inputSettled{ false };
     static std::atomic<bool> g_inputDetachReq{ false };
     static std::atomic<bool> g_inputDetachedFlag{ true };
+    static std::atomic<int>  g_inputTries{ 0 };   // 目标解析/挂钩失败次数（有界重试用）
 
     struct FireRt
     {
@@ -340,11 +341,92 @@ namespace GameDetour
         }
     }
 
+    // ============================================================
+    // CATCH 专用背景打歌引擎（独立算法：与"冰与火宏"不共用状态 / 参数 / 随机源）
+    //
+    //   CATCH 覆盖层每判一个音就把"归一化目标偏差"按歌曲时刻发布出来
+    //   （Chart4K::CatchPlayTargetFrac）。这里按同一个原生入口打背景那首原关：
+    //     · 归一化单位 = 背景"计数窗(Counted)"半宽（60° × marginScale）；
+    //       MARV 0.20 / PERFECT 0.42 / GOOD 0.88 / MISS 1.60（符号 = 慢/快）；
+    //       → 背景分别吃到 Perfect / Perfect / VeryEarly·VeryLate / TooEarly·TooLate，
+    //         即 CATCH 判什么，冰与火本体就判什么（含"快/慢"方向）。
+    //   自带拟人抖动（每砖抽一次，±5ms），不读宏模式的精准度 / 拟人度设置。
+    // ============================================================
+    struct CatchPlayRt
+    {
+        int      floorSeq   = -1;
+        int      tries      = 0;
+        int      logged     = 0;
+        double   targetDeg  = 0.0;
+        double   jitMs      = 0.0;     // 本砖的拟人抖动（每砖抽一次）
+        double   lastCallMs = 0.0;
+        unsigned jit        = 0x9E3779B9u;
+    };
+    static CatchPlayRt g_catchRt;
+
+    static void CatchPlayFrame(void* self)
+    {
+        GameBridge::FireCtx c;
+        if (!GameBridge::ReadFireCtx(&c) || !c.ok || c.player != self)
+            return;
+        if (!c.gameworld || c.paused || !c.inControl || !c.hasNext ||
+            c.floorIndex < 0 || c.crotchet <= 0.0)
+        {
+            g_catchRt.floorSeq = -1;      // 不在打歌中：复位
+            return;
+        }
+
+        double nowMs = FireNowMs();
+        double dt = (g_catchRt.lastCallMs > 0.0) ? (nowMs - g_catchRt.lastCallMs) : 16.0;
+        g_catchRt.lastCallMs = nowMs;
+        if (dt < 0.5)   dt = 0.5;
+        if (dt > 100.0) dt = 100.0;
+        const double degPerMs = 180.0 * c.speed / (c.crotchet * 1000.0);
+
+        if (c.floorIndex != g_catchRt.floorSeq)
+        {
+            g_catchRt.floorSeq = c.floorIndex;
+            g_catchRt.tries = 0;
+            g_catchRt.jit = g_catchRt.jit * 1664525u + 1013904223u;   // 每砖一次拟人抖动
+            g_catchRt.jitMs = ((double)(g_catchRt.jit >> 8) / 16777216.0 * 2.0 - 1.0) * 5.0;
+        }
+
+        // CATCH 的判定偏差（按当前歌曲时刻取最近一条）；没拿到就按 0（当成完美接住）
+        double tgtFrac = 0.0;
+        const bool hasTgt = Chart4K::CatchPlayTargetFrac(Chart4K::ApiSongTime(), &tgtFrac);
+        const double scale = (double)Chart4K::CatchPlayAccGet() / 100.0;   // 打歌精准度
+        // 背景原关的"计数窗"半宽（度）：60° × marginScale（marginScale 取自原生砖块）
+        const double marginScale = (c.marginScale > 0.01 && c.marginScale < 100.0) ? c.marginScale : 1.0;
+        const double cntDeg = 60.0 * marginScale;
+        g_catchRt.targetDeg = (hasTgt ? tgtFrac * scale * cntDeg : 0.0) + g_catchRt.jitMs * degPerMs;
+
+        if (g_catchRt.tries >= 4 || !g_fireHit)
+            return;
+
+        const double thr = g_catchRt.targetDeg - 0.5 * dt * degPerMs;
+        if (c.errDeg >= thr)
+        {
+            g_catchRt.tries++;
+            const bool okHit = g_fireHit(self, 0);
+            if (g_catchRt.logged < 24)
+            {
+                g_catchRt.logged++;
+                Log::Printf("[catch-hit] floor=%d err=%.2fdeg target=%+.3f*%0.0fdeg(%.1fdeg) got=%d hit=%d",
+                            c.floorIndex, c.errDeg, (hasTgt ? tgtFrac * scale : 0.0), cntDeg,
+                            g_catchRt.targetDeg, (int)hasTgt, okHit ? 1 : 0);
+            }
+        }
+    }
+
     static void HK_SimPlayerControlUpdate(void* self, void* a, void* b)
     {
-        if (!CheatState::GameQuitting.load(std::memory_order_relaxed) &&
-            Chart4K::FireMacroEnabled())
-            FireMacroFrame(self);
+        if (!CheatState::GameQuitting.load(std::memory_order_relaxed))
+            GameBridge::TickCheatsFast();
+        if (!CheatState::GameQuitting.load(std::memory_order_relaxed))
+        {
+            if      (Chart4K::FireMacroEnabled())        FireMacroFrame(self);   // 冰与火宏（用户自己的）
+            else if (Chart4K::CatchAssistEnabled())      CatchPlayFrame(self);   // CATCH 专用打歌引擎
+        }
         if (g_origSimUpdate)
             g_origSimUpdate(self, a, b);
     }
@@ -354,8 +436,12 @@ namespace GameDetour
     // 否则纯宏（人不按键）永远停在 States.Start，代打无从触发。
     static void HK_ControllerUpdate(void* self)
     {
+        // 每帧驱动"开关重应用"：关卡 Awake 会重置 noFail / RDC.auto，
+        // 这里保证在 ~100ms 内把它们改回用户选择（修复"不死/自动连打有时失效"）。
+        if (!CheatState::GameQuitting.load(std::memory_order_relaxed))
+            GameBridge::TickCheatsFast();
         if (!CheatState::GameQuitting.load(std::memory_order_relaxed) &&
-            Chart4K::FireMacroEnabled())
+            (Chart4K::FireMacroEnabled() || Chart4K::CatchAssistEnabled()))
         {
             GameBridge::FireCtx c;
             if (GameBridge::ReadFireCtx(&c) && c.ok && c.gameworld && !c.paused && c.state == 1)
@@ -365,22 +451,66 @@ namespace GameDetour
             g_origCtrlUpdate(self);
     }
 
+    // 名称匹配、不限参数个数：不同游戏版本 / Mono 后端上同一方法的签名可能是
+    // ()、 (ulong?)、 (bool,bool) 等，逐个 arity 试，避免"换个版本就找不到目标"。
+    static MonoMethod* FindMethodAnyArity(MonoClass* cls, const char* name)
+    {
+        if (!cls || !name)
+            return nullptr;
+        for (int n = 0; n <= 4; n++)
+        {
+            MonoMethod* m = mono_class_get_method_from_name(cls, name, n);
+            if (m)
+                return m;
+        }
+        return nullptr;
+    }
+
     static void AttachInput_Hooked()
     {
         if (!MonoApi::Ready())
             return;                                  // 元数据未就绪：下次 Tick 再试
 
+        // 这里曾经是"宏在某些机器上不生效"的主因：旧实现在第一次找不到目标时就
+        // 永久放弃（g_inputSettled=true）。但注入时机偏早 / 机器偏快时
+        // Assembly-CSharp 可能还没加载完，于是钩子再也装不上、冰与火宏静默失效。
+        // 现在改成有界重试：程序集/类还没就绪就一直等；确认程序集在了却仍找不到
+        // 方法、或 Detours 反复失败，才判定不可用。
         MonoImage* img = mono_image_loaded("Assembly-CSharp");
-        MonoClass* clsPlayer = img ? mono_class_from_name(img, "", "scrPlayer") : nullptr;
-        MonoMethod* mUpdate = clsPlayer ? mono_class_get_method_from_name(clsPlayer, "Simulated_PlayerControl_Update", 1) : nullptr;
-        MonoMethod* mHit    = clsPlayer ? mono_class_get_method_from_name(clsPlayer, "Hit", 1) : nullptr;
-        MonoClass* clsCtrl  = img ? mono_class_from_name(img, "", "scrController") : nullptr;
-        MonoMethod* mCtrlUpdate = clsCtrl ? mono_class_get_method_from_name(clsCtrl, "Update", 0) : nullptr;
-        if (!clsPlayer || !mUpdate || !mHit)
+        if (!img)
         {
-            Log::Printf("[Detour] fire hook targets not found (cls=%p upd=%p hit=%p) - fire macro off",
-                        (void*)clsPlayer, (void*)mUpdate, (void*)mHit);
-            g_inputSettled.store(true, std::memory_order_relaxed);   // 放弃，避免刷日志
+            static DWORD s_lastLog = 0;
+            if (GetTickCount() - s_lastLog > 5000)
+            {
+                s_lastLog = GetTickCount();
+                Log::Printf("[Detour] Assembly-CSharp not loaded yet - retrying");
+            }
+            return;                                  // 不放弃：下次 Tick 再试
+        }
+        MonoClass* clsPlayer = mono_class_from_name(img, "", "scrPlayer");
+        if (!clsPlayer)
+            return;                                  // 类还未就绪：继续等
+
+        MonoMethod* mUpdate = FindMethodAnyArity(clsPlayer, "Simulated_PlayerControl_Update");
+        if (!mUpdate)
+        {
+            // 退路：scrPlayer.Update 也是每帧跑在同一个实例上，宏逻辑与它无关，
+            // 只需要"每帧、在主线程、判定之前"拿到同一时机即可。
+            mUpdate = FindMethodAnyArity(clsPlayer, "Update");
+            if (mUpdate)
+                Log::Printf("[Detour] Simulated_PlayerControl_Update missing - hooking scrPlayer.Update instead");
+        }
+        MonoMethod* mHit    = FindMethodAnyArity(clsPlayer, "Hit");
+        MonoClass* clsCtrl  = mono_class_from_name(img, "", "scrController");
+        MonoMethod* mCtrlUpdate = clsCtrl ? FindMethodAnyArity(clsCtrl, "Update") : nullptr;
+        if (!mUpdate || !mHit)
+        {
+            if (++g_inputTries > 20)
+            {
+                Log::Printf("[Detour] fire hook targets missing after %d tries (upd=%p hit=%p) - fire macro off",
+                            (int)g_inputTries.load(), (void*)mUpdate, (void*)mHit);
+                g_inputSettled.store(true, std::memory_order_relaxed);   // 确认不可用
+            }
             return;
         }
 
@@ -389,52 +519,73 @@ namespace GameDetour
         g_ctrlUpdateTarget = mCtrlUpdate ? mono_compile_method(mCtrlUpdate) : nullptr;
         if (!g_fireHit || !g_simUpdateTarget)
         {
-            Log::Printf("[Detour] mono_compile_method(fire) failed (hit=%p upd=%p)",
-                        (void*)g_fireHit, g_simUpdateTarget);
-            g_inputSettled.store(true, std::memory_order_relaxed);
+            if (++g_inputTries > 20)
+            {
+                Log::Printf("[Detour] mono_compile_method(fire) failed (hit=%p upd=%p) - fire macro off",
+                            (void*)g_fireHit, g_simUpdateTarget);
+                g_inputSettled.store(true, std::memory_order_relaxed);
+            }
             return;
         }
 
+        // 事务 1（宏必需）：scrPlayer 判定入口。
         LONG rv = DetourTransactionBegin();
         if (rv != NO_ERROR)
         {
             Log::Printf("[Detour] fire TransactionBegin failed %ld", rv);
-            return;                                  // 下次再试
+            return;                                  // 瞬时失败：下次再试
         }
         DetourUpdateThread(GetCurrentThread());
         g_origSimUpdate = (SimUpdate_t)g_simUpdateTarget;
         rv = DetourAttach((PVOID*)&g_origSimUpdate, (PVOID)HK_SimPlayerControlUpdate);
-        if (rv == NO_ERROR && g_ctrlUpdateTarget)
-        {
-            // 同一事务里再挂 scrController.Update（跳过 Press to start）
-            g_origCtrlUpdate = (CtrlUpdate_t)g_ctrlUpdateTarget;
-            rv = DetourAttach((PVOID*)&g_origCtrlUpdate, (PVOID)HK_ControllerUpdate);
-            if (rv != NO_ERROR)
-                Log::Printf("[Detour] ctrl Update DetourAttach failed %ld", rv);
-        }
-        if (rv != NO_ERROR)
-        {
+        if (rv == NO_ERROR)
+            rv = DetourTransactionCommit();
+        else
             DetourTransactionAbort();
-            g_origSimUpdate = (SimUpdate_t)g_simUpdateTarget;
-            g_origCtrlUpdate = (CtrlUpdate_t)g_ctrlUpdateTarget;
-            Log::Printf("[Detour] fire DetourAttach failed %ld", rv);
-            return;
-        }
-        rv = DetourTransactionCommit();
         if (rv != NO_ERROR)
         {
             g_origSimUpdate = (SimUpdate_t)g_simUpdateTarget;
-            Log::Printf("[Detour] fire Commit failed %ld", rv);
-            return;
+            if (++g_inputTries > 20)
+            {
+                Log::Printf("[Detour] fire DetourAttach/Commit failed %ld after %d tries - fire macro off",
+                            rv, (int)g_inputTries.load());
+                g_inputSettled.store(true, std::memory_order_relaxed);
+            }
+            return;                                  // 否则下次再试
         }
 
+        // 事务 2（可选，失败不影响宏）：scrController.Update → 跳过 Press to start。
+        //   与宏分开挂：以前放在同一事务里，ctrl 挂不上会把整个事务回滚，
+        //   连 macros 必需的 scrPlayer 钩子一起丢，宏直接失效。
+        if (g_ctrlUpdateTarget)
+        {
+            LONG rv2 = DetourTransactionBegin();
+            if (rv2 == NO_ERROR)
+            {
+                DetourUpdateThread(GetCurrentThread());
+                g_origCtrlUpdate = (CtrlUpdate_t)g_ctrlUpdateTarget;
+                rv2 = DetourAttach((PVOID*)&g_origCtrlUpdate, (PVOID)HK_ControllerUpdate);
+                if (rv2 == NO_ERROR)
+                    rv2 = DetourTransactionCommit();
+                else
+                    DetourTransactionAbort();
+            }
+            if (rv2 != NO_ERROR)
+            {
+                g_origCtrlUpdate = nullptr;
+                g_ctrlUpdateTarget = nullptr;        // 摘钩时不再尝试 detach
+                Log::Printf("[Detour] ctrl Update hook failed %ld (press-to-start skip off, macro kept)", rv2);
+            }
+        }
+
+        g_inputTries.store(0, std::memory_order_relaxed);
         g_inputAttached = true;
         g_inputDetachedFlag.store(false, std::memory_order_relaxed);
         g_inputSettled.store(true, std::memory_order_relaxed);
-        Log::Printf("[Detour] fire macro hooked: scrPlayer.Simulated_PlayerControl_Update=%p Hit=%p",
-                    g_simUpdateTarget, (void*)g_fireHit);
-        Log::Printf("[Detour] ctrl Update hooked: scrController.Update=%p (press-to-start auto-skip)",
-                    g_ctrlUpdateTarget);
+        Log::Printf("[Detour] fire macro hooked: scrPlayer entry=%p Hit=%p", g_simUpdateTarget, (void*)g_fireHit);
+        if (g_ctrlUpdateTarget)
+            Log::Printf("[Detour] ctrl Update hooked: scrController.Update=%p (press-to-start auto-skip)",
+                        g_ctrlUpdateTarget);
     }
 
     static void DetachInput_Hooked()
@@ -471,6 +622,7 @@ namespace GameDetour
     }
 
     bool InputHookSettled()        { return g_inputSettled.load(std::memory_order_relaxed); }
+    bool InputHookActive()         { return g_inputAttached; }
     bool InputHookDetachRequested() { return g_inputDetachReq.load(std::memory_order_relaxed); }
     void RequestInputHookDetach()  { g_inputDetachReq.store(true, std::memory_order_relaxed); }
     bool InputHookDetached()       { return g_inputDetachedFlag.load(std::memory_order_relaxed); }

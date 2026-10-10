@@ -1204,11 +1204,13 @@ int Extras(Extra* out, int maxN)
     return n;
 }
 
-void PushHit(int kind, double offsetMs)
+void PushHit(int kind, double offsetMs, int lane)
 {
     std::lock_guard<std::mutex> lk(g_qmx);
     Event e;
-    e.type = 1; e.kind = kind; e.off = offsetMs; e.lane = 1; e.noteType = 1;
+    e.type = 1; e.kind = kind; e.off = offsetMs;
+    e.lane = (lane > 0) ? lane : 1;      // Malody HitX：1 起（脚本按轨算特效 X）
+    e.noteType = 1;
     if (g_hits.size() < 512) g_hits.push_back(e);
 }
 

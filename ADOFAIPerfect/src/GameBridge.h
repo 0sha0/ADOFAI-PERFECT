@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // ============================================================
 // GameBridge.h — 通过 Mono API 直接读写游戏内部状态
 //
@@ -38,6 +38,13 @@ namespace GameBridge
     // 让桥接在标题画面就立即就绪，无需等玩家进入关卡。
     void QueueMainThreadInit();
     void QueueCheatApply();      // 请求主线程把 noFail / RDC.auto 应用到当前值
+    // CATCH 漏音即死：请求主线程重开本关（scrController.Restart(false)）。
+    // 只在"主线程任务"里真正调用，任意线程可安全请求。
+    void RequestLevelRestart();
+    // 游戏主线程（每帧钩子）调用：节流后重新把 noFail / RDC.auto 应用到当前值。
+    // 关卡 Awake 会把 noFail / RDC.auto 重置为默认，靠它把"进关卡 / 重开一关"
+    // 之后的重置窗口压到 ~100ms 以内（此前只能等 1s 一次的主线程任务）。
+    void TickCheatsFast();
     void MainThreadInitTask();   // 仅在游戏主线程调用！
     void SetMainThreadPoster(void (*fn)()); // RenderHook 注入投递函数
     // 通用主线程任务（在主线程、mono 托管线程上执行；ctx 由调用方负责生命周期）

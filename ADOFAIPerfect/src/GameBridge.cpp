@@ -1,4 +1,4 @@
-﻿#include "GameBridge.h"
+#include "GameBridge.h"
 #include "MonoApi.h"
 #include "CheatState.h"
 #include "Chart4K.h"
@@ -610,6 +610,15 @@ namespace GameBridge
     void QueueMainThreadInit() { PostTask(kTaskInit); }
     void QueueCheatApply() { PostTask(kTaskCheats); }
 
+    // ---- CATCH 漏音即死：请求重开本关 ----
+    static std::atomic<bool> g_restartReq{ false };
+    void RequestLevelRestart()
+    {
+        if (CheatState::GameQuitting.load(std::memory_order_relaxed)) return;
+        g_restartReq.store(true, std::memory_order_relaxed);
+        PostTask(kTaskCheats);   // 由主线程任务真正调用 scrController.Restart
+    }
+
     // ---- 通用主线程任务队列 ----
     struct MainWork { void (*fn)(void*); void* ctx; };
     static std::mutex g_workMx;
@@ -627,6 +636,7 @@ namespace GameBridge
     }
 
     static void ApplyCheatsMainThread();   // 定义见下（开关应用，仅主线程）
+    static void RestartLevelMainThread();  // 定义见下（CATCH 漏音即死：重开本关）
 
     // 主线程用 scrController.get_instance() 刷新的实例（自动重新 Find 已销毁的
     // _instance）。静态槽里的对象被 Unity 销毁后 `_instance == null` 为真，
@@ -903,8 +913,18 @@ namespace GameBridge
         __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
                       ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
         {
-            Log::Printf("[Bridge] AV in MainThreadInitTask -> tool dormant");
-            CheatState::GameQuitting.store(true, std::memory_order_relaxed);
+            // 一次瞬时 AV（读到刚被销毁的托管对象很常见）不应让整个工具永久失效 ——
+            // 此前这里直接置 GameQuitting，表现为"某次进关卡后不死/自动连打再也回不来"。
+            // 现在只计数限流，连续大量 AV 才判定环境不可用。
+            static volatile long s_avCount = 0;
+            long n = InterlockedIncrement(&s_avCount);
+            if (n <= 5 || (n % 200) == 0)
+                Log::Printf("[Bridge] AV in MainThreadInitTask (#%ld)", n);
+            if (n > 400)
+            {
+                Log::Printf("[Bridge] too many AVs -> tool dormant");
+                CheatState::GameQuitting.store(true, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -928,7 +948,15 @@ namespace GameBridge
         if (!g_fieldInstance)
             g_fieldInstance = mono_class_get_field_from_name(g_clsController, "_instance");
         void* obj = nullptr;
-        if (g_fieldInstance)
+        // 优先使用主线程 get_instance() 发布的实例：
+        // 切换关卡时静态槽 _instance 可能仍指向已销毁的旧 scrController，
+        // 直接写它的 noFail 等于写空气（表现为"不死模式有时候不生效"）。
+        if (g_ctrlFreshPub.load(std::memory_order_acquire))
+        {
+            obj = g_ctrlFresh.load(std::memory_order_acquire);
+            if (!obj) return nullptr;      // 游戏明确表示当前没有实例
+        }
+        if (!obj && g_fieldInstance)
             mono_field_static_get_value(g_vtController, g_fieldInstance, &obj);
         if (!obj)
         {
@@ -955,13 +983,12 @@ namespace GameBridge
         bool wantNoFail = CheatState::NoDeath.load(std::memory_order_relaxed);
         bool wantAuto = CheatState::AutoCombo.load(std::memory_order_relaxed);
 
-        // 冰与火宏模式：宏要自己按键打歌 ⇒ 抑制游戏内置自动演奏（RDC.auto），
-        // 同时强制不死，避免宏的拟人失误直接判定死亡（判定本身仍照常记 MISS）。
-        if (Chart4K::FireMacroEnabled())
-        {
+        // 冰与火宏 / CATCH 打歌引擎：宏要自己按键打歌 ⇒ 必须抑制游戏内置自动演奏
+        // （RDC.auto）；否则 Auto 会满判，CATCH 判什么背景就体现不出来。
+        // 注意：**不再**替用户强开不死 —— 正常打歌即可，宏的拟人失误照原生判定处理，
+        // （CATCH 判 MISS 时背景原关也确实会 TooEarly/TooLate → 死亡/重开）。
+        if (Chart4K::FireMacroEnabled() || Chart4K::CatchAssistEnabled())
             wantAuto = false;
-            wantNoFail = true;
-        }
 
         // ---- 不死模式：scrController.noFail ----
         if (!g_fieldNoFail)
@@ -1026,10 +1053,57 @@ namespace GameBridge
             g_cheatAppliedAuto = false;
         }
 
+        RestartLevelMainThread();   // CATCH 漏音即死：处理"重开本关"请求
+
         AcquireSRWLockExclusive(&g_statusLock);
         g_status.noFailApplied = g_cheatAppliedNoFail;
         g_status.autoApplied = g_cheatAppliedAuto;
         ReleaseSRWLockExclusive(&g_statusLock);
+    }
+
+    // CATCH 漏音即死：在主线程调用 scrController.Restart(false) 重开本关。
+    // 只在主线程任务里执行（mono_runtime_invoke 必须托管主线程）。
+    static void RestartLevelMainThread()
+    {
+        if (!g_restartReq.exchange(false, std::memory_order_relaxed)) return;
+        if (!MonoApi::Ready() || !g_clsController || !mono_runtime_invoke)
+        {
+            Log::Printf("[CATCH] restart skipped (mono not ready)");
+            return;
+        }
+        static MonoMethod* mRestart = nullptr;
+        if (!mRestart)
+            mRestart = mono_class_get_method_from_name(g_clsController, "Restart", 1);
+        void* ctrl = CtrlInstanceMainThread();
+        if (!ctrl || !mRestart)
+        {
+            Log::Printf("[CATCH] restart unavailable (ctrl=%p m=%p)", ctrl, (void*)mRestart);
+            return;
+        }
+        bool fromBeginning = false;
+        void* args[1] = { &fromBeginning };
+        MonoObject* exc = nullptr;
+        mono_runtime_invoke(mRestart, ctrl, args, &exc);
+        Log::Printf("[CATCH] Restart(false) invoked exc=%p", (void*)exc);
+    }
+
+    // 游戏主线程每帧钩子调用（节流）：把开关重应用间隔从 ~1s 压到 ~100ms。
+    // 为什么需要：scrController.Awake 每关都把 noFail 重置为 GCS.useNoFail、
+    // 把 RDC.auto 重置为 false；只在 1s 一次的主线程任务里应用，会在"进关卡 /
+    // 死亡重开"的头一段时间里失效（不死被打死、自动连打前几拍不触发）。
+    void TickCheatsFast()
+    {
+        static DWORD s_last = 0;
+        DWORD now = GetTickCount();
+        if (now - s_last < 100) return;
+        s_last = now;
+        if (CheatState::GameQuitting.load(std::memory_order_relaxed)) return;
+        if (!CheatState::NoDeath.load(std::memory_order_relaxed) &&
+            !CheatState::AutoCombo.load(std::memory_order_relaxed) &&
+            !Chart4K::FireMacroEnabled() &&
+            !Chart4K::AnyAssistEnabled())
+            return;
+        ApplyCheatsMainThread();
     }
 
     // ---------------- 桥接线程 Tick（纯指针读，绝不调用 mono API） ----------------
