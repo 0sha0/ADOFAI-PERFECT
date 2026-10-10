@@ -1,4 +1,4 @@
-ADOFAI PERFECT v2.0 - 使用说明
+ADOFAI PERFECT v2.1 - 使用说明
 ================================
 
 ■ 运行环境
@@ -70,7 +70,7 @@ ADOFAI PERFECT v2.0 - 使用说明
 
   · 设置：界面风格（6 套强调色）、切换语言（简中 / 繁中 / English / 日本語 / Русский）、
           选择游戏目录、整套配置保存 / 加载、键位说明
-  · 关于：LOGO / 名称 / 版本 2.0 / 演示视频 / GitHub / 配置目录（需手动点击，不会自动跳转）
+  · 关于：LOGO / 名称 / 版本 2.1 / 演示视频 / GitHub / 配置目录（需手动点击，不会自动跳转）
 
   · MOD 管理器：默认安装「官方 UnityModManager 0.32.5 内核」（MIT，随包分发，装到
     <游戏>_Data\Managed\UnityModManager，与 MOD-MANAGER 装出来的布局完全同款），

@@ -5,12 +5,12 @@
 <h1 align="center">ADOFAI PERFECT</h1>
 
 <p align="center">
-  <b>A Dance of Fire and Ice</b> 本地辅助工具 · v2.0 · Powered by <b>SHASHEN4404</b>
+  <b>A Dance of Fire and Ice</b> 本地辅助工具 · v2.1 · Powered by <b>SHASHEN4404</b>
 </p>
 
 <p align="center">
   <a href="../../releases"><img src="https://img.shields.io/badge/download-Release-blueviolet" alt="Release"></a>
-  <img src="https://img.shields.io/badge/version-2.0-brightgreen" alt="version">
+  <img src="https://img.shields.io/badge/version-2.1-brightgreen" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue" alt="platform">
   <img src="https://img.shields.io/badge/game-ADOFAI%20Steam-orange" alt="game">
   <img src="https://img.shields.io/badge/C%2B%2B-20-00599C" alt="cpp">
@@ -51,7 +51,7 @@ v1.3 的界面**完全重写**为 **侧边栏 + 子导航**布局（不再使用
 | **其他** | 顶部子导航：`宏模式` / `录制` / `皮肤` / `按键反馈`；入口页另有一张 **直播模式（防采集）** 卡片 |
 | **MOD 管理器** | 内置自研 **UMM 兼容加载器**：列出全部 MOD 与实时加载状态（绿=已加载 / 黄=加载中 / 红=失败 / 灰=已禁用），一键开启 / 停用、打开 MOD 自带界面、展开卡片内联改设置、删除 MOD。**内核就是官方 UnityModManager 0.32.5**（v2.0 起，MIT 随仓库分发）：全新安装直接部署官方内核到 `Managed\UnityModManager`（与 MOD-MANAGER 装出来的布局逐字同款，官方 GUI / 皮肤 / 热键 / 设置注解框架全部原生可用），工具通过**桥接 Sidecar**（`AdofPerfectUmm.dll`，纯反射）驱动它——MOD 列表 / 开关 / 打开界面 / 设置热应用照常在工具页完成。已装别的管理器（MOD-MANAGER / 官方安装器）时自动转「复用模式」：不覆写它的 doorstop 配置、不把 MOD 重复加载第二遍；存储全盘对齐（Config.xml / Params.xml 接手并双向镜像 / `<MOD>\Settings.xml` 单一事实源），还会自动导入 MOD-MANAGER 的游戏目录配置（`%AppData%\AdofaiModManager\settings.json`），已有生态零成本迁移 |
 | **设置** | 界面风格（6 套强调色：灰蓝 / 橄榄 / 青苔 / 深海 / 暖粉 / 琥珀）、语言、游戏目录、配置档案、键位说明 |
-| **关于** | LOGO、软件名称、版本 2.0、演示视频 / GitHub 仓库 / 配置目录按钮（**不会自动跳转浏览器**） |
+| **关于** | LOGO、软件名称、版本 2.1、演示视频 / GitHub 仓库 / 配置目录按钮（**不会自动跳转浏览器**） |
 
 - 「**一般轨道**」的 4K / 5K / 6K / 10K / 16K(PAD) / CATCH 各是独立页面，切换模式不会串数据；
 - 「**其他**」把宏打歌、录制、皮肤、按键反馈集中收纳，入口页再放一张**直播模式**卡片，
@@ -78,7 +78,26 @@ v1.3 的界面**完全重写**为 **侧边栏 + 子导航**布局（不再使用
 | **皮肤** | 一键切换皮肤；**支持导入 Malody `.msp` 皮肤包**（MSP 字段解析 + `info.lua` 脚本）；**每模式独立皮肤**（4K / 5K / 6K / 10K / 8K / 16K / CATCH 互不通用；OSU 固定内置 osu! 皮肤） |
 | **按键反馈（KeyViewer）** | 类经典 KeyViewer 的按键反馈：按下高亮、按键次数、KPS、总 KPS、逐键自定义、任意键位数（不止 4 键）、位置与缩放、**长按拖尾雨**（像 KeyViewer MOD 一样连续拖尾） |
 | **设置** | 界面风格（6 套强调色）、i18n 语言切换（简体中文 / 繁體中文 / English / 日本語 / Русский）、选择游戏目录（自动探测 + 手动浏览）、配置文件整套保存 / 加载 |
-| **关于** | LOGO、软件名称、版本 2.0、演示视频、GitHub 仓库、配置目录 |
+| **关于** | LOGO、软件名称、版本 2.1、演示视频、GitHub 仓库、配置目录 |
+
+### v2.1 更新
+
+**MOD 管理器：与 MOD-MANAGER / 官方 UnityModManager 完全兼容**
+
+- **默认安装官方内核**：全新安装直接部署官方 UnityModManager 0.32.5（MIT，随包分发）到
+  `Managed\UnityModManager`——布局与 MOD-MANAGER 装出来的逐字同款（相对路径 doorstop），
+  官方 GUI / 皮肤 / 热键 / 设置注解框架全部原生可用，MOD 100% 兼容；
+- **桥接 Sidecar**（`umm/sidecar` → `AdofPerfectUmm.dll`）：工具通过纯反射驱动官方内核，
+  MOD 列表 / 开关 / 打开界面 / 设置热应用 / 日志照常在工具页完成；
+- **复用模式**：检测到 MOD-MANAGER / 官方安装器已装内核时，不覆写 doorstop 配置、
+  不把 MOD 重复加载第二遍（修复「加载两次覆盖原有生态」）；
+- **设置存储单一事实源**：MOD 设置统一走 `<MOD>\Settings.xml`（与官方 0.32 一致），
+  修复 Overlayer 等 MOD「配置 zh-CN 却显示英文」；旧版写过的 `<类名>.xml` 自动升级迁移；
+- **配置互通**：Config.xml 接手、Params.xml 双向镜像（两边开关状态永远一致）、
+  SaveSettingsAndParams / GetHeader / OnChange / ChangeValue / SaveOnReload /
+  Draw 注解框架惰性类型 / Vector2i / Vector3i 等官方 API 补齐；
+- **参考管理器数据导入**：自动读取 `%AppData%\AdofaiModManager\settings.json` 的
+  GamePath / MOD 目录（有手动配置则不覆盖）。
 
 ### v2.0 更新
 
@@ -94,7 +113,7 @@ v1.3 的界面**完全重写**为 **侧边栏 + 子导航**布局（不再使用
 
 **其余**
 
-- 版本资源升至 **2.0.0.0**；发布包 `ADOFAI-PERFECT-v2.0-win64.zip`；
+- 版本资源升至 **2.0.0.0**；发布包 `ADOFAI-PERFECT-v2.1-win64.zip`；
 - 16K 起手位、乐句换形、难度跨距（Lv ≥ 18 / ≥ 26 两档）均按手法独立调校。
 
 ### v1.3 更新
@@ -416,7 +435,7 @@ Release 使用**静态 CRT**（`/MT`），产物不依赖 `vcruntime140.dll` / `
 ├── KSkin/                      内置轨道皮肤（4K/5K/6K/10K/16K；发布包带着它）
 ├── CatchSkin/                  内置 CATCH 皮肤（Malody 原皮 Dylamo）
 ├── ADOFAIPerfect/
-│   ├── ADOFAIPerfect.rc        版本资源（2.0.0.0）+ 内嵌 LOGO（RCDATA）
+│   ├── ADOFAIPerfect.rc        版本资源（2.1.0.0）+ 内嵌 LOGO（RCDATA）
 │   └── src/
 │       ├── Menu.cpp            侧边栏主界面（导航 / 页面分发 / 顶栏 / 窗口）
 │       ├── UiKit.cpp/.h        自绘控件库（Etherium 风格：Tab / 开关 / 卡片 / 组合框 / 改键…）
@@ -451,7 +470,7 @@ Release 使用**静态 CRT**（`/MT`），产物不依赖 `vcruntime140.dll` / `
 | `KSkin/` · `CatchSkin/` | 内置皮肤（**必须随仓库一起分发**，否则对应模式不绘制贴图） |
 | `umm/` | MOD 加载器运行时（UnityModManager.dll / 0Harmony.dll / dnlib.dll + C# host 源码，**随仓库分发**） |
 | `README.md` · `使用说明.txt` · `LICENSE` · `run.cmd` | 文档与一键注入脚本 |
-| `ADOFAI-PERFECT-v2.0-win64.zip` | 发布包（上传到 Releases 即可；`.gitignore` 已忽略 `*.zip`，不进源码提交） |
+| `ADOFAI-PERFECT-v2.1-win64.zip` | 发布包（上传到 Releases 即可；`.gitignore` 已忽略 `*.zip`，不进源码提交） |
 | `bin/` · `obj/` | 构建产物，不提交（`.gitignore` 已忽略） |
 
 ### 第三方依赖
