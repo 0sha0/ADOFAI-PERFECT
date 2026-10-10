@@ -388,7 +388,9 @@ namespace GameDetour
             g_catchRt.floorSeq = c.floorIndex;
             g_catchRt.tries = 0;
             g_catchRt.jit = g_catchRt.jit * 1664525u + 1013904223u;   // 每砖一次拟人抖动
-            g_catchRt.jitMs = ((double)(g_catchRt.jit >> 8) / 16777216.0 * 2.0 - 1.0) * 5.0;
+            // 固定 ±5ms → 随宏页「抖动幅度」缩放（0% = 绝对零抖动，高 BPM 不出窗）
+            g_catchRt.jitMs = ((double)(g_catchRt.jit >> 8) / 16777216.0 * 2.0 - 1.0) * 5.0
+                              * ((double)Chart4K::MacroJitterGet() / 100.0);
         }
 
         // CATCH 的判定偏差（按当前歌曲时刻取最近一条）；没拿到就按 0（当成完美接住）

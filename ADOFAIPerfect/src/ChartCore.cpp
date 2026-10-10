@@ -154,6 +154,7 @@ namespace Chart4K
     static std::atomic<bool> s_macroPlay[kModeN]= { { false }, { false }, { false }, { false }, { false }, { false }, { false }, { false } };  // 宏打歌（拟人化）
     static std::atomic<int>  s_macroAcc{ 98 };     // 宏打歌目标精准度（90..100）
     static std::atomic<int>  s_macroHuman{ 60 };   // 拟人抖动强度（0..100）
+    static std::atomic<int>  s_macroJitter{ 100 }; // 抖动幅度总乘数（0..100%；0=绝对零抖动，高 BPM 保底档）
     static std::atomic<bool> s_recOn{ false };     // 录制开关
     static std::atomic<bool> s_recAuto{ true };    // 录制跟随游戏自动开始/停止
     static std::atomic<bool> s_recPaused{ false }; // 录制暂停（结束当前分段，恢复时写新文件）
@@ -4655,10 +4656,21 @@ namespace Chart4K
         auto urand = []() { s_autoRng = s_autoRng * 1664525u + 1013904223u; return (double)(s_autoRng >> 8) / 16777216.0; };
         const int acc = std::max(90, std::min(100, s_macroAcc.load(std::memory_order_relaxed)));
         const int hum = std::max(0, std::min(100, s_macroHuman.load(std::memory_order_relaxed)));
-        const double sigma = (17.0 - 0.14 * (double)(acc - 90)) * (0.30 + 0.70 * (double)hum / 100.0);
+        const int jit = std::max(0, std::min(100, s_macroJitter.load(std::memory_order_relaxed)));
+        // 保底档：抖动幅度 0%，或 100% 精准度 + 0% 拟人 = 绝对零偏移。
+        // 旧版在这里仍会加 ~±4.7ms 高斯 + 恒定慢漂移，高 BPM / 紧判定窗
+        // （marginScale<1）叠加帧量化就直接出窗断连 —— 用户要求可关。
+        if (jit <= 0 || (acc >= 100 && hum <= 0))
+        {
+            s_macroDrift = 0.0;
+            return 0.0;
+        }
+        const double jitK = (double)jit / 100.0;                            // 新增：总幅度乘数
+        const double humK = 0.30 + 0.70 * (double)hum / 100.0;
+        const double sigma = (17.0 - 0.14 * (double)(acc - 90)) * humK * jitK;
         const double u1 = std::max(1e-9, urand()), u2 = urand();
         const double g = std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
-        s_macroDrift = s_macroDrift * 0.990 + g * 0.22;                    // 慢漂移（真人节奏感）
+        s_macroDrift = s_macroDrift * 0.990 + g * 0.22 * jitK * humK;      // 慢漂移（随幅度缩放）
         double off = g * sigma + s_macroDrift;
         if (urand() < (double)(100 - acc) * 0.012)                         // 偶发手滑（GOOD 级偏差）
             off += (urand() * 2.0 - 1.0) * winMs * 0.42;
@@ -6746,6 +6758,7 @@ namespace Chart4K
         }
         I18N::Prefs::SetInt("macro_acc",   s_macroAcc.load(std::memory_order_relaxed));
         I18N::Prefs::SetInt("macro_human", s_macroHuman.load(std::memory_order_relaxed));
+        I18N::Prefs::SetInt("macro_jitter", s_macroJitter.load(std::memory_order_relaxed));
         I18N::Prefs::SetInt("catch_playacc", s_catchPlayAcc.load(std::memory_order_relaxed));
         I18N::Prefs::Save();
     }
@@ -6782,6 +6795,10 @@ namespace Chart4K
         if (hum < 0) hum = 0;
         if (hum > 100) hum = 100;
         s_macroHuman.store(hum, std::memory_order_relaxed);
+        int jit = I18N::Prefs::GetInt("macro_jitter", 100);
+        if (jit < 0) jit = 0;
+        if (jit > 100) jit = 100;
+        s_macroJitter.store(jit, std::memory_order_relaxed);
         int cpa = I18N::Prefs::GetInt("catch_playacc", 100);
         if (cpa < 0) cpa = 0;
         if (cpa > 100) cpa = 100;
@@ -9139,7 +9156,7 @@ namespace Chart4K
         "read.windows", "read.adapt",
         "rec.on", "rec.auto", "rec.fps", "rec.mbps", "rec.paused",
         "mini.on", "mini.x", "mini.y", "mini.w", "mini.h",
-        "hfx", "jpop", "board", "macro.acc", "macro.human", "macro.fire"
+        "hfx", "jpop", "board", "macro.acc", "macro.human", "macro.fire", "macro.jitter"
     };
     int GlobalSettingCount() { return (int)(sizeof(kGlobalKeys) / sizeof(kGlobalKeys[0])); }
     const char* GlobalSettingKey(int id)
@@ -9169,6 +9186,7 @@ namespace Chart4K
         case 31: return MacroAccGet();
         case 32: return MacroHumanGet();
         case 33: return FireMacroEnabled() ? 1 : 0;
+        case 34: return MacroJitterGet();
         default: return 0;
         }
     }
@@ -9195,6 +9213,7 @@ namespace Chart4K
         case 31: MacroAccSet(v); break;
         case 32: MacroHumanSet(v); break;
         case 33: FireMacroSet(v); break;
+        case 34: MacroJitterSet(v); break;
         default: break;
         }
     }
@@ -9229,6 +9248,8 @@ namespace Chart4K
     void MacroAccSet(int v) { s_macroAcc.store(std::max(90, std::min(100, v)), std::memory_order_relaxed); }
     int  MacroHumanGet() { return s_macroHuman.load(std::memory_order_relaxed); }
     void MacroHumanSet(int v) { s_macroHuman.store(std::max(0, std::min(100, v)), std::memory_order_relaxed); }
+    int  MacroJitterGet() { return s_macroJitter.load(std::memory_order_relaxed); }
+    void MacroJitterSet(int v) { s_macroJitter.store(std::max(0, std::min(100, v)), std::memory_order_relaxed); }
     int  RecFpsGet()     { RecCfgLoadOnce(); return s_recFps.load(std::memory_order_relaxed); }
     void RecFpsSet(int v) { RecCfgLoadOnce(); s_recFps.store(std::max(15, std::min(240, v)), std::memory_order_relaxed); RecCfgSave(); }
     int  RecMbpsGet()    { RecCfgLoadOnce(); return s_recMbps.load(std::memory_order_relaxed); }
@@ -9899,6 +9920,16 @@ namespace Chart4K
             ImGui::SetNextItemWidth(-14.f);
             if (ImGui::SliderInt("##macrochum", &hum, 0, 100, "%d%%"))
                 MacroHumanSet(hum);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                ModeCfgSave();
+
+            int jit = MacroJitterGet();
+            ImGui::TextUnformatted(I18N::Tr(I18N::MACRO_JITTER));
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(120.f);
+            ImGui::SetNextItemWidth(-14.f);
+            if (ImGui::SliderInt("##macrocjit", &jit, 0, 100, "%d%%"))
+                MacroJitterSet(jit);
             if (ImGui::IsItemDeactivatedAfterEdit())
                 ModeCfgSave();
 

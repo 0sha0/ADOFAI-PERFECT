@@ -40,6 +40,7 @@ namespace Chart4K
     // ---- 宏 / 录制 配置（设置页档案 + 宏页共用；rec_dir 持久化在 adofai_perfect.cfg）----
     int         MacroAccGet();  void MacroAccSet(int v);     // 目标精准度 90..100
     int         MacroHumanGet(); void MacroHumanSet(int v);  // 拟人程度 0..100
+    int         MacroJitterGet(); void MacroJitterSet(int v); // 抖动幅度 0..100（总乘数；0=绝对零抖动，高 BPM 保底档）
     int         RecOnGet();     void RecOnSet(int v);
     int         RecAutoGet();   void RecAutoSet(int v);
     int         RecFpsGet();    void RecFpsSet(int v);
