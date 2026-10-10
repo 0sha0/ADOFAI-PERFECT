@@ -1,18 +1,18 @@
 #pragma once
 // ============================================================
-// ModLoader.h — 自研 UMM 兼容加载器的 C++ 侧桥接
+// ModLoader.h — MOD 内核（官方 UnityModManager）的 C++ 侧桥接
 //
-//  加载器本体是我们自己写的托管程序集，源在 <仓库>\umm\host\ ，
-//  编译产物是 UnityModManager.dll。它由本模块安装进游戏：
-//    <游戏>_Data\Managed\UnityModManager\UnityModManager.dll
-//    <游戏>_Data\Managed\0Harmony.dll
-//    <游戏>\winhttp.dll + doorstop_config.ini      （可选：启动时加载）
-//    <游戏>_Data\Managed\UnityModManager\AdofPerfectUmm.json （MOD 目录等配置）
+//  内核 = 官方 UnityModManager 0.32.5（umm\UnityModManager.dll，MIT，
+//  与 MOD-MANAGER 分发的逐字节相同）。由本模块安装进游戏：
+//    <游戏>_Data\Managed\UnityModManager\   官方内核（dll/Harmony/dnlib/Config.xml）
+//    <游戏>_Data\Managed\AdofPerfectUmm\    桥接 Sidecar（AdofPerfectUmm.dll）
+//    <游戏>\winhttp.dll + doorstop_config.ini（相对路径，与 MOD-MANAGER 同款）
+//  更早版本的自研加载器（legacy）已退役：检测到即自动迁移到官方内核并清残留。
 //
-//  真正的“加载/驱动/界面”都在托管侧完成；本模块只负责：
-//    · 安装 / 检查加载器文件
+//  真正的“加载/驱动/界面”都在官方内核托管侧完成；本模块只负责：
+//    · 安装 / 检查内核与 Sidecar
 //    · 在游戏主线程（mono 托管线程）上通过 Mono API 调用
-//      AdofPerfectUmm.Bridge，查询 MOD 列表 / 开关 / 打开设置
+//      AdofPerfectUmm.Bridge（反射桥），查询 MOD 列表 / 开关 / 打开设置
 //
 //  线程模型：所有 Mono 调用都排进 GameBridge::QueueMainThreadWork，
 //  由游戏主线程执行；渲染线程只读缓存结果。

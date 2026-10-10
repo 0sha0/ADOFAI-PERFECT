@@ -468,7 +468,7 @@ Release 使用**静态 CRT**（`/MT`），产物不依赖 `vcruntime140.dll` / `
 | `ADOFAIPerfect/` · `Injector/` · `deps/` · `ADOFAI-PERFECT.sln` | 源码 + 依赖，可完整构建（VS2022 / x64 / Release） |
 | `assets/` | 图标与 LOGO（构建时 LOGO 编进 DLL） |
 | `KSkin/` · `CatchSkin/` | 内置皮肤（**必须随仓库一起分发**，否则对应模式不绘制贴图） |
-| `umm/` | MOD 加载器运行时（UnityModManager.dll / 0Harmony.dll / dnlib.dll + C# host 源码，**随仓库分发**） |
+| `umm/` | MOD 内核运行时（官方 UnityModManager.dll / 0Harmony / dnlib / Config.xml + 桥接 Sidecar 源码 `umm/sidecar/`，**随仓库分发**） |
 | `README.md` · `使用说明.txt` · `LICENSE` · `run.cmd` | 文档与一键注入脚本 |
 | `ADOFAI-PERFECT-v2.1-win64.zip` | 发布包（上传到 Releases 即可；`.gitignore` 已忽略 `*.zip`，不进源码提交） |
 | `bin/` · `obj/` | 构建产物，不提交（`.gitignore` 已忽略） |
