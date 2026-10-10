@@ -327,5 +327,187 @@ namespace UnityModManagerNet
     // 缺失时反射读取自定义特性会抛异常，这里补一个空实现。
     [AttributeUsage(AttributeTargets.Class)]
     public class EnableReloadingAttribute : Attribute { }
+
+    // 原版 UMM 的「重载时自动保存」标记（SaveOnReload）。
+    [AttributeUsage(AttributeTargets.Class)]
+    public class SaveOnReloadAttribute : Attribute { }
+
+    // ============================================================
+    //  原版 UMM 0.32 的「设置 GUI 注解框架」+ 基础类型。
+    //  Overlayer 等 MOD 的设置类大量使用这些注解（官方 GUI 靠它们渲染
+    //  设置页），个别 MOD 还会实现 IDrawable / ICopyable 或直接用
+    //  Vector2i/Vector3i 做设置字段 —— 类型缺失就是 TypeLoadException。
+    //  本加载器的设置页由工具侧（C++ / ImGui）直接编辑设置文件，
+    //  所以这里只提供「惰性」定义：形状与原版一致，行为为空。
+    // ============================================================
+    public enum DrawType
+    {
+        Auto, Ignore, Field, Slider, Toggle, ToggleGroup, ToggleMulti,
+        PopupToggleMulti, PopupList, KeyBinding, KeyBindingNoMod, CustomGUI,
+    }
+
+    [Flags]
+    public enum DrawFieldMask
+    {
+        Any = 0, Public = 1, Serialized = 2, SkipNotSerialized = 4,
+        OnlyDrawAttr = 8,
+    }
+
+    [Flags]
+    public enum CopyFieldMask
+    {
+        Any = 0, Public = 1, Serialized = 2, SkipNotSerialized = 4,
+        OnlyCopyAttr = 8, Matching = 16,
+    }
+
+    // MOD 可实现它让官方 GUI 在值变化时收到回调
+    public interface IDrawable
+    {
+        void OnChange();
+    }
+
+    // MOD 可实现它支持官方 GUI 的「配置档案复制」
+    public interface ICopyable
+    {
+    }
+
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct)]
+    public class DrawFieldsAttribute : Attribute
+    {
+        public DrawFieldMask Mask = DrawFieldMask.Any;
+        public DrawFieldsAttribute() { }
+        public DrawFieldsAttribute(DrawFieldMask mask) { Mask = mask; }
+    }
+
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct)]
+    public class CopyFieldsAttribute : Attribute
+    {
+        public CopyFieldMask Mask = CopyFieldMask.Any;
+        public CopyFieldsAttribute() { }
+        public CopyFieldsAttribute(CopyFieldMask mask) { Mask = mask; }
+    }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class DrawAttribute : Attribute
+    {
+        public DrawType Type = DrawType.Auto;
+        public string Label;
+        public int Width;
+        public int Height;
+        public double Min;
+        public double Max;
+        public int Precision = 2;
+        public int MaxLength;
+        public string VisibleOn;
+        public string InvisibleOn;
+        public bool Box;
+        public bool Collapsible;
+        public bool Vertical;
+        public string Tooltip;
+        public bool TextArea;
+        public bool NoFlexibleSpace;
+        public int Unique;
+        public DrawAttribute() { }
+        public DrawAttribute(DrawType type) { Type = type; }
+    }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class CopyAttribute : Attribute
+    {
+        public string Alias;
+        public CopyAttribute() { }
+        public CopyAttribute(string alias) { Alias = alias; }
+    }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class HorizontalAttribute : Attribute
+    {
+        public int Space = 10;
+        public HorizontalAttribute() { }
+        public HorizontalAttribute(int space) { Space = space; }
+    }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class DrawSpaceAttribute : Attribute
+    {
+        public int Height;
+        public DrawSpaceAttribute() { }
+        public DrawSpaceAttribute(int height) { Height = height; }
+    }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class DrawHeaderAttribute : Attribute
+    {
+        public string Text;
+        public DrawHeaderAttribute() { }
+        public DrawHeaderAttribute(string text) { Text = text; }
+    }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class DrawBeginHorizontalAttribute : Attribute { }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class DrawEndHorizontalAttribute : Attribute { }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class DrawBeginVerticalAttribute : Attribute { }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class DrawEndVerticalAttribute : Attribute { }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    public class DrawFlexibleSpaceAttribute : Attribute { }
+
+    // 整型向量（原版 UMM 自带；个别 MOD 的设置/存档里直接用）
+    public struct Vector2i
+    {
+        public int x, y;
+
+        public Vector2i(int x, int y) { this.x = x; this.y = y; }
+
+        public void Set(int nx, int ny) { x = nx; y = ny; }
+
+        public static float Distance(Vector2i a, Vector2i b)
+        {
+            double dx = a.x - b.x, dy = a.y - b.y;
+            return (float)Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        public static Vector2i Min(Vector2i a, Vector2i b) { return new Vector2i(Math.Min(a.x, b.x), Math.Min(a.y, b.y)); }
+        public static Vector2i Max(Vector2i a, Vector2i b) { return new Vector2i(Math.Max(a.x, b.x), Math.Max(a.y, b.y)); }
+        public static Vector2i Scale(Vector2i a, Vector2i b) { return new Vector2i(a.x * b.x, a.y * b.y); }
+        public void Scale(Vector2i s) { x *= s.x; y *= s.y; }
+        public void Clamp(Vector2i min, Vector2i max)
+        {
+            x = Math.Max(min.x, Math.Min(max.x, x));
+            y = Math.Max(min.y, Math.Min(max.y, y));
+        }
+    }
+
+    public struct Vector3i
+    {
+        public int x, y, z;
+
+        public Vector3i(int x, int y, int z) { this.x = x; this.y = y; this.z = z; }
+
+        public void Set(int nx, int ny, int nz) { x = nx; y = ny; z = nz; }
+
+        public static float Distance(Vector3i a, Vector3i b)
+        {
+            double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+            return (float)Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        public static Vector3i Min(Vector3i a, Vector3i b) { return new Vector3i(Math.Min(a.x, b.x), Math.Min(a.y, b.y), Math.Min(a.z, b.z)); }
+        public static Vector3i Max(Vector3i a, Vector3i b) { return new Vector3i(Math.Max(a.x, b.x), Math.Max(a.y, b.y), Math.Max(a.z, b.z)); }
+        public static Vector3i Scale(Vector3i a, Vector3i b) { return new Vector3i(a.x * b.x, a.y * b.y, a.z * b.z); }
+        public void Scale(Vector3i s) { x *= s.x; y *= s.y; z *= s.z; }
+        public void Clamp(Vector3i min, Vector3i max)
+        {
+            x = Math.Max(min.x, Math.Min(max.x, x));
+            y = Math.Max(min.y, Math.Min(max.y, y));
+            z = Math.Max(min.z, Math.Min(max.z, z));
+        }
+    }
 }
 

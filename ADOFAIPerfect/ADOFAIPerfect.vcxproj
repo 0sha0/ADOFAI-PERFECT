@@ -191,11 +191,20 @@
     <ClInclude Include="src\GameDir.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <!-- 自研 UMM 兼容加载器：随 C++ 一起编译，产物落在 $(OutDir)umm\ -->
+  <!-- UMM 部署：官方内核 + 桥接 Sidecar + 旧自研加载器（legacy），产物落在 $(OutDir)umm\ -->
   <Target Name="BuildUmmLoader" AfterTargets="Build">
     <Exec Command="call &quot;$(RepoRoot)umm\host\build.cmd&quot;" ContinueOnError="WarnAndContinue" />
+    <Exec Command="call &quot;$(RepoRoot)umm\sidecar\build.cmd&quot;" ContinueOnError="WarnAndContinue" />
     <MakeDir Directories="$(OutDir)umm" />
-    <Copy SourceFiles="$(RepoRoot)umm\host\UnityModManager.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\host\UnityModManager.dll')" />
+    <MakeDir Directories="$(OutDir)umm\legacy" />
+    <!-- 默认安装内核 = 官方 UnityModManager 0.32.5（MIT，随仓库分发） -->
+    <Copy SourceFiles="$(RepoRoot)umm\UnityModManager.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\UnityModManager.dll')" />
+    <Copy SourceFiles="$(RepoRoot)umm\Config.xml" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\Config.xml')" />
+    <Copy SourceFiles="$(RepoRoot)umm\UnityModManager.xml" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\UnityModManager.xml')" />
+    <!-- 桥接 Sidecar（工具页驱动官方内核用） -->
+    <Copy SourceFiles="$(RepoRoot)umm\AdofPerfectUmm.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\AdofPerfectUmm.dll')" />
+    <!-- 旧自研加载器（仅用于已装旧版的机器原地兼容，不再新装） -->
+    <Copy SourceFiles="$(RepoRoot)umm\host\UnityModManager.dll" DestinationFolder="$(OutDir)umm\legacy" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\host\UnityModManager.dll')" />
     <Copy SourceFiles="$(RepoRoot)umm\0Harmony.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\0Harmony.dll')" />
     <Copy SourceFiles="$(RepoRoot)umm\dnlib.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\dnlib.dll')" />
     <Copy SourceFiles="$(RepoRoot)umm\winhttp_x64.dll" DestinationFolder="$(OutDir)umm" ContinueOnError="WarnAndContinue" Condition="Exists('$(RepoRoot)umm\winhttp_x64.dll')" />

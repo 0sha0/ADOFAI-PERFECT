@@ -182,14 +182,17 @@ namespace ModLoader
             if (!MonoApi::Ready()) return false;
             using namespace MonoApi;
 
-            // 已加载的程序集里找我们的 Bridge（门卫/注入两条路都可能命中）。
-            // 注意：重名的「原生 UnityModManager」里没有 Bridge，所以必须按类判定，
-            // 不能只看 mono_image_loaded 是否返回非空。
+            // 优先 Sidecar（AdofPerfectUmm.dll，官方内核的反射桥）；
+            // 找不到再回退旧自研加载器（legacy UnityModManager.dll 自带 Bridge）。
+            // 注意：官方内核的程序集也叫 UnityModManager 但没有 Bridge，
+            // 所以必须按类判定，不能只看 mono_image_loaded 是否返回非空。
+            const char* kProbe[] = { "AdofPerfectUmm", "UnityModManager" };
             if (mono_image_loaded && mono_class_from_name)
             {
-                MonoImage* img = mono_image_loaded("UnityModManager");
-                if (img)
+                for (int i = 0; i < 2; i++)
                 {
+                    MonoImage* img = mono_image_loaded(kProbe[i]);
+                    if (!img) continue;
                     MonoClass* c = mono_class_from_name(img, "AdofPerfectUmm", "Bridge");
                     if (c)
                     {
@@ -200,22 +203,25 @@ namespace ModLoader
                 }
             }
 
-            // 还没加载：按文件路径把我们的加载器装进 AppDomain
+            // 还没加载：按文件路径把 Sidecar / 旧加载器装进 AppDomain
+            const char* kFiles[] = { "AdofPerfectUmm.dll", "UnityModManager.dll" };
+            for (int i = 0; i < 2; i++)
             {
-                std::string dll = JoinPath(LoaderDirPath(), "UnityModManager.dll");
-                if (!FileExists(dll)) return false;
+                std::string dll = JoinPath(LoaderDirPath(), kFiles[i]);
+                if (!FileExists(dll)) continue;
                 MonoDomain* dom = mono_domain_get ? mono_domain_get() : nullptr;
                 if (!dom || !mono_domain_assembly_open) return false;
                 MonoAssembly* as = mono_domain_assembly_open(dom, dll.c_str());
-                if (!as || !mono_assembly_get_image) return false;
+                if (!as || !mono_assembly_get_image) continue;
                 MonoImage* img = mono_assembly_get_image(as);
-                if (!img) return false;
+                if (!img) continue;
                 MonoClass* c = mono_class_from_name(img, "AdofPerfectUmm", "Bridge");
-                if (!c) return false;
+                if (!c) continue;
                 g_bridge = c;
                 if (mono_class_init) mono_class_init(c);
                 return true;
             }
+            return false;
         }
 
         std::string CallBridge(const char* method, int argc, const char* a0, const char* a1)
@@ -367,12 +373,17 @@ namespace ModLoader
         WriteAll(JoinPath(ld, "AdofPerfectUmm.json"), json);
     }
 
-    // ---------------- 原版 UMM 共存 ----------------
-    // 用户的游戏目录里可能已经装着「原生 UnityModManager」（doorstop 启动时
-    // 加载 Managed\UnityModManager\UnityModManager.dll）。那种情况下：
-    //   · 绝不覆写 doorstop_config.ini（那等于抢走整个 MOD 生态的启动权）；
-    //   · 游戏内加载器转入 passive 复用模式（C# 侧 Foreign.cs 反射转发）。
-    bool ForeignDoorstop()
+    // ---------------- 内核三态：官方 / 旧自研 / 未装 ----------------
+    //  默认安装「官方 UnityModManager 0.32.5」（与参考管理器 MOD-MANAGER 装出来的
+    //  布局逐字节同款：Managed\UnityModManager + 相对路径 doorstop），MOD 因此
+    //  100% 兼容（GUI 注解 / 皮肤 / 热键 / Utils 全都是真的）。工具通过 Sidecar
+    //  （AdofPerfectUmm.dll，纯反射桥）驱动官方内核 —— 管理器页照常可用。
+    //
+    //  · OfficialDoorstop：doorstop 指向 Managed\UnityModManager\UnityModManager.dll
+    //    （无论它是参考管理器 / 官方安装器 / 本工具装的）→ passive 复用模式
+    //  · LegacyDoorstop：doorstop 指向 Managed\AdofPerfectUmm\UnityModManager.dll
+    //    （旧版本本工具装的自研加载器）→ 原地保留兼容，继续可用
+    bool OfficialDoorstop()
     {
         std::string g = GameDir::Get();
         if (g.empty()) return false;
@@ -380,25 +391,51 @@ namespace ModLoader
         if (ini.empty()) return false;
         size_t p = ini.find("target_assembly");
         if (p == std::string::npos) return false;
-        // 指向我们的 AdofPerfectUmm 目录 → 不是外来配置
+        // 指向我们的旧自研目录 → 不是官方内核
         if (ini.find("AdofPerfectUmm", p) != std::string::npos) return false;
-        // 指向任何 UnityModManager.dll（原版 UMM / 其他分发版）→ 外来
         return ini.find("UnityModManager.dll", p) != std::string::npos;
+    }
+
+    bool LegacyDoorstop()
+    {
+        std::string g = GameDir::Get();
+        if (g.empty()) return false;
+        std::string ini = ReadAll(JoinPath(g, "doorstop_config.ini"));
+        size_t p = ini.find("target_assembly");
+        if (p == std::string::npos) return false;
+        return ini.find("AdofPerfectUmm", p) != std::string::npos &&
+               ini.find("UnityModManager.dll", p) != std::string::npos;
+    }
+
+    // Sidecar（AdofPerfectUmm.dll）在发布包里的位置；旧包没有 legacy 子目录时回退
+    std::string LegacySourceDll()
+    {
+        std::string srcDir = DllDir() + "umm";
+        std::string legacy = JoinPath(srcDir, "legacy\\UnityModManager.dll");
+        if (FileExists(legacy)) return legacy;
+        // 旧发布包：umm\UnityModManager.dll 就是自研加载器（那时还没有官方内核）
+        if (!FileExists(JoinPath(srcDir, "AdofPerfectUmm.dll")))
+            return JoinPath(srcDir, "UnityModManager.dll");
+        return std::string();
     }
 
     bool Installed()
     {
-        // 原版 UMM 已经接管启动钩子：视为「已安装」，我们的 Tick 不再去
-        // 覆写它的 doorstop_config.ini（过去这里会把生态覆盖掉 —— 用户反馈的
-        // 「我这个还加载一次覆盖了原有的生态」）。工具侧走 passive 复用。
-        if (ForeignDoorstop()) return true;
+        // 官方内核已接管启动钩子（无论谁装的）：视为「已安装」，Tick 只需
+        // 保证 Sidecar 在场供工具页复用，绝不去覆写它的 doorstop_config.ini。
+        // Sidecar 还没落地时返回 false，让 Tick 走一次 Install 把桥补上。
+        if (OfficialDoorstop())
+        {
+            std::string ld = LoaderDirPath();
+            return !ld.empty() && FileExists(JoinPath(ld, "AdofPerfectUmm.dll"));
+        }
 
-        std::string src = JoinPath(DllDir() + "umm", "UnityModManager.dll");
+        std::string legacy = LegacySourceDll();
         std::string ld = LoaderDirPath();
-        if (ld.empty() || !FileExists(src)) return false;
+        if (ld.empty() || legacy.empty()) return false;
         std::string dst = JoinPath(ld, "UnityModManager.dll");
         if (!FileExists(dst)) return false;
-        if (FileSize(dst) != FileSize(src)) return false;
+        if (FileSize(dst) != FileSize(legacy)) return false;
         if (!FileExists(JoinPath(ld, "AdofPerfectUmm.json"))) return false;
         // 启动钩子（doorstop）也必须指向我们的加载器，否则下次启动根本不会加载它
         std::string g = GameDir::Get();
@@ -408,18 +445,14 @@ namespace ModLoader
         return true;
     }
 
-    // UnityDoorstop：把「游戏启动时加载哪个程序集」指向我们的加载器。
+    // UnityDoorstop：把「游戏启动时加载哪个程序集」指向目标加载器。
+    // official=true → 官方内核布局（相对路径，与参考管理器写法一致）；
+    // official=false → 旧自研加载器（绝对路径，历史行为）。
     // 原配置只备份一次，用户可随时还原。
-    // force=false 时若检测到原版 UMM 的 doorstop 配置则拒绝覆写（保护生态）。
-    static bool WriteDoorstopConfig(bool force)
+    static bool WriteDoorstopConfig(bool official)
     {
         std::string g = GameDir::Get();
         if (g.empty()) return false;
-        if (!force && ForeignDoorstop())
-        {
-            Log::Printf("[mod] foreign doorstop_config.ini present; keep it (passive mode)");
-            return true;
-        }
         std::string srcDir = DllDir() + "umm";
         std::string winhttp = JoinPath(srcDir, "winhttp_x64.dll");
         std::string dstWinhttp = JoinPath(g, "winhttp.dll");
@@ -430,16 +463,27 @@ namespace ModLoader
         if (FileExists(ini) && !FileExists(ini + ".adofperfect-backup"))
             CopyFileA(ini.c_str(), (ini + ".adofperfect-backup").c_str(), FALSE);
 
-        std::string target = JoinPath(LoaderDirPath(), "UnityModManager.dll");
         std::string doc;
         doc += "[General]\r\n";
         doc += "enabled = true\r\n";
-        doc += "target_assembly = " + target + "\r\n";
+        if (official)
+        {
+            // 相对路径写法与 MOD-MANAGER（参考管理器）逐字一致，
+            // 这样它 / 官方 UMM 的检测都认得这次安装
+            std::string data = FindDataDir(g);
+            if (data.empty()) return false;
+            doc += "target_assembly = " + data + "\\Managed\\UnityModManager\\UnityModManager.dll\r\n";
+        }
+        else
+        {
+            doc += "target_assembly = " + JoinPath(LoaderDirPath(), "UnityModManager.dll") + "\r\n";
+        }
         return WriteAll(ini, doc);
     }
 
     bool Install(std::string* message, bool force)
     {
+        (void)force;
         std::string g = GameDir::Get();
         std::string managed = ManagedDir();
         std::string ld = LoaderDirPath();
@@ -448,47 +492,77 @@ namespace ModLoader
             if (message) *message = "game folder not set";
             return false;
         }
-        if (!force && ForeignDoorstop())
-        {
-            // 原版 UMM 在场：只落我们自己的文件（供 passive 复用），不动它的启动钩子
-            if (message) *message = "native UMM detected; passive mode (not overriding)";
-            Log::Printf("[mod] native UMM detected; installing loader files only (doorstop untouched)");
-        }
 
         std::string srcDir = DllDir() + "umm";
-        std::string srcDll = JoinPath(srcDir, "UnityModManager.dll");
+        std::string sidecar = JoinPath(srcDir, "AdofPerfectUmm.dll");
         std::string srcHarmony = JoinPath(srcDir, "0Harmony.dll");
-        if (!FileExists(srcDll))
+        std::string srcDnlib = JoinPath(srcDir, "dnlib.dll");
+        if (!FileExists(sidecar))
         {
-            if (message) *message = "loader not built: " + srcDll;
+            if (message) *message = "sidecar not built: " + sidecar;
             return false;
         }
-
         CreateDirectoryA(ld.c_str(), nullptr);
 
-        bool ok = true;
-        ok = CopyFileTo(srcDll, JoinPath(ld, "UnityModManager.dll")) && ok;
-        if (FileExists(srcHarmony))
+        if (OfficialDoorstop())
         {
-            CopyFileTo(srcHarmony, JoinPath(ld, "0Harmony.dll"));
-            // 游戏 Managed 根下若没有 0Harmony，也补一份（MOD 依赖它）
-            if (!FileExists(JoinPath(managed, "0Harmony.dll")))
-                CopyFileTo(srcHarmony, JoinPath(managed, "0Harmony.dll"));
+            // 官方内核在场（参考管理器 / 官方安装器 / 本工具之前装的）：
+            // 只保证 Sidecar 在场供工具页复用，启动钩子一律不动
+            CopyFileTo(sidecar, JoinPath(ld, "AdofPerfectUmm.dll"));
+            SetModsDir(ModsDir());
+            Log::Printf("[mod] official UMM kernel detected; sidecar bridged (doorstop untouched)");
+            if (message) *message = "official kernel present; tool bridged to it";
+            return true;
         }
-        // dnlib：JALib 等 MOD 会通过 AssemblyResolve 找它（原版 UMM 目录里也带）
-        std::string srcDnlib = JoinPath(srcDir, "dnlib.dll");
-        if (FileExists(srcDnlib)) CopyFileTo(srcDnlib, JoinPath(ld, "dnlib.dll"));
+
+        if (LegacyDoorstop())
+        {
+            // 旧自研安装：原地升级文件 + 补 Sidecar（不换内核，保持可用）
+            std::string legacy = LegacySourceDll();
+            if (!legacy.empty())
+            {
+                CopyFileTo(legacy, JoinPath(ld, "UnityModManager.dll"));
+                CopyFileTo(sidecar, JoinPath(ld, "AdofPerfectUmm.dll"));
+            }
+            SetModsDir(ModsDir());
+            Log::Printf("[mod] legacy loader updated in place (+sidecar)");
+            if (message) *message = "legacy loader updated (+bridge sidecar)";
+            return true;
+        }
+
+        // ------- 全新安装：官方内核（Managed\UnityModManager）+ Sidecar -------
+        std::string kDir = JoinPath(managed, "UnityModManager");
+        CreateDirectoryA(kDir.c_str(), nullptr);
+        std::string srcDll = JoinPath(srcDir, "UnityModManager.dll");
+        if (!FileExists(srcDll))
+        {
+            if (message) *message = "official kernel missing: " + srcDll;
+            return false;
+        }
+        bool ok = true;
+        ok = CopyFileTo(srcDll, JoinPath(kDir, "UnityModManager.dll")) && ok;
+        if (FileExists(srcHarmony)) CopyFileTo(srcHarmony, JoinPath(kDir, "0Harmony.dll"));
+        if (FileExists(srcDnlib)) CopyFileTo(srcDnlib, JoinPath(kDir, "dnlib.dll"));
+        std::string srcXml = JoinPath(srcDir, "UnityModManager.xml");
+        if (FileExists(srcXml)) CopyFileTo(srcXml, JoinPath(kDir, "UnityModManager.xml"));
+        // 游戏配置：已存在则不覆盖（与参考管理器一致），否则落我们的默认
+        std::string cfgTarget = JoinPath(kDir, "Config.xml");
+        if (!FileExists(cfgTarget))
+        {
+            std::string cfgSrc = JoinPath(srcDir, "Config.xml");
+            if (FileExists(cfgSrc)) CopyFileTo(cfgSrc, cfgTarget);
+        }
+        // Sidecar（工具页桥）
+        ok = CopyFileTo(sidecar, JoinPath(ld, "AdofPerfectUmm.dll")) && ok;
 
         // MOD 目录配置（供「直接启动游戏」时的 doorstop 路径使用）
         SetModsDir(ModsDir());
 
-        // UnityDoorstop：让下次启动游戏时直接加载我们的加载器
-        // （这样 MOD 能在游戏启动前打补丁；注入器路径只是兜底）。
-        // 原版 UMM 在场且未强制时保持沉默（保护它的启动钩子）。
-        WriteDoorstopConfig(force);
+        // UnityDoorstop → 官方内核（相对路径，MOD 在游戏启动前完成打补丁）
+        WriteDoorstopConfig(true);
 
         if (!ok && message) *message = "copy failed (game running? close it and retry)";
-        else if (message) *message = "installed to " + ld;
+        else if (message) *message = "official kernel installed to " + kDir;
         return ok;
     }
 

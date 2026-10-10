@@ -1577,10 +1577,44 @@ namespace ModManager
             return std::string(b);
         }
 
+        // ---- 参考「MOD-MANAGER」（AdofaiModManager）的用户数据一次性导入 ----
+        //  它把游戏目录存在 %AppData%\AdofaiModManager\settings.json 的
+        //  "GamePath" 字段。本工具从未设置过游戏目录时接手过来，
+        //  MOD 目录随之取 <GamePath>\Mods —— 用户从参考管理器迁来零配置。
+        void TryImportReferenceSettings()
+        {
+            if (I18N::Prefs::GetInt("ref.imported", 0) == 1) return;
+            I18N::Prefs::SetInt("ref.imported", 1);
+            I18N::Prefs::Save();
+            char appdata[MAX_PATH * 2] = { 0 };
+            if (GetEnvironmentVariableA("APPDATA", appdata, (DWORD)sizeof(appdata)) == 0) return;
+            std::string json = ReadAll(std::string(appdata) + "\\AdofaiModManager\\settings.json");
+            if (json.empty()) return;
+            std::string gp = JsonStrField(json, "GamePath");
+            if (gp.empty() || !DirExists(gp)) return;
+            char saved[MAX_PATH * 2] = { 0 };
+            I18N::Prefs::GetStr("game_dir", saved, sizeof(saved), "");
+            if (!saved[0])     // 用户没手动设过游戏目录才接手
+            {
+                I18N::Prefs::SetStr("game_dir", gp.c_str());
+                Log::Printf("[mod] imported GamePath from AdofaiModManager: %s", gp.c_str());
+            }
+            char moddir[MAX_PATH * 2] = { 0 };
+            I18N::Prefs::GetStr("mod.dir", moddir, sizeof(moddir), "");
+            std::string mods = JoinPath(gp, "Mods");
+            if (!moddir[0] && DirExists(mods))
+            {
+                I18N::Prefs::SetStr("mod.dir", mods.c_str());
+                Log::Printf("[mod] imported Mods dir from AdofaiModManager: %s", mods.c_str());
+            }
+            I18N::Prefs::Save();
+        }
+
         void InitPathsOnce()
         {
             if (s_pathInit) return;
             s_pathInit = true;
+            TryImportReferenceSettings();
             snprintf(s_gameBuf, sizeof(s_gameBuf), "%s", GameDir::Get());
             snprintf(s_modBuf, sizeof(s_modBuf), "%s", ResolveModsDir().c_str());
         }
