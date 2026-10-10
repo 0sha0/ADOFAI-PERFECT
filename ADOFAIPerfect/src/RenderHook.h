@@ -13,6 +13,7 @@ namespace RenderHook
     bool Install();   // worker 线程调用（需 dxgi.dll 已加载）
     void Shutdown();  // 卸载前调用：恢复 WndProc、摘钩、释放资源
     void GetGameWindowSize(float* w, float* h); // 游戏客户区尺寸（渲染线程调用）
+    bool GameCursorClientPos(float* outX, float* outY); // 系统光标在游戏客户区的坐标（不走 ImGui IO）
 }
 
 // ---- 游戏画面捕获（左下角缩略图用；DX11/DX12 通用）----

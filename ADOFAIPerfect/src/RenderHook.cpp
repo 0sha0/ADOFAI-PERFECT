@@ -1289,6 +1289,24 @@ namespace RenderHook
         *w = cw; *h = ch;
     }
 
+    // 系统光标在游戏客户区里的坐标（CATCH 接盘 / OSU 光标用）。
+    // 不走 ImGui IO.MousePos —— IO 依赖游戏窗口的 WM_MOUSEMOVE，游戏用
+    // RawInput、焦点切换、光标被游戏隐藏时都可能停更（接盘"有时候不动"
+    // 的根源）；GetCursorPos+ScreenToClient 与输入路径无关，永远反映真实位置。
+    // 光标不在客户区内（min 到任务栏 / 多屏拖出）返回 false。
+    bool GameCursorClientPos(float* outX, float* outY)
+    {
+        HWND hwnd = g_hwnd ? g_hwnd : g_scHwnd;
+        if (!hwnd || !outX || !outY) return false;
+        POINT p;
+        if (!GetCursorPos(&p)) return false;
+        if (!ScreenToClient(hwnd, &p)) return false;
+        if (p.x < -4000 || p.y < -4000 || p.x > 4000 || p.y > 4000) return false;
+        *outX = (float)p.x;
+        *outY = (float)p.y;
+        return true;
+    }
+
     // ============ 皮肤贴图加载（WIC 解码，DX11 / DX12 各一条上传路径） ============
     // WIC → RGBA8 像素（两条 API 共用）
     static bool DecodeImageRGBA(const char* path, std::vector<BYTE>* px, UINT* outW, UINT* outH)

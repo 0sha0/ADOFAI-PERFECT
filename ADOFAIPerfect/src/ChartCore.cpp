@@ -7200,15 +7200,19 @@ namespace Chart4K
             if (catchMode)
             {
                 // CATCH v2（一键自动接 + 鼠标接盘 + 漏音即死）：
-                //   接盘横坐标 = 鼠标 X（菜单打开或鼠标离开窗口时保持原位，避免跳变）；
-                //   雨点落线瞬间被接盘盖住即自动接住，没盖住判 MISS。
-                const ImVec2 mp = ImGui::GetIO().MousePos;
-                const bool menuOpen = CheatState::MenuVisible.load(std::memory_order_relaxed);
+                //   接盘横坐标 = 鼠标 X。鼠标不走 ImGui IO —— IO 依赖游戏窗口的
+                //   WM_MOUSEMOVE，游戏 RawInput / 焦点切换 / 光标隐藏时可能停更
+                //   （接盘"有时候不动"的根源），直接读系统光标；
+                //   仅当菜单展开且指针真的悬停在界面上时保持原位（避免误跳）。
+                const bool hold = CheatState::MenuVisible.load(std::memory_order_relaxed) &&
+                                  ImGui::GetIO().WantCaptureMouse;
                 static float s_plateX = 0.5f;
-                if (!menuOpen && mp.x >= 0.f && mp.x <= gw && mp.y >= 0.f && mp.y <= gh)
+                float mx = -1.f, my = -1.f;
+                if (!hold && RenderHook::GameCursorClientPos(&mx, &my) &&
+                    mx >= 0.f && mx <= gw && my >= 0.f && my <= gh)
                 {
                     const float dt = std::min(0.05f, (float)ImGui::GetIO().DeltaTime);
-                    s_plateX += (mp.x / gw - s_plateX) * (1.f - expf(-dt * 40.f));   // 平滑跟随
+                    s_plateX += (mx / gw - s_plateX) * (1.f - expf(-dt * 40.f));   // 平滑跟随
                     if (s_plateX < 0.02f) s_plateX = 0.02f;
                     if (s_plateX > 0.98f) s_plateX = 0.98f;
                     CatchSetPlateX(s_plateX);
@@ -7222,15 +7226,17 @@ namespace Chart4K
             {
                 // OSU（戳泡泡）：光标 = 鼠标；点击 = 鼠标左/右键 或 Z / X（osu! 默认键）。
                 //   判定窗按 OD；一次点击只算一个泡泡（最近未命中的那个）。
-                const ImVec2 mp = ImGui::GetIO().MousePos;
-                const bool menuOpen = CheatState::MenuVisible.load(std::memory_order_relaxed);
+                //   光标同样直接读系统位置（理由同 CATCH：IO.MousePos 可能停更）。
+                const bool hold = CheatState::MenuVisible.load(std::memory_order_relaxed) &&
+                                  ImGui::GetIO().WantCaptureMouse;
                 float fx0, fy0, fw, fh;
                 OsuFieldRect(gw, gh, &fx0, &fy0, &fw, &fh);
                 float px = 256.f, py = 192.f;
-                if (fw > 1.f && fh > 1.f)
+                float mx = -1.f, my = -1.f;
+                if (!hold && RenderHook::GameCursorClientPos(&mx, &my) && fw > 1.f && fh > 1.f)
                 {
-                    px = (mp.x - fx0) / fw * 512.f;
-                    py = (mp.y - fy0) / fh * 384.f;
+                    px = (mx - fx0) / fw * 512.f;
+                    py = (my - fy0) / fh * 384.f;
                 }
                 const ImGuiIO& io = ImGui::GetIO();
                 static bool s_prevClick = false;
@@ -7243,8 +7249,8 @@ namespace Chart4K
                 }
                 const bool edge = down && !s_prevClick;
                 s_prevClick = down;
-                if (menuOpen) { px = 256.f; py = 192.f; }
-                OsuTick(clock, px, py, edge && !menuOpen, down);
+                if (hold) { px = 256.f; py = 192.f; }
+                OsuTick(clock, px, py, edge && !hold, down);
             }
             else
             {

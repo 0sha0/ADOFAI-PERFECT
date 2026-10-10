@@ -1414,7 +1414,19 @@ namespace Menu
 
     // ----------------------------------------------
     // 子导航（Etherium SubTab 行：位于内容面板上方的 y=12 处）
+    //   · 条带右缘收到最小化按钮（W-38）之前，标签再多也不压住「−」；
+    //   · 悬停在条带上滚动滑轮 = 横向滚动标签。
     // ----------------------------------------------
+    static void TabsWheelScroll()
+    {
+        if (ImGui::IsWindowHovered())
+        {
+            const float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.f)
+                ImGui::SetScrollX(ImGui::GetScrollX() - wheel * 56.f);
+        }
+    }
+
     static void DrawTrackTabs()
     {
         const char* kL[TR_N + 1] = {
@@ -1423,7 +1435,8 @@ namespace Menu
             I18N::Tr(I18N::TAB_16K), I18N::Tr(I18N::TAB_CATCH),
             I18N::Tr(I18N::TAB_8K), I18N::Tr(I18N::TAB_OSU)
         };
-        const float avail = ImGui::GetWindowSize().x - s_subX - 8.f;
+        // 右缘顶到最小化按钮（W-38）再留 8px 间隙
+        const float avail = (ImGui::GetWindowSize().x - 46.f) - s_subX;
         if (avail < 70.f) return;
         ImGui::SetCursorPos(ImVec2(s_subX, 8.f));
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 7.f);
@@ -1445,6 +1458,7 @@ namespace Menu
                 s_trScrolled = s_subTR;
             }
         }
+        TabsWheelScroll();
         ImGui::EndChild();
         ImGui::PopStyleVar();
     }
@@ -1455,7 +1469,7 @@ namespace Menu
             TT(NS_SELECT), I18N::Tr(I18N::TAB_MACRO), I18N::Tr(I18N::TAB_RECORD),
             I18N::Tr(I18N::TAB_SKIN), TT(NS_KV_TITLE), I18N::Tr(I18N::TAB_LIVE)
         };
-        const float avail = ImGui::GetWindowSize().x - s_subX - 8.f;
+        const float avail = (ImGui::GetWindowSize().x - 46.f) - s_subX;
         if (avail < 70.f) return;
         ImGui::SetCursorPos(ImVec2(s_subX, 8.f));
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 7.f);
@@ -1477,6 +1491,7 @@ namespace Menu
                 s_miScrolled = s_subMI;
             }
         }
+        TabsWheelScroll();
         ImGui::EndChild();
         ImGui::PopStyleVar();
     }
