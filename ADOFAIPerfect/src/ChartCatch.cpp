@@ -63,11 +63,27 @@ void GenerateCatch(const PadEv* ev, int n, int style, int level,
     auto rnd01 = [&rng]() { rng = rng * 1664525u + 1013904223u; return (float)(rng >> 8) / 16777216.0f; };
     const float kStair = 0.115f;   // 长阶梯步长（≈ 1 个吸附区 / 音）
 
+    // 分布修正（修 "PERFECT 一直贴在右边"）：
+    //   dirLock —— 方向锁定。旧实现里"同向砖"每个音都把 dir 重设成 e.dir，于是长时间
+    //   同向旋转会把雨一路推到一侧、反弹也拉不回来（改向下一音就被覆盖）。
+    //   这里用"软边界 + 锁定"：越过判定场中心 ±0.26 后，强制朝中心方向走 14 个音，
+    //   保证落点围绕中心分布（长按原地 / 边冲刻意贴边除外），PERFECT 的接点因此居中。
+    int   dirLock   = 0;
+    int   lockedDir = 1;
+    const int   kSoftLock = 14;
+    const float kSoftBand = 0.26f;   // 中心 ±0.26 内自由游走（收窄 → PERFECT 接点更靠中间）
+
     for (int i = 0; i < n; i++)
     {
         const PadEv& e  = ev[i];
         const float  tu = (float)e.turn;                          // 度
         const bool   fast = (e.dt > 0.0) && (e.dt <= (double)kFastDt);
+        if (style != 4 && e.hold <= 0.f)                          // 软边界：越界就锁定朝中心
+        {
+            if      (x > 0.5f + kSoftBand) { dirLock = kSoftLock; lockedDir = -1; }
+            else if (x < 0.5f - kSoftBand) { dirLock = kSoftLock; lockedDir =  1; }
+        }
+        const bool   forced = (dirLock > 0);                      // 反弹保持期：本砖不跟随 e.dir 改向
         float step = 0.0f;
 
         if (e.hold > 0.f)
@@ -78,15 +94,15 @@ void GenerateCatch(const PadEv* ev, int n, int style, int level,
         }
         else if (style == 1)                                      // 走 Walk
         {
-            if (tu >= 8.f && e.dir != 0) dir = e.dir;
+            if (!forced && tu >= 8.f && e.dir != 0) dir = e.dir;
             step = 0.045f * (float)dir;                           // 相邻区之间的小步
         }
         else if (style == 2)                                      // 冲 Dash
         {
             if (streak <= 0)
             {
-                if (tu >= 8.f && e.dir != 0) dir = e.dir;
-                else                         dir = -dir;
+                if (!forced && tu >= 8.f && e.dir != 0) dir = e.dir;
+                else                                    dir = -dir;
                 streak = 1 + (int)(rnd01() * 2.f);
             }
             step = (0.150f + 0.05f * rnd01()) * (float)dir;        // 保持冲刺距离
@@ -96,8 +112,8 @@ void GenerateCatch(const PadEv* ev, int n, int style, int level,
         {
             if (streak <= 0)
             {
-                if (tu >= 8.f && e.dir != 0) dir = e.dir;
-                else                         dir = -dir;
+                if (!forced && tu >= 8.f && e.dir != 0) dir = e.dir;
+                else                                    dir = -dir;
                 streak = 2 + (int)(rnd01() * 3.f);
             }
             step = (0.300f + 0.08f * rnd01()) * (float)dir;        // 大跨度滑行
@@ -112,7 +128,7 @@ void GenerateCatch(const PadEv* ev, int n, int style, int level,
         }
         else if (style == 5)                                      // 阶梯 Stair
         {
-            if (tu >= 8.f && e.dir != 0 && rnd01() < 0.30f) dir = e.dir;
+            if (!forced && tu >= 8.f && e.dir != 0 && rnd01() < 0.30f) dir = e.dir;
             step = 0.085f * (float)dir;                            // 单调同向小步
             streak = 0;
         }
@@ -121,7 +137,7 @@ void GenerateCatch(const PadEv* ev, int n, int style, int level,
             if (stairLeft <= 0)
             {
                 stairLeft = 5 + ((int)(tu / 45.0f) % 7);          // 5..11 步
-                if (tu > 6.0f && e.dir != 0) dir = e.dir;         // 跟随旋转方向
+                if (!forced && tu > 6.0f && e.dir != 0) dir = e.dir;  // 跟随旋转方向
             }
             step = kStair * (float)dir;
             stairLeft--;
@@ -134,16 +150,26 @@ void GenerateCatch(const PadEv* ev, int n, int style, int level,
             else if (tu < 150.f) mag = 0.19f;
             else if (tu < 250.f) mag = 0.27f;
             else                 mag = 0.36f;                     // 折返大跳
-            if (tu >= 150.f)          dir = (e.dir >= 0) ? 1 : -1;
-            else if (tu >= 8.f)       dir = (e.dir >= 0) ? 1 : -1;
+            if (!forced)
+            {
+                if (tu >= 150.f)    dir = (e.dir >= 0) ? 1 : -1;
+                else if (tu >= 8.f) dir = (e.dir >= 0) ? 1 : -1;
+            }
             step = mag * (float)dir;
         }
 
+        if (forced)                                               // 方向锁定：沿锁定方向走
+        {
+            dir = lockedDir;
+            step = fabsf(step) * (float)dir;
+            dirLock--;
+        }
+
         x += step;
-        if (x < 0.03f) { x = 0.03f + (0.03f - x); dir = 1; }      // 边界反弹
-        if (x > 0.97f) { x = 0.97f - (x - 0.97f); dir = -1; }
-        if (x < 0.02f) x = 0.02f;
-        if (x > 0.98f) x = 0.98f;
+        if (x < 0.05f) { x = 0.05f + (0.05f - x); dir = 1;  if (style != 4) { dirLock = 4; lockedDir = 1;  } }  // 边界反弹
+        if (x > 0.95f) { x = 0.95f - (x - 0.95f); dir = -1; if (style != 4) { dirLock = 4; lockedDir = -1; } }
+        if (x < 0.04f) x = 0.04f;
+        if (x > 0.96f) x = 0.96f;
 
         outX[i] = x;
         int z = (int)(x * (float)Z);
@@ -157,9 +183,8 @@ void GenerateCatch(const PadEv* ev, int n, int style, int level,
 
 const char* ModeDescCatch()
 {
-    return "CATCH（落物）：一键自动接 —— 无需按键，用鼠标左右移动底部接盘；"
-           "雨点落到判定线的瞬间被接盘盖住即自动接住（正中 MARVELOUS / 靠边 GOOD）。"
-           "没盖住判 MISS，只显示判定、不会自动重开；可在「手法」里换 走 / 冲 / 超冲 / 边冲 / 阶梯。";
+    return "CATCH（落物）：鼠标左右移动底部接盘接住雨点；正中 MARVELOUS、靠边 GOOD、"
+           "没盖住 MISS（只显示判定，不会自动重开）。";
 }
 
 // ---------------- 内置皮肤（Malody 原皮 Dylamo） ----------------

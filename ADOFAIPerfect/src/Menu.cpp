@@ -42,7 +42,7 @@ namespace Menu
     static ImVec2 s_mainPos(60.f, 60.f);
     static ImVec2 s_dotPos(60.f, 60.f);
 
-    static const char* kAppVersion  = "1.3";
+    static const char* kAppVersion  = "2.2";
     static const char* kAppVideoUrl = "https://www.bilibili.com/video/BV115aQ6iEqJ/";
     static const char* kAppRepoUrl  = "https://github.com/0sha0/ADOFAI-PERFECT";
     static const int   kLogoResId   = 101;
@@ -50,7 +50,7 @@ namespace Menu
     // ---- 侧边栏页 ----
     enum { PG_BASIC = 0, PG_STATUS, PG_READ, PG_TRACK, PG_MISC, PG_MODMGR, PG_SET, PG_ABOUT, PG_N };
     // ---- 「一般轨道」子页 ----
-    enum { TR_4K = 0, TR_5K, TR_6K, TR_10K, TR_16K, TR_CATCH, TR_8K, TR_OSU, TR_N };
+    enum { TR_4K = 0, TR_5K, TR_6K, TR_8K, TR_10K, TR_16K, TR_CATCH, TR_OSU, TR_N };
     // ---- 「其他」子页 ----
     enum { MI_MACRO = 0, MI_RECORD, MI_SKIN, MI_KV, MI_LIVE, MI_N };
     // ---- 「设置」子页 ----
@@ -746,10 +746,10 @@ namespace Menu
             { TR_4K,    "4K",       "D  F  J  K" },
             { TR_5K,    "5K",       "S  D  F  J  K" },
             { TR_6K,    "6K",       "S  D  F  J  K  L" },
+            { TR_8K,    "8K",       "A S D F  /  J K L ;" },
             { TR_10K,   "10K",      "A S D F G  /  H J K L ;" },
             { TR_16K,   "16K PAD",  "4 x 4 grid pad" },
             { TR_CATCH, "CATCH",    "rain - no lanes" },
-            { TR_8K,    "8K",       "A S D F  /  J K L ;" },
             { TR_OSU,   "OSU",      "osu! standard - click the circles" },
         };
         for (int i = 0; i < TR_N; i++)
@@ -1431,9 +1431,10 @@ namespace Menu
     {
         const char* kL[TR_N + 1] = {
             TT(NS_SELECT), I18N::Tr(I18N::TAB_4K), I18N::Tr(I18N::TAB_5K),
-            I18N::Tr(I18N::TAB_6K), I18N::Tr(I18N::TAB_10K),
+            I18N::Tr(I18N::TAB_6K), I18N::Tr(I18N::TAB_8K),
+            I18N::Tr(I18N::TAB_10K),
             I18N::Tr(I18N::TAB_16K), I18N::Tr(I18N::TAB_CATCH),
-            I18N::Tr(I18N::TAB_8K), I18N::Tr(I18N::TAB_OSU)
+            I18N::Tr(I18N::TAB_OSU)
         };
         // 右缘顶到最小化按钮（W-38）再留 8px 间隙
         const float avail = (ImGui::GetWindowSize().x - 46.f) - s_subX;

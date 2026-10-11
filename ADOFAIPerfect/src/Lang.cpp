@@ -356,6 +356,26 @@ namespace I18N
         "Aim with the mouse; click left/right button (or Z / X) when the approach ring meets the circle edge. Windows follow OD: 300 = 80-6*OD, 100 = 140-8*OD, 50 = 200-10*OD, else MISS.",
         "マウスで照準し、判定サークルが重なった瞬間に左/右クリック（または Z / X）。判定幅は OD 換算：300 = 80-6*OD · 100 = 140-8*OD · 50 = 200-10*OD、外れは MISS。",
         "Наводите мышью и щёлкайте левой/правой кнопкой (или Z / X), когда кольцо сойдётся с кругом. Окна по OD: 300 = 80-6*OD · 100 = 140-8*OD · 50 = 200-10*OD, иначе MISS." } },  // LBL_OSU_CAL_HINT
+    // ---- OSU：自动打 / OD / AR ----
+    { { "自动打（鼠标悬停自动命中）", "自動打（滑鼠懸停自動命中）", "Auto-hit (hover to hit)", "自動打（ホバーで自動ヒット）", "Авто-хит (наведение)" } },  // LBL_OSU_AUTOHIT
+    { { "开启后：把鼠标停在泡泡上，判定环到位时工具会自动帮你点击（不用再手动点）。",
+        "開啟後：把滑鼠停在泡泡上，判定環到位時工具會自動幫你點擊（不用再手動點）。",
+        "When on: rest the cursor on a circle and the tool clicks for you the moment the ring closes (no manual clicks).",
+        "オン：カーソルをサークルに置くと、リングが重なった瞬間に自動でクリックします（手動クリック不要）。",
+        "Вкл.: наведите курсор на круг — инструмент сам кликнет в нужный момент." } },  // LBL_OSU_AUTOHIT_HINT
+    { { "判定严度 OD", "判定嚴度 OD", "Overall difficulty (OD)", "判定難易度 OD", "Сложность (OD)" } },  // LBL_OSU_OD
+    { { "判定环出现 AR", "判定環出現 AR", "Approach rate (AR)", "アプローチレート AR", "Скорость появления (AR)" } },  // LBL_OSU_AR
+    // ---- CATCH：宏代打（自动接盘）----
+    { { "宏代打（自动接盘）", "巨集代打（自動接盤）", "Macro auto-catch", "マクロ自動キャッチ", "Макрос-ловля" } },  // LBL_CATCH_AUTOPLATE
+    { { "开启后：鼠标不动时接盘自动追最近的雨点（在落线前到位），PERFECT 接点因此落在雨点上（居中分布）；移动鼠标立即手动接管，松手 0.6 秒后恢复自动。",
+        "開啟後：滑鼠不動時接盤自動追最近的雨點（在落線前到位），PERFECT 接點因此落在雨點上（居中分佈）；移動滑鼠立即手動接管，放手 0.6 秒後恢復自動。",
+        "On: while the mouse is still, the catcher auto-chases the nearest drop (arriving before it lands), so the PERFECT catch lands on the drop (centered spread). Moving the mouse takes over instantly; auto resumes 0.6s after you stop.",
+        "オン：マウスが静止している間、キャッチャーが最寄りの雫を自動で追い（落線前に到着）、PERFECT の接点が雫の位置（中央寄り）になります。マウスを動かすと即手動、止めて 0.6 秒で自動に戻ります。",
+        "Вкл.: при неподвижной мыши ловец сам догоняет ближайшую каплю (успевая до линии) — PERFECT попадает в точку капли (по центру). Движение мыши сразу перехватывает управление; через 0.6 с после остановки авто возвращается." } },  // LBL_CATCH_AUTOPLATE_HINT
+        // ---- CATCH / OSU 各自独立的宏抖动（只作用于 GOOD / 50 / MISS 档）----
+        { { "抖动幅度（仅 GOOD / MISS）", "抖動幅度（僅 GOOD / MISS）", "Jitter (GOOD / MISS only)", "ゆらぎ（GOOD / MISS のみ）", "Дрожание (только GOOD/MISS)" } },  // LBL_CATCH_JITTER
+        { { "抖动幅度（仅 50 / MISS）", "抖動幅度（僅 50 / MISS）", "Jitter (50 / MISS only)", "ゆらぎ（50 / MISS のみ）", "Дрожание (только 50/MISS)" } },  // LBL_OSU_JITTER
+        { { "背景压暗（画面设置）", "背景壓暗（畫面設定）", "Background dim", "背景の暗さ", "Затемнение фона" } },  // LBL_OSU_DIM
     };
     static_assert(sizeof(g_table) / sizeof(g_table[0]) == (size_t)BUILTIN_N, "table/enum mismatch");
 

@@ -42,85 +42,146 @@ namespace Chart4K
     };
 
     // ---------------- 手法生成 ----------------
-    //   在 512x384 判定场里做"跟随冰火旋转角的反射游走"：
-    //     heading 按本砖转向旋转（与星球同步），步长按手法 / 转角大小给。
+    //   按 osu! 的写谱习惯在 512x384 判定场里铺泡泡（不是"随手乱走"）：
+    //     · 以「图形组」为单位落点：直线串 / 折返 / 三角梯 / 蛇形方块 / 方块 / 五角星；
+    //       组内相邻两注的间距由 unit 决定 —— 小 unit = stream（等距连打），
+    //       大 unit = jump（大跨甩动），和真实谱面的读谱手感一致；
+    //     · 组与组之间换位（换位距离按快慢给：快音近、慢音远）；
+    //     · 组内顺序用最近邻重排，从上一组末点接进去时总走最短的一条路，不会来回横跳；
+    //     · 每个落点都留场边距、彼此不重叠；长按（hold）在原地叠一注。
     //   style: 0=经典 1=跳 2=串 3=交互 4=双押 5=技术
     void GenerateOsu(const PadEv* ev, int n, int style, int level,
                      float* outX, float* outY, int* outKey, int* outHoldIdx)
     {
         if (!outX || !outY || n <= 0) return;
         if (style < 0 || style > 5) style = 0;
-        const float R    = OsuRadius();
-        const float minX = R + 8.f, maxX = kOsuFieldW - R - 8.f;
-        const float minY = R + 8.f, maxY = kOsuFieldH - R - 8.f;
-        float x = kOsuFieldW * 0.5f, y = kOsuFieldH * 0.5f;
-        float heading = -1.5707963f;                 // 朝上起步
+        const float R  = OsuRadius();                 // CS4 ≈ 36.5 osu!px
+        const float mg = R + 12.f;                    // 场边留白（圆完整落在场内）
+        const float minX = mg, maxX = kOsuFieldW - mg;
+        const float minY = mg, maxY = kOsuFieldH - mg;
 
         uint32_t rng = 0x9E3779B9u ^ ((uint32_t)style * 2654435761u)
                      ^ ((uint32_t)level * 40503u + 12345u);
         auto rnd01 = [&rng]() { rng = rng * 1664525u + 1013904223u; return (float)(rng >> 8) / 16777216.0f; };
+        auto rndR  = [&](float a, float b) { return a + (b - a) * rnd01(); };
 
-        // 步长（osu!px）：串 = 略大于一个圆（密集但不重叠）；跳 = 1/2 屏级大甩动
-        const float kStreamStep = 2.30f * R;         // ≈ 84 px
-        const float kJumpStep   = 4.20f * R;         // ≈ 153 px
-        int   altPhase = 0;
-        int   pairLeft = 0;
+        // 图形模板（局部坐标，相邻点间距 ≈ 1 格）
+        struct Pat { int n; float x[8]; float y[8]; };
+        static const Pat kPat[8] = {
+            { 6, { 0,1,2,3,4,5 },                          { 0,0,0,0,0,0 } },            // 0 直线串
+            { 6, { 0,1,2,3,4,5 },                          { 0,1,0,1,0,1 } },            // 1 折返
+            { 5, { 0,1,0.5f,1.5f,1.f },                    { 0,0,0.87f,0.87f,1.74f } },  // 2 三角梯
+            { 8, { 0,1,1,0,0,1,1,0 },                      { 0,0,1,1,2,2,3,3 } },        // 3 蛇形方块
+            { 6, { 0,1,2,2,1,0 },                          { 0,0,0,1,1,1 } },            // 4 方块回路
+            { 5, { 0,0.951f,0.588f,-0.588f,-0.951f },      { 1,0.309f,-0.809f,-0.809f,0.309f } }, // 5 五角星（大跳）
+            { 3, { 0,1,2 },                                { 0,0.9f,0 } },               // 6 浅折
+            { 5, { 0,1,0,1,0 },                            { 0,0,1,1,2 } },              // 7 竖折返
+        };
+
+        float px = kOsuFieldW * 0.5f, py = kOsuFieldH * 0.55f;   // 上一注落点
+        float gx[8], gy[8];
+        int   gn = 0, gi = 0;
 
         for (int i = 0; i < n; i++)
         {
             const PadEv& e = ev[i];
-            const float tu  = (float)e.turn;                     // 度
-            const bool  fast = (e.dt > 0.0) && (e.dt <= 0.26);   // 1/4 拍级（>3.8 音/秒）
-            const float dirSign = (e.dir >= 0) ? 1.f : -1.f;
-
-            // 1) heading：跟随冰火旋转（转角越大转得越多）
-            float rot = (tu / 180.f) * 1.15f;
-            if (rot > 2.6f) rot = 2.6f;
-            heading += dirSign * rot;
-            if (heading > 6.2831853f)  heading -= 6.2831853f;
-            if (heading < -6.2831853f) heading += 6.2831853f;
-
-            // 2) 步长：按手法 / 快慢 / 转角
-            float step = kStreamStep;
-            switch (style)
+            if (e.hold > 0.f)                     // 长按：原地叠一注（泡泡按住）
             {
-            case 1:  step = kJumpStep * (0.92f + 0.16f * rnd01()); break;                       // 跳
-            case 2:  step = kStreamStep * (0.92f + 0.12f * rnd01()); break;                     // 串
-            case 3:  step = (altPhase ^= 1) ? kStreamStep : kJumpStep * (0.95f + 0.15f * rnd01());// 交互
-            case 4:                                                                             // 双押
-                if (pairLeft > 0) { step = R * 0.85f; pairLeft--; }
-                else              { step = kJumpStep * (0.95f + 0.15f * rnd01()); pairLeft = 1; }
-                break;
-            case 5:                                                                             // 技术
-                step = kStreamStep + (kJumpStep - kStreamStep) * std::min(1.f, tu / 180.f);
-                step *= (0.85f + 0.30f * rnd01());
-                break;
-            default:                                                                            // 经典
-                if (fast && tu < 70.f) step = kStreamStep * (0.90f + 0.14f * rnd01());
-                else                   step = kStreamStep + (kJumpStep - kStreamStep) * std::min(1.f, tu / 180.f);
-                break;
+                outX[i] = px / kOsuFieldW;
+                outY[i] = py / kOsuFieldH;
+                if (outKey) outKey[i] = (i & 1);
+                if (outHoldIdx) outHoldIdx[i] = 1;
+                continue;
             }
-            if (step < 0.85f * R) step = 0.85f * R;      // 避免与上一个圆重叠
-            if (e.hold > 0.f) step = 0.f;                // 长按：原地（泡泡叠成"按住"）
 
-            // 3) 走位 + 边界反射（圆始终完整留在判定场内）
-            x += std::cos(heading) * step;
-            y += std::sin(heading) * step;
-            if (x < minX) { x = minX + (minX - x); heading = 3.1415926f - heading; }
-            if (x > maxX) { x = maxX - (x - maxX); heading = 3.1415926f - heading; }
-            if (y < minY) { y = minY + (minY - y); heading = -heading; }
-            if (y > maxY) { y = maxY - (y - maxY); heading = -heading; }
-            if (x < minX) x = minX; if (x > maxX) x = maxX;
-            if (y < minY) y = minY; if (y > maxY) y = maxY;
+            if (gi >= gn)                          // 该铺新的一组了
+            {
+                const bool fast = (e.dt > 0.0) && (e.dt <= 0.26);   // 1/4 拍级（>3.8 音/秒）
+                int p;
+                switch (style)
+                {
+                case 1:  p = (rnd01() < 0.55f) ? 5 : 4; break;                     // 跳：星形 / 方块大跨
+                case 2:  p = (rnd01() < 0.62f) ? 0 : 1; break;                     // 串：直线 / 折返
+                case 3:  p = (rnd01() < 0.60f) ? 1 : 7; break;                     // 交互：折返
+                case 4:  p = (rnd01() < 0.50f) ? 4 : 3; break;                     // 双押：方块 / 蛇形
+                case 5:  p = (int)(2.f + rnd01() * 6.f); break;                    // 技术：三角/蛇形/方块/星/浅折/竖折
+                default: p = fast ? ((rnd01() < 0.5f) ? 0 : 1)                     // 经典：快→串，慢→混
+                                  : (int)(rnd01() * 8.f); break;
+                }
+                if (p < 0 || p > 7) p = 0;
+                const Pat& pat = kPat[p];
+                gn = pat.n; gi = 0;
+                if (gn > 8) gn = 8;
 
-            outX[i] = x / kOsuFieldW;
-            outY[i] = y / kOsuFieldH;
-            if (outKey) outKey[i] = (i & 1);             // 供统计：0=左键 1=右键（偶数左、奇数右）
-            if (outHoldIdx) outHoldIdx[i] = (e.hold > 0.f) ? 1 : 0;
+                // 组内间距（osu!px）：串 ≈ 1.4R 等距；跳 ≈ 3.4R 大甩
+                float unit;
+                switch (style)
+                {
+                case 1:  unit = R * rndR(2.9f, 3.9f); break;
+                case 2:  unit = R * rndR(1.55f, 1.95f); break;
+                case 3:  unit = R * rndR(1.85f, 2.40f); break;
+                case 4:  unit = R * rndR(1.65f, 2.15f); break;
+                case 5:  unit = R * rndR(1.60f, 3.30f); break;
+                default: unit = R * (fast ? rndR(1.55f, 2.00f) : rndR(2.00f, 3.40f)); break;
+                }
+
+                // 旋转 + 缩放（超场就整体缩小）
+                const float rot = rndR(0.f, 6.2831853f);
+                const float cs = cosf(rot), sn = sinf(rot);
+                float lx[8], ly[8];
+                float mnx = 1e9f, mxx = -1e9f, mny = 1e9f, mxy = -1e9f;
+                for (int k = 0; k < gn; k++)
+                {
+                    const float ux = pat.x[k] * unit, uy = pat.y[k] * unit;
+                    lx[k] = ux * cs - uy * sn;
+                    ly[k] = ux * sn + uy * cs;
+                    if (lx[k] < mnx) mnx = lx[k];
+                    if (lx[k] > mxx) mxx = lx[k];
+                    if (ly[k] < mny) mny = ly[k];
+                    if (ly[k] > mxy) mxy = ly[k];
+                }
+                float fit = 1.f;
+                const float bw = mxx - mnx, bh = mxy - mny;
+                if (bw > (maxX - minX)) fit = (maxX - minX) / bw;
+                if (bh > 1.f && bh * fit > (maxY - minY)) fit = std::min(fit, (maxY - minY) / bh);
+                const float hw = bw * fit * 0.5f, hh = bh * fit * 0.5f;
+                const float lcx = (mnx + mxx) * 0.5f, lcy = (mny + mxy) * 0.5f;
+
+                // 摆位：与上一注保持一个"换位距离"（快音近、慢音远），并夹进合法范围
+                const float jump = R * (fast ? rndR(2.0f, 2.8f) : rndR(2.5f, 4.3f));
+                const float ja   = rndR(0.f, 6.2831853f);
+                float ox = px + cosf(ja) * jump;
+                float oy = py + sinf(ja) * jump;
+                ox = std::max(minX + hw, std::min(maxX - hw, ox));
+                oy = std::max(minY + hh, std::min(maxY - hh, oy));
+                for (int k = 0; k < gn; k++)
+                {
+                    gx[k] = ox + (lx[k] - lcx) * fit;
+                    gy[k] = oy + (ly[k] - lcy) * fit;
+                }
+
+                // 组内最近邻重排：从上一注出发，每一步都走到最近的一个落点
+                for (int a = 0; a < gn; a++)
+                {
+                    int best = a; float bd = 1e18f;
+                    for (int b2 = a; b2 < gn; b2++)
+                    {
+                        const float dx = gx[b2] - px, dy = gy[b2] - py;
+                        const float d = dx * dx + dy * dy;
+                        if (d < bd) { bd = d; best = b2; }
+                    }
+                    if (best != a) { std::swap(gx[a], gx[best]); std::swap(gy[a], gy[best]); }
+                }
+            }
+
+            px = gx[gi]; py = gy[gi]; gi++;        // 取组内下一个落点
+            outX[i] = px / kOsuFieldW;
+            outY[i] = py / kOsuFieldH;
+            if (outKey) outKey[i] = (i & 1);
+            if (outHoldIdx) outHoldIdx[i] = 0;
         }
         Log::Printf("[OSU] gen: style=%d level=%d notes=%d", style, level, n);
     }
-
     const char* ModeDescOsu()
     {
         return "OSU（戳泡泡）：鼠标瞄准 + 左/右键（或 Z / X）点击泡泡，"
@@ -206,15 +267,57 @@ namespace Chart4K
         ImGui::BringWindowToDisplayBack(ImGui::GetCurrentWindow());
         ImDrawList* dl = ImGui::GetWindowDrawList();
 
-        // ---- 背景：判定场外压暗，判定场略压暗（保留游戏画面）----
-        dl->AddRectFilled(ImVec2(0.f, 0.f), ImVec2(gw, gh), IM_COL32(4, 6, 12, 150));
-        dl->AddRectFilled(ImVec2(fx0, fy0), ImVec2(fx0 + fw, fy0 + fh), IM_COL32(8, 10, 18, 96), 10.f * u);
+        // ---- 背景：判定场外按「背景压暗」轻压暗，判定场几乎透出游戏画面（原版 osu! 的 dim 观感）----
+        const int dimA = OsuDimGet() * 255 / 100;
+        dl->AddRectFilled(ImVec2(0.f, 0.f), ImVec2(gw, gh), IM_COL32(4, 6, 12, dimA));
+        dl->AddRectFilled(ImVec2(fx0, fy0), ImVec2(fx0 + fw, fy0 + fh), IM_COL32(8, 10, 18, (int)(dimA * 0.36f)), 10.f * u);
         dl->AddRect(ImVec2(fx0, fy0), ImVec2(fx0 + fw, fy0 + fh), IM_COL32(90, 110, 150, 70), 10.f * u, 0, 1.4f * u);
 
         // ---- 泡泡（HitCircle + ApproachCircle + 连击数字）----
         int liveIdx = -1;
         for (int i = 0; i < nTot; i++) if (s_snap[i].state == 0) { liveIdx = i; break; }
         const int baseCombo = OsuCombo() + 1;
+
+        // ---- 引导点（Follow Points）：与 osu! 默认皮肤一致 ----
+        //   · 不画连线，只有一串**白色小圆点**（osu! 默认 followpoint 就是白点）；
+        //   · 上一个泡泡命中后，圆点从它出发、沿直线**逐个亮起**滑向下一个泡泡；
+        //   · MISS / 长按叠泡泡 / 间隔过大 不引导；画在泡泡之下（先画）。
+        {
+            const float spacing = std::max(R * 1.00f, 22.f * u);
+            for (int i = 0; i + 1 < nTot; i++)
+            {
+                const OsuHit& a = s_snap[i];
+                const OsuHit& b = s_snap[i + 1];
+                if (a.state != 1) continue;                    // 只有已命中的泡泡才铺引导点
+                if (b.state != 0) continue;                    // 下一个已命中 / MISS：不再铺
+                if (a.hold > 0.f || b.hold > 0.f) continue;    // 长按叠泡泡：无引导
+                const double gap = b.t - a.t;
+                if (gap <= 0.0 || gap > 2.0) continue;
+                if (b.t - clock > preempt + 0.05) break;       // b 还没进窗：后面更远（时间有序）
+                const float ax = fx0 + a.x * fw, ay = fy0 + a.y * fh;
+                const float dx = (fx0 + b.x * fw) - ax, dy = (fy0 + b.y * fh) - ay;
+                const float dist = sqrtf(dx * dx + dy * dy);
+                if (dist < spacing) continue;
+                int nf = (int)(dist / spacing);
+                if (nf < 1) continue;
+                if (nf > 24) nf = 24;
+                float prog = (float)((clock - a.t) / gap);
+                if (prog < 0.f) prog = 0.f;
+                if (prog > 1.f) prog = 1.f;
+                const float reach = prog * (float)(nf + 1);    // 已经"流到"第几个槽位
+                for (int k = 1; k <= nf; k++)
+                {
+                    if ((float)k > reach) break;               // 还没轮到 → 不画（逐个亮起）
+                    const float fade = std::min(1.f, reach - (float)k);
+                    const float fr = (float)k / (float)(nf + 1);
+                    const float qx = ax + dx * fr, qy = ay + dy * fr;
+                    const float rr = R * 0.18f;
+                    dl->AddCircleFilled(ImVec2(qx, qy), rr, IM_COL32(255, 255, 255, (int)(140 * fade)), 20);
+                    dl->AddCircleFilled(ImVec2(qx, qy), rr * 0.55f, IM_COL32(255, 255, 255, (int)(205 * fade)), 16);
+                }
+            }
+        }
+
         int runCombo = 0;
         for (int i = 0; i < nTot; i++)
         {
@@ -255,23 +358,26 @@ namespace Chart4K
                 dl->AddText(ImGui::GetFont(), fsz, ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f),
                             IM_COL32(255, 255, 255, 245), nb);
             }
-            // 判定环：从 4x 半径收到 1x（缩到重合时点击）
+            // 判定环：从 3x 半径收到 1x（缩到与圈重合时点击；osu! 默认皮肤的比例）
             if (dt > -0.28)
             {
                 float t01 = 1.f - (float)(dt / preempt);
                 if (t01 < 0.f) t01 = 0.f;
                 if (t01 > 1.f) t01 = 1.f;
-                const float ar = R * (4.f - 3.f * t01);
+                const float ar = R * (3.f - 2.f * t01);
                 const int   aa = (int)(225 * std::min(1.f, (float)((preempt - dt) / (preempt * 0.35f))));
-                dl->AddCircle(ImVec2(cx, cy), ar, IM_COL32(255, 255, 255, aa), 72, R * 0.11f);
+                dl->AddCircle(ImVec2(cx, cy), ar, IM_COL32(255, 255, 255, aa), 72, R * 0.075f);
             }
         }
 
         // ---- 光标（osu! 默认：白圈 + 实心点 + 拖尾）----
+        //   取**系统光标**（与判定用的坐标同源）—— 用 ImGui 的 MousePos 会在游戏
+        //   RawInput / 覆盖层抢消息时停在原地，出现"画的光标和实际判定点不一致"。
         {
-            const ImVec2 mp = ImGui::GetIO().MousePos;
-            const bool menuOpen = CheatState::MenuVisible.load(std::memory_order_relaxed);
-            if (!menuOpen && mp.x >= 0.f && mp.x <= gw && mp.y >= 0.f && mp.y <= gh)
+            float scx = -1.f, scy = -1.f;
+            const ImVec2 mp = RenderHook::GameCursorClientPos(&scx, &scy) ? ImVec2(scx, scy)
+                                                                          : ImGui::GetIO().MousePos;
+            if (mp.x >= 0.f && mp.x <= gw && mp.y >= 0.f && mp.y <= gh)
             {
                 const float cr = 18.f * u;
                 static ImVec2 s_trail[10] = {};

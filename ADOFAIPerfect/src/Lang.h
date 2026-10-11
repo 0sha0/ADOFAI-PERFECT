@@ -83,6 +83,14 @@ namespace I18N
         LBL_CATCH_AUTO, LBL_CATCH_MACC, LBL_CATCH_FAST, LBL_CATCH_SLOW,
         // ---- 8K / OSU（戳泡泡）模式页 ----
         TAB_8K, TAB_OSU, LBL_OSU_CAL_HINT,
+        // ---- OSU：自动打（鼠标悬停自动命中） / OD / AR ----
+        LBL_OSU_AUTOHIT, LBL_OSU_AUTOHIT_HINT, LBL_OSU_OD, LBL_OSU_AR,
+        // ---- CATCH：宏代打（自动接盘）提示 ----
+        LBL_CATCH_AUTOPLATE, LBL_CATCH_AUTOPLATE_HINT,
+        // ---- CATCH / OSU：各自的宏抖动（独立算法，不读宏模式页）----
+        LBL_CATCH_JITTER, LBL_OSU_JITTER,
+        // ---- OSU：背景压暗（画面设置）----
+        LBL_OSU_DIM,
         BUILTIN_N
     };
 

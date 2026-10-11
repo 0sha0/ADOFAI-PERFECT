@@ -274,8 +274,17 @@ namespace Chart4K
 
         float gw = 1280.f, gh = 720.f;
         RenderHook::GetGameWindowSize(&gw, &gh);
+        // 尺寸兜底：最小化 / 窗口重建 / 换分辨率期间客户区会短暂为 0x0，
+        // 直接 return 会让 KeyViewer 覆盖层整帧消失（"有时候层不生效"的根源）。
+        // 沿用上一帧有效值即可（与 DrawPlayfield / CATCH / OSU 覆盖层同一套兜底）。
+        static float s_kvSzW = 0.f, s_kvSzH = 0.f;
         if (gw < 200.f || gh < 200.f)
-            return;
+        {
+            if (s_kvSzW < 200.f || s_kvSzH < 200.f)
+                return;
+            gw = s_kvSzW; gh = s_kvSzH;
+        }
+        else { s_kvSzW = gw; s_kvSzH = gh; }
 
         TickKeyViewer();
         const int n = s_kvLiveN;
@@ -316,14 +325,20 @@ namespace Chart4K
         if (px - pad < 4.f) px = pad + 4.f;
         if (py - pad < 4.f) py = pad + 4.f;
 
-        const bool interactive = CheatState::MenuVisible.load(std::memory_order_relaxed);
+        // 只有"菜单打开 **且** 指针真的落在键帽面板上"时，这个铺满全屏的窗口才参与
+        // 命中判定。旧实现只要菜单可见就 interactive —— 面板折叠成小圆点（MenuVisible
+        // 仍为 true）时，全屏窗口会把整屏鼠标"吃掉"：CATCH 接盘不跟手、OSU 点不中。
+        const ImVec2 kvMouse = ImGui::GetIO().MousePos;
+        const bool overPanel = kvMouse.x >= px - pad - 8.f && kvMouse.x <= px + totalW + pad + 8.f &&
+                               kvMouse.y >= py - pad - 8.f && kvMouse.y <= py + totalH + pad + 8.f;
+        const bool interactive = CheatState::MenuVisible.load(std::memory_order_relaxed) && overPanel;
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(gw, gh), ImGuiCond_Always);
         ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
                               ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings |
                               ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus;
         if (!interactive)
-            fl |= ImGuiWindowFlags_NoInputs;   // 打歌时不抢鼠标，只有菜单打开时可拖动
+            fl |= ImGuiWindowFlags_NoInputs;   // 打歌 / 未悬停面板时一律不抢鼠标
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));

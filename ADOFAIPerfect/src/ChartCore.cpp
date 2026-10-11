@@ -206,6 +206,8 @@ namespace Chart4K
     // CATCH v2：漏音即死 / 接盘宽度（千分比，160 = 屏宽 16%）
     static std::atomic<bool>  s_catchKill[kModeN]   = { { true }, { true }, { true }, { true }, { true }, { true }, { true }, { true } };
     static std::atomic<int>   s_catchPlateW[kModeN] = { { 160 }, { 160 }, { 160 }, { 160 }, { 160 }, { 160 }, { 160 }, { 160 } };
+    // CATCH 宏代打（自动接盘）：鼠标静止时接盘自动追最近一枚雨点；默认开。
+    static std::atomic<bool>  s_catchAutoPlate[kModeN] = { { true }, { true }, { true }, { true }, { true }, { true }, { true }, { true } };
 
     // 多押砖（tapsNeeded>1）固定按"自动"处理：平均间隔 >= 75ms 完整展开，
     // 更密的（>13 NPS，人手按不出来）合并为 1 个。
@@ -4305,6 +4307,19 @@ namespace Chart4K
         if (mil > 400) mil = 400;
         s_catchPlateW[mi].store(mil, std::memory_order_relaxed);
     }
+    // 宏代打（自动接盘）开关（每模式独立；默认开，见 s_catchAutoPlate）
+    bool  CatchAutoPlateGet()
+    {
+        int mi = ActiveModeIndex();
+        if (mi < 0) mi = kModeCatch;
+        return s_catchAutoPlate[mi].load(std::memory_order_relaxed);
+    }
+    void  CatchAutoPlateSet(bool on)
+    {
+        int mi = ActiveModeIndex();
+        if (mi < 0) mi = kModeCatch;
+        s_catchAutoPlate[mi].store(on, std::memory_order_relaxed);
+    }
 
     // ---------------- CATCH → 背景打歌引擎：发布每次判定的"归一化目标偏差" ----------------
     //   CATCH 覆盖层的判定（接盘离落点多远）决定背景那首冰与火原关该怎么打：
@@ -4321,6 +4336,9 @@ namespace Chart4K
     static unsigned       s_catchPubW = 0;
     static std::mutex     s_catchPubMx;
     static std::atomic<int> s_catchPlayAcc{ 100 };   // 打歌精准度 0..100（把 CATCH 偏差带到背景的比例）
+    // CATCH 自己的拟人抖动（0..100%）。**独立于「宏模式」页的抖动幅度**：CATCH 是
+    // 独立算法，不该被宏页的参数牵着走。只有 GOOD / MISS 档吃这个抖动（见 GameDetour）。
+    static std::atomic<int> s_catchJitter{ 50 };
 
     static void CatchPublishPlayTarget(double t, double frac)
     {
@@ -4371,7 +4389,13 @@ namespace Chart4K
     static std::atomic<float> s_osuCursorX{ 0.5f }, s_osuCursorY{ 0.5f };
     static std::atomic<int>   s_osuCombo{ 0 }, s_osuMaxCombo{ 0 }, s_osuMissN{ 0 };
     static std::atomic<int>   s_osuOd{ 8 };
+    static std::atomic<bool>  s_osuAutoHit[kModeN] =
+        { { false }, { false }, { false }, { false }, { false }, { false }, { false }, { false } };  // OSU 自动打（鼠标悬停自动命中）
     static std::atomic<int>   s_osuPreemptMs{ 1200 };   // AR5 起手（osu! AR5 = 1200ms）
+    // OSU 自己的拟人抖动（0..100%），同样独立于宏页；只作用于 50 / MISS 判定的背景打歌。
+    static std::atomic<int>   s_osuJitter{ 50 };
+    // OSU 背景压暗（0..100%）：判定场外的整体暗度 —— 对应 osu! 的 Background dim。
+    static std::atomic<int>   s_osuDim{ 45 };
     static std::atomic<float> s_osuLastDx{ 0.f }, s_osuLastDy{ 0.f };
 
     static inline double OsuWindowMs(int kind)
@@ -4399,6 +4423,7 @@ namespace Chart4K
         const bool fresh  = (genNow != s_osuGen);
         s_osuGen = genNow;
         int missN = 0;
+        const bool autoHit = s_osuAutoHit[kModeOsu].load(std::memory_order_relaxed);   // 鼠标悬停自动命中
         std::lock_guard<std::mutex> lk(s_notesMutex);
         const int n = (int)s_notes.size();
         for (int i = 0; i < n; i++)
@@ -4430,9 +4455,13 @@ namespace Chart4K
                 missN++;
                 continue;
             }
-            if (!clickEdge) break;                      // 没点：等下一帧
+            if (!clickEdge && !autoHit) break;                 // 没点（且未开自动打）：等下一帧
             const float dx = mx - nx, dy = my - ny;
-            if (sqrtf(dx * dx + dy * dy) > R * 1.15f) break;   // 点偏了：不算（osu! 空点无惩罚）
+            const float dist = sqrtf(dx * dx + dy * dy);
+            // 手动点击：允许略微点在圈外（osu! 空点无惩罚）；自动打：光标必须真的压在泡泡上
+            if (dist > (clickEdge ? R * 1.15f : R * 1.00f)) break;
+            // 自动打：光标已在泡泡上，等判定点到来再命中（不抢拍，落 Great）
+            if (!clickEdge && dt > 0.012) break;
             const double adt = fabs(dt);
             const int kind = (adt <= w0) ? 0 : (adt <= w1 ? 1 : 2);
             s_consumed[i] = 1;
@@ -4515,6 +4544,14 @@ namespace Chart4K
         if (od < 0) od = 0;
         if (od > 10) od = 10;
         s_osuOd.store(od, std::memory_order_relaxed);
+    }
+    bool OsuAutoHit(int mi)
+    {
+        return (mi >= 0 && mi < kModeN) ? s_osuAutoHit[mi].load(std::memory_order_relaxed) : false;
+    }
+    void OsuAutoHitSet(int mi, bool on)
+    {
+        if (mi >= 0 && mi < kModeN) s_osuAutoHit[mi].store(on, std::memory_order_relaxed);
     }
 
     // ---------------- 长按尾端（松手拍）判定 ----------------
@@ -6755,11 +6792,18 @@ namespace Chart4K
             snprintf(k, sizeof(k), "mode%d.auto",  i); I18N::Prefs::SetInt(k, s_autoPlay[i].load(std::memory_order_relaxed) ? 1 : 0);
             snprintf(k, sizeof(k), "mode%d.ckill",  i); I18N::Prefs::SetInt(k, s_catchKill[i].load(std::memory_order_relaxed) ? 1 : 0);
             snprintf(k, sizeof(k), "mode%d.cplate", i); I18N::Prefs::SetInt(k, s_catchPlateW[i].load(std::memory_order_relaxed));
+            snprintf(k, sizeof(k), "mode%d.oauto",  i); I18N::Prefs::SetInt(k, s_osuAutoHit[i].load(std::memory_order_relaxed) ? 1 : 0);
+            snprintf(k, sizeof(k), "mode%d.cauto",  i); I18N::Prefs::SetInt(k, s_catchAutoPlate[i].load(std::memory_order_relaxed) ? 1 : 0);
         }
         I18N::Prefs::SetInt("macro_acc",   s_macroAcc.load(std::memory_order_relaxed));
         I18N::Prefs::SetInt("macro_human", s_macroHuman.load(std::memory_order_relaxed));
         I18N::Prefs::SetInt("macro_jitter", s_macroJitter.load(std::memory_order_relaxed));
         I18N::Prefs::SetInt("catch_playacc", s_catchPlayAcc.load(std::memory_order_relaxed));
+        I18N::Prefs::SetInt("catch_jitter", s_catchJitter.load(std::memory_order_relaxed));
+        I18N::Prefs::SetInt("osu_jitter", s_osuJitter.load(std::memory_order_relaxed));
+        I18N::Prefs::SetInt("osu_dim",    s_osuDim.load(std::memory_order_relaxed));
+        I18N::Prefs::SetInt("osu_od", s_osuOd.load(std::memory_order_relaxed));
+        I18N::Prefs::SetInt("osu_ar", s_osuPreemptMs.load(std::memory_order_relaxed));
         I18N::Prefs::Save();
     }
     static void ModeCfgLoadOnce()
@@ -6775,6 +6819,8 @@ namespace Chart4K
             snprintf(k, sizeof(k), "mode%d.auto",  i); s_autoPlay[i].store(I18N::Prefs::GetInt(k, 0) != 0, std::memory_order_relaxed);
             snprintf(k, sizeof(k), "mode%d.ckill",  i); s_catchKill[i].store(I18N::Prefs::GetInt(k, 1) != 0, std::memory_order_relaxed);
             snprintf(k, sizeof(k), "mode%d.cplate", i); s_catchPlateW[i].store(I18N::Prefs::GetInt(k, 160), std::memory_order_relaxed);
+            snprintf(k, sizeof(k), "mode%d.oauto",  i); s_osuAutoHit[i].store(I18N::Prefs::GetInt(k, 0) != 0, std::memory_order_relaxed);
+            snprintf(k, sizeof(k), "mode%d.cauto",  i); s_catchAutoPlate[i].store(I18N::Prefs::GetInt(k, 1) != 0, std::memory_order_relaxed);
         }
         // 宏打歌依赖对应模式的键位/判定管线：存档里若只有宏没开模式，补开一次，
         // 否则覆盖层不铺、宏永远不跑（老配置 / 手改 cfg 的兜底）。
@@ -6803,6 +6849,26 @@ namespace Chart4K
         if (cpa < 0) cpa = 0;
         if (cpa > 100) cpa = 100;
         s_catchPlayAcc.store(cpa, std::memory_order_relaxed);
+        int cj = I18N::Prefs::GetInt("catch_jitter", 50);
+        if (cj < 0) cj = 0;
+        if (cj > 100) cj = 100;
+        s_catchJitter.store(cj, std::memory_order_relaxed);
+        int oj = I18N::Prefs::GetInt("osu_jitter", 50);
+        if (oj < 0) oj = 0;
+        if (oj > 100) oj = 100;
+        s_osuJitter.store(oj, std::memory_order_relaxed);
+        int odim = I18N::Prefs::GetInt("osu_dim", 45);
+        if (odim < 0) odim = 0;
+        if (odim > 100) odim = 100;
+        s_osuDim.store(odim, std::memory_order_relaxed);
+        int ood = I18N::Prefs::GetInt("osu_od", 8);
+        if (ood < 0) ood = 0;
+        if (ood > 10) ood = 10;
+        s_osuOd.store(ood, std::memory_order_relaxed);
+        int oar = I18N::Prefs::GetInt("osu_ar", 1200);
+        if (oar < 300) oar = 300;
+        if (oar > 1800) oar = 1800;
+        s_osuPreemptMs.store(oar, std::memory_order_relaxed);
     }
 
     // ---------------- 主绘制 ----------------
@@ -6898,6 +6964,12 @@ namespace Chart4K
         }
         const char* rs = getenv("ADOFAI_PERFECT_RECSTOP");
         if (rs && rs[0]) RecStopArm(atoi(rs));
+        const char* oa = getenv("ADOFAI_PERFECT_OSU_AUTO");
+        if (oa && oa[0] == '1')
+        {
+            s_osuAutoHit[kModeOsu].store(true, std::memory_order_relaxed);
+            Log::Printf("[test] osu auto-hit hook on");
+        }
         const char* fm = getenv("ADOFAI_PERFECT_FIRE");
         if (fm && fm[0] == '1')
         {
@@ -7225,11 +7297,49 @@ namespace Chart4K
                                   ImGui::GetIO().WantCaptureMouse;
                 static float s_plateX = 0.5f;
                 float mx = -1.f, my = -1.f;
-                if (!hold && RenderHook::GameCursorClientPos(&mx, &my) &&
-                    mx >= 0.f && mx <= gw && my >= 0.f && my <= gh)
+                const bool curOk = RenderHook::GameCursorClientPos(&mx, &my) &&
+                                   mx >= 0.f && mx <= gw && my >= 0.f && my <= gh;
+                // 鼠标"真在动" = 手动接管；松手 0.6s 后回到宏代打自动接盘。
+                static float  s_lastMx = -1e9f;
+                static double s_mouseActMs = -1e9;
+                const double nowTickMs = (double)GetTickCount64();
+                if (curOk && !hold)
                 {
-                    const float dt = std::min(0.05f, (float)ImGui::GetIO().DeltaTime);
-                    s_plateX += (mx / gw - s_plateX) * (1.f - expf(-dt * 40.f));   // 平滑跟随
+                    if (s_lastMx < -1e8f)                 s_lastMx = mx;                 // 首帧不算"动"
+                    else if (fabsf(mx - s_lastMx) > 2.f)  s_mouseActMs = nowTickMs;      // 动了 → 手动
+                    s_lastMx = mx;
+                }
+                const bool autoPlate = CatchAutoPlateGet() && (nowTickMs - s_mouseActMs > 600.0);
+                if (autoPlate)
+                {
+                    // 宏代打：接盘追"最近一枚还没接住的雨点"，指数趋近保证落线前到位。
+                    // 于是 PERFECT 的接点落在雨点所在处（雨点围绕中心分布）——不会再被
+                    // 静止的鼠标钉在屏右侧（"PERFECT 一直在右边"）。
+                    float tgt = -1.f;
+                    {
+                        std::lock_guard<std::mutex> lk(s_notesMutex);
+                        const int n2 = (int)s_notes.size();
+                        for (int i = 0; i < n2; i++)
+                        {
+                            if (s_consumed[i] || s_missed[i]) continue;
+                            if (s_notes[i].time - clock < -0.12) continue;   // 已经过窗：看下一枚
+                            tgt = (i < (int)s_catchX.size()) ? s_catchX[i] : 0.5f;
+                            break;                                           // 时间有序：就是最近一枚
+                        }
+                    }
+                    if (tgt >= 0.f)
+                    {
+                        const float dtf = std::min(0.05f, (float)ImGui::GetIO().DeltaTime);
+                        s_plateX += (tgt - s_plateX) * (1.f - expf(-dtf * 60.f));
+                        if (s_plateX < 0.02f) s_plateX = 0.02f;
+                        if (s_plateX > 0.98f) s_plateX = 0.98f;
+                        CatchSetPlateX(s_plateX);
+                    }
+                }
+                else if (curOk && !hold)
+                {
+                    const float dtf = std::min(0.05f, (float)ImGui::GetIO().DeltaTime);
+                    s_plateX += (mx / gw - s_plateX) * (1.f - expf(-dtf * 40.f));   // 平滑跟随
                     if (s_plateX < 0.02f) s_plateX = 0.02f;
                     if (s_plateX > 0.98f) s_plateX = 0.98f;
                     CatchSetPlateX(s_plateX);
@@ -7255,19 +7365,22 @@ namespace Chart4K
                     px = (mx - fx0) / fw * 512.f;
                     py = (my - fy0) / fh * 384.f;
                 }
-                const ImGuiIO& io = ImGui::GetIO();
-                static bool s_prevClick = false;
-                bool down = io.MouseDown[0] || io.MouseDown[1];
-                if (cols >= 2)
-                {
-                    down = down ||
-                           ((GetAsyncKeyState(0x5A) & 0x8000) != 0) ||   // Z
-                           ((GetAsyncKeyState(0x58) & 0x8000) != 0);     // X
-                }
-                const bool edge = down && !s_prevClick;
-                s_prevClick = down;
-                if (hold) { px = 256.f; py = 192.f; }
-                OsuTick(clock, px, py, edge && !hold, down);
+                // 输入全部读**物理键状态**：鼠标左/右键 + Z / X 各自独立取上升沿。
+                //   · 鼠标瞄准 + 键盘点拍可以同时用（和 PC 版 osu! 一样：一只手移动、
+                //     另一只手交替按 Z / X 连打，按住左键也不影响键盘的按下沿）；
+                //   · 不经过 ImGui IO —— 任何覆盖层（如全屏的按键反馈层）抢了鼠标消息
+                //     也照样能点出来（"开着按键反馈 OSU 点不动"的根源之一）。
+                static bool s_pM0 = false, s_pM1 = false, s_pZ = false, s_pX = false;
+                const bool m0 = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+                const bool m1 = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+                const bool kz = (GetAsyncKeyState(0x5A) & 0x8000) != 0;   // Z
+                const bool kx = (GetAsyncKeyState(0x58) & 0x8000) != 0;   // X
+                const bool down = m0 || m1 || kz || kx;
+                bool edge = (m0 && !s_pM0) || (m1 && !s_pM1) ||
+                            (kz && !s_pZ) || (kx && !s_pX);
+                s_pM0 = m0; s_pM1 = m1; s_pZ = kz; s_pX = kx;
+                if (hold) { px = 256.f; py = 192.f; edge = false; }
+                OsuTick(clock, px, py, edge, down);
             }
             else
             {
@@ -9113,6 +9226,11 @@ namespace Chart4K
         case 12: return s_innerRoll[mi].load(std::memory_order_relaxed) ? 1 : 0;
         case 13: return s_catchKill[mi].load(std::memory_order_relaxed) ? 1 : 0;
         case 14: return s_catchPlateW[mi].load(std::memory_order_relaxed);
+        case 15: return s_osuAutoHit[mi].load(std::memory_order_relaxed) ? 1 : 0;
+        case 16: return s_catchAutoPlate[mi].load(std::memory_order_relaxed) ? 1 : 0;
+        case 35: return s_catchJitter.load(std::memory_order_relaxed);
+        case 36: return s_osuJitter.load(std::memory_order_relaxed);
+        case 37: return s_osuDim.load(std::memory_order_relaxed);
         default: return 0;
         }
     }
@@ -9143,6 +9261,11 @@ namespace Chart4K
             if (v > 400) v = 400;
             s_catchPlateW[mi].store(v, std::memory_order_relaxed);
             break;
+        case 15: s_osuAutoHit[mi].store(v != 0, std::memory_order_relaxed); break;
+        case 16: s_catchAutoPlate[mi].store(v != 0, std::memory_order_relaxed); break;
+        case 35: CatchJitterSet(v); break;
+        case 36: OsuJitterSet(v);   break;
+        case 37: OsuDimSet(v);      break;
         default: break;
         }
     }
@@ -9250,6 +9373,32 @@ namespace Chart4K
     void MacroHumanSet(int v) { s_macroHuman.store(std::max(0, std::min(100, v)), std::memory_order_relaxed); }
     int  MacroJitterGet() { return s_macroJitter.load(std::memory_order_relaxed); }
     void MacroJitterSet(int v) { s_macroJitter.store(std::max(0, std::min(100, v)), std::memory_order_relaxed); }
+    // ---- CATCH / OSU 各自独立的宏抖动（0..100%）----
+    //   这两个模式各有自己的打歌算法，**不读「宏模式」页**的抖动幅度 / 拟人度 / 精准度。
+    //   抖动只作用在"非完美档"（CATCH 的 GOOD / MISS，OSU 的 50 / MISS）：
+    //   完美接住时目标角恒定 —— 宏平时就该是稳的。
+    int  CatchJitterGet() { return s_catchJitter.load(std::memory_order_relaxed); }
+    void CatchJitterSet(int v) { s_catchJitter.store(std::max(0, std::min(100, v)), std::memory_order_relaxed); }
+    int  OsuJitterGet()   { return s_osuJitter.load(std::memory_order_relaxed); }
+    void OsuJitterSet(int v) { s_osuJitter.store(std::max(0, std::min(100, v)), std::memory_order_relaxed); }
+    int  OsuDimGet()      { return s_osuDim.load(std::memory_order_relaxed); }
+    void OsuDimSet(int v) { s_osuDim.store(std::max(0, std::min(100, v)), std::memory_order_relaxed); }
+    // 当前模式打歌引擎的读数（GameDetour 用）：
+    //   AssistJitterGet  —— CATCH / OSU 用各自页面的抖动；其它模式回落到宏页
+    //   AssistPlayAccGet —— CATCH 用页面「打歌精准度」；OSU 固定 100%（300/50/MISS 直接映射）
+    int  AssistJitterGet()
+    {
+        const int mi = ActiveModeIndex();
+        if (mi == kModeOsu)   return s_osuJitter.load(std::memory_order_relaxed);
+        if (mi == kModeCatch) return s_catchJitter.load(std::memory_order_relaxed);
+        return s_macroJitter.load(std::memory_order_relaxed);
+    }
+    int  AssistPlayAccGet()
+    {
+        const int mi = ActiveModeIndex();
+        if (mi == kModeOsu) return 100;
+        return s_catchPlayAcc.load(std::memory_order_relaxed);
+    }
     int  RecFpsGet()     { RecCfgLoadOnce(); return s_recFps.load(std::memory_order_relaxed); }
     void RecFpsSet(int v) { RecCfgLoadOnce(); s_recFps.store(std::max(15, std::min(240, v)), std::memory_order_relaxed); RecCfgSave(); }
     int  RecMbpsGet()    { RecCfgLoadOnce(); return s_recMbps.load(std::memory_order_relaxed); }
@@ -9426,10 +9575,8 @@ namespace Chart4K
             g_lblColX = colW;
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 6.f));
 
-            // ---- CATCH v2：一键自动接 + 鼠标接盘 ----
-            //   本模式不再需要键位：雨点落到判定线的瞬间，只要接盘盖住它的落点就
-            //   自动接住（正中 MARV / 靠边 GOOD）；没盖住就判 MISS。接盘横坐标由
-            //   鼠标左右移动控制。MISS 只是照常显示一条判定，不会自动返回 / 重开。
+            // ---- CATCH：接盘宽度 → 打歌精准度 → 抖动幅度 → 宏代打（自动接盘）----
+            //   抖动是**本模式自己的**（独立算法），不读「宏模式」页的设置。
             if (mi == kModeCatch)
             {
                 int pwPct = s_catchPlateW[mi].load(std::memory_order_relaxed) / 10;   // 千分比 → 百分比
@@ -9441,7 +9588,10 @@ namespace Chart4K
                 ImGui::SetNextItemWidth(-14.f);
                 snprintf(id, sizeof(id), "##m%dcatchpw", mi);
                 if (ImGui::SliderInt(id, &pwPct, 6, 40, "%d %%"))
+                {
                     s_catchPlateW[mi].store(pwPct * 10, std::memory_order_relaxed);
+                    ModeCfgSave();
+                }
 
                 // 打歌精准度：把 CATCH 的判定偏差按多少比例带到背景原关的成绩上
                 //   （100% = 原样带过去：CATCH 判 GOOD，背景也吃到对应差判；0% = 背景永远满判）。
@@ -9452,11 +9602,106 @@ namespace Chart4K
                 ImGui::SetNextItemWidth(-14.f);
                 snprintf(id, sizeof(id), "##m%dcatchpa", mi);
                 if (ImGui::SliderInt(id, &pa, 0, 100, "%d %%"))
+                {
                     s_catchPlayAcc.store(pa, std::memory_order_relaxed);
+                    ModeCfgSave();
+                }
 
-                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(160, 166, 182, 255));
-                ImGui::TextWrapped("%s", I18N::Tr(I18N::LBL_CATCH_HINT));
-                ImGui::PopStyleColor();
+                // 抖动幅度（0..100%）：只作用在 GOOD / MISS 档；MARVELOUS / PERFECT 恒定零抖动。
+                int cj = CatchJitterGet();
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_CATCH_JITTER));
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(colW);
+                ImGui::SetNextItemWidth(-14.f);
+                snprintf(id, sizeof(id), "##m%dcatchjit", mi);
+                if (ImGui::SliderInt(id, &cj, 0, 100, "%d %%"))
+                {
+                    CatchJitterSet(cj);
+                    ModeCfgSave();
+                }
+
+                // 宏代打（自动接盘）：鼠标不动时接盘自动追最近的雨点 —— PERFECT 的接点
+                // 因此落在雨点上（雨点围绕中心分布），不会被静止的鼠标钉在屏右侧。
+                // 动鼠标立即手动接管，松手 0.6s 后自动恢复（手动一样能打出 GOOD / MISS）。
+                bool cap = s_catchAutoPlate[mi].load(std::memory_order_relaxed);
+                snprintf(id, sizeof(id), "##m%dcautoplate", mi);
+                if (MiniToggle(id, &cap))
+                {
+                    s_catchAutoPlate[mi].store(cap, std::memory_order_relaxed);
+                    ModeCfgSave();
+                    Log::Printf("[UI] CATCH auto-plate -> %d", (int)cap);
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_CATCH_AUTOPLATE));
+                ImGui::Spacing();
+            }
+
+            // ---- OSU（戳泡泡）：鼠标悬停自动命中 + OD / AR ----
+            //   自动打是**可选开关**（默认关闭）：开启后光标停在泡泡上，判定环到位时
+            //   由工具代点（不抢拍），无需手动点击；背景原关仍由 OSU 打歌引擎演奏。
+            if (mi == kModeOsu)
+            {
+                bool au = s_osuAutoHit[mi].load(std::memory_order_relaxed);
+                snprintf(id, sizeof(id), "##m%dosuau", mi);
+                if (MiniToggle(id, &au))
+                {
+                    s_osuAutoHit[mi].store(au, std::memory_order_relaxed);
+                    ModeCfgSave();
+                    Log::Printf("[UI] OSU auto-hit -> %d", (int)au);
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_OSU_AUTOHIT));
+
+                // 抖动幅度（0..100%）：本模式自己的，只作用在 50 / MISS 档。
+                int oj = OsuJitterGet();
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_OSU_JITTER));
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(colW);
+                ImGui::SetNextItemWidth(-14.f);
+                snprintf(id, sizeof(id), "##m%dosujit", mi);
+                if (ImGui::SliderInt(id, &oj, 0, 100, "%d %%"))
+                {
+                    OsuJitterSet(oj);
+                    ModeCfgSave();
+                }
+
+                int od = s_osuOd.load(std::memory_order_relaxed);
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_OSU_OD));
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(colW);
+                ImGui::SetNextItemWidth(-14.f);
+                snprintf(id, sizeof(id), "##m%dosuod", mi);
+                if (ImGui::SliderInt(id, &od, 0, 10))
+                {
+                    OsuOdSet(od);
+                    ModeCfgSave();
+                }
+
+                int arMs = s_osuPreemptMs.load(std::memory_order_relaxed);
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_OSU_AR));
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(colW);
+                ImGui::SetNextItemWidth(-14.f);
+                snprintf(id, sizeof(id), "##m%dosuar", mi);
+                if (ImGui::SliderInt(id, &arMs, 300, 1800, "%d ms"))
+                {
+                    OsuPreemptSet(arMs);
+                    ModeCfgSave();
+                }
+
+                // 背景压暗（0..100%）：判定场外的整体暗度，对应 osu! 的 Background dim。
+                int odim = OsuDimGet();
+                ImGui::TextUnformatted(I18N::Tr(I18N::LBL_OSU_DIM));
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(colW);
+                ImGui::SetNextItemWidth(-14.f);
+                snprintf(id, sizeof(id), "##m%dosudim", mi);
+                if (ImGui::SliderInt(id, &odim, 0, 100, "%d %%"))
+                {
+                    OsuDimSet(odim);
+                    ModeCfgSave();
+                }
+
                 ImGui::Spacing();
             }
 

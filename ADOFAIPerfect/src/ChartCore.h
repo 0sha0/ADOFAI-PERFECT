@@ -194,16 +194,15 @@ namespace Chart4K
     //   osu! 判定场（512x384，4:3）在游戏客户区里的居中矩形（像素）
     static inline void OsuFieldRect(float gw, float gh, float* x0, float* y0, float* w, float* h)
     {
-        // osu! 原版坐标单位是 game pixel：1 game px = 640x480 窗口下的 1 个屏幕像素，
-        // 分辨率更高时 game px 的视觉大小不变（osu! wiki: Playfield）。
-        //   → 缩放系数 s = 客户区高度 / 480；判定场 512x384 game px，水平居中，
-        //     垂直比窗口中心低 8 game px。
-        float s = gh / 480.f;
-        if (gw / 640.f < s) s = gw / 640.f;     // 比 4:3 更窄的窗口：按宽度兜底
+        // osu!pixel：判定场固定 512x384 osu!px（中心 (256,192)），按窗口高度缩放
+        // —— 1 osu!px = 客户区高度 / 384 个屏幕像素（osu! wiki: osu!pixel）。
+        //   → s = gh / 384；判定场填满高度、水平居中（16:9 下左右留黑边，与 osu! 一致）。
+        float s = gh / 384.f;
+        if (gw / 512.f < s) s = gw / 512.f;     // 比 4:3 更窄的窗口：按宽度兜底
         const float fw = 512.f * s, fh = 384.f * s;
         *w = fw; *h = fh;
         *x0 = (gw - fw) * 0.5f;
-        *y0 = (gh - fh) * 0.5f + 8.f * s;
+        *y0 = (gh - fh) * 0.5f;
     }
     // OSU 运行时（渲染线程写入判定 / 主判定管线读取）
     struct OsuHit { double t; float x; float y; float hold; uint8_t state; };  // state 0 live 1 hit 2 miss
@@ -216,6 +215,10 @@ namespace Chart4K
     void OsuReset();
     int  OsuPreemptMs(); void OsuPreemptSet(int ms);
     int  OsuOd(); void OsuOdSet(int od);
+    // OSU 自动打：鼠标悬停在泡泡上时由工具在判定点自动命中（不用手动点击）
+    bool OsuAutoHit(int mi); void OsuAutoHitSet(int mi, bool on);
+    // OSU 背景压暗 0..100%（判定场外整体暗度；对应 osu! Background dim）
+    int  OsuDimGet(); void OsuDimSet(int v);
 
     // ---------------- 16K（PAD）分砖引擎（Chart16K.cpp，独立算法）----------------
     //   PAD 是 4x4 面板（不是下落式）：index = row*4+col，row0=最上行。
@@ -266,6 +269,16 @@ namespace Chart4K
     void   CatchReset();              // 清空漏音计数 / 快慢方向（换谱 / 重开）
     int    CatchPlateWMil();          // 接盘宽度（千分比，60..400）
     void   CatchPlateWSet(int mil);
+    //   CATCH / OSU 各自的宏抖动（0..100%，只作用 GOOD / 50 / MISS 档；独立于宏模式页）
+    int    CatchJitterGet(); void CatchJitterSet(int v);
+    int    OsuJitterGet();   void OsuJitterSet(int v);
+    int    AssistJitterGet();     // 当前模式打歌引擎的抖动量（GameDetour 用）
+    int    AssistPlayAccGet();    // 判定偏差带入比例（CATCH 页面值；OSU 固定 100%）
+    //   宏代打（自动接盘）：鼠标静止时接盘自动追最近一枚雨点，在它落线前到位 ——
+    //   这样 PERFECT 的接点落在雨点所在处（雨点本身围绕中心分布），而不是被静止的
+    //   鼠标钉死在某一边。动鼠标即手动接管，松手 0.6s 后回到自动。
+    bool   CatchAutoPlateGet();
+    void   CatchAutoPlateSet(bool on);
     //   CATCH 渲染取数（线程安全拷贝；返回写入条数）
     struct CatchRender { double t; float x; float hold; uint8_t state; };  // state 0 live 1 hit 2 miss
     int  CatchNotes(CatchRender* out, int cap, double minT = -1e18);  // 只拷贝 t>=minT 的音（长谱省拷贝）

@@ -79,4 +79,9 @@ namespace Chart4K
     int         CatchLastDir();                      // 最近一次判定方向：+1=慢 / -1=快 / 0=无
     int         CatchPlayAccGet();                   // 打歌精准度 0..100（把 CATCH 偏差带到背景的比例）
     void        CatchPlayAccSet(int v);
+    //   CATCH / OSU 的宏抖动与偏差比例（各自页面独立设置，不读「宏模式」页）：
+    //     AssistJitterGet  —— 当前模式页面的抖动幅度 0..100（只作用 GOOD / 50 / MISS 档）
+    //     AssistPlayAccGet —— 偏差带入比例（CATCH 用页面值；OSU 固定 100%）
+    int         AssistJitterGet();
+    int         AssistPlayAccGet();
 }

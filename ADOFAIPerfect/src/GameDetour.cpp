@@ -388,22 +388,32 @@ namespace GameDetour
             g_catchRt.floorSeq = c.floorIndex;
             g_catchRt.tries = 0;
             g_catchRt.jit = g_catchRt.jit * 1664525u + 1013904223u;   // 每砖一次拟人抖动
-            // 固定 ±5ms → 随宏页「抖动幅度」缩放（0% = 绝对零抖动，高 BPM 不出窗）
-            g_catchRt.jitMs = ((double)(g_catchRt.jit >> 8) / 16777216.0 * 2.0 - 1.0) * 5.0
-                              * ((double)Chart4K::MacroJitterGet() / 100.0);
+            // 每砖最多 ±3ms，且**只在非完美档生效**（见下 targetDeg）：
+            //   CATCH 的 MARVELOUS / PERFECT、OSU 的 300 / 100 一律零抖动 —— 宏平时
+            //   就该是稳的。抖动量取**当前模式自己的**（CATCH / OSU 页面各一个），
+            //   与「宏模式」页的抖动幅度无关（CATCH / OSU 是独立算法）。
+            g_catchRt.jitMs = ((double)(g_catchRt.jit >> 8) / 16777216.0 * 2.0 - 1.0) * 3.0
+                              * ((double)Chart4K::AssistJitterGet() / 100.0);
         }
 
         // CATCH 的判定偏差（按当前歌曲时刻取最近一条）；没拿到就按 0（当成完美接住）
         double tgtFrac = 0.0;
         const bool hasTgt = Chart4K::CatchPlayTargetFrac(Chart4K::ApiSongTime(), &tgtFrac);
-        const double scale = (double)Chart4K::CatchPlayAccGet() / 100.0;   // 打歌精准度
+        // 判定偏差带入比例：CATCH 用页面「打歌精准度」；OSU 固定 100%（300/50/MISS 直接映射）。
+        const double scale = (double)Chart4K::AssistPlayAccGet() / 100.0;
         // 背景原关的"计数窗"半宽（度）：60° × marginScale（marginScale 取自原生砖块）
         const double marginScale = (c.marginScale > 0.01 && c.marginScale < 100.0) ? c.marginScale : 1.0;
         const double cntDeg = 60.0 * marginScale;
-        g_catchRt.targetDeg = (hasTgt ? tgtFrac * scale * cntDeg : 0.0) + g_catchRt.jitMs * degPerMs;
+        // 只有"非完美档"（≈0.88 = CATCH GOOD / OSU 50，1.60 = MISS）才加拟人抖动；
+        // MARV(0.20)/PERFECT(0.42) 不加。
+        const bool jitterable = hasTgt && fabs(tgtFrac) >= 0.80;
+        g_catchRt.targetDeg = (hasTgt ? tgtFrac * scale * cntDeg : 0.0)
+                              + (jitterable ? g_catchRt.jitMs * degPerMs : 0.0);
 
         if (g_catchRt.tries >= 4 || !g_fireHit)
+        {
             return;
+        }
 
         const double thr = g_catchRt.targetDeg - 0.5 * dt * degPerMs;
         if (c.errDeg >= thr)
@@ -426,8 +436,11 @@ namespace GameDetour
             GameBridge::TickCheatsFast();
         if (!CheatState::GameQuitting.load(std::memory_order_relaxed))
         {
-            if      (Chart4K::FireMacroEnabled())        FireMacroFrame(self);   // 冰与火宏（用户自己的）
-            else if (Chart4K::CatchAssistEnabled())      CatchPlayFrame(self);   // CATCH 专用打歌引擎
+            // CATCH / OSU 必须用自己的打歌引擎（覆盖层每判一个音就把目标偏差发布给背景原关）。
+            // 若让"冰与火宏"抢在前面，背景会被通用宏按固定 90ms 偏移代打，CATCH/OSU 的判定就
+            // 完全同步不到背景（表现为"CATCH 全 PERFECT 但宏断掉 / OSU 不生效"）。故优先 CATCH/OSU。
+            if      (Chart4K::CatchAssistEnabled())      CatchPlayFrame(self);   // CATCH / OSU 专用打歌引擎（优先）
+            else if (Chart4K::FireMacroEnabled())        FireMacroFrame(self);   // 冰与火宏（原生关卡）
         }
         if (g_origSimUpdate)
             g_origSimUpdate(self, a, b);
